@@ -1012,8 +1012,8 @@ html, body, #root {
   .hide-on-desktop { display: none !important; }
 }
 
-@media (min-width: 480px) and (max-width: 899px) {
-  /* Center content inside the scroll container */
+/* Tablet — small (480–639px) */
+@media (min-width: 480px) and (max-width: 639px) {
   .page-content {
     max-width: 680px;
     margin: 0 auto;
@@ -1023,4 +1023,39 @@ html, body, #root {
   .stock-grid  { grid-template-columns: repeat(3, 1fr); }
   .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
   .action-grid { grid-template-columns: repeat(4, 1fr); }
+}
+/* Tablet — iPad (640–899px) */
+@media (min-width: 640px) and (max-width: 899px) {
+  .page-content {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 1.25rem 1.75rem;
+    padding-bottom: calc(68px + env(safe-area-inset-bottom) + 1rem);
+  }
+  /* Grids */
+  .stock-grid  { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
+  .action-grid { grid-template-columns: repeat(4, 1fr); }
+  .pos-grid    { grid-template-columns: repeat(3, 1fr); }
+  /* Bottom nav — centered floating */
+  .bottom-nav {
+    max-width: 600px;
+    left: 50%;
+    transform: translateX(-50%);
+    border-radius: 16px 16px 0 0;
+  }
+  /* Modal wider on tablet */
+  .bottom-sheet {
+    max-width: 620px;
+    border-radius: 20px 20px 0 0;
+  }
+  /* Topbar wider */
+  .app-topbar {
+    max-width: 780px;
+    margin: 0 auto;
+  }
+  /* Card padding */
+  .card { padding: 1rem 1.1rem; }
+  /* Lot popup wider */
+  .lot-popup { max-width: 620px; }
 }

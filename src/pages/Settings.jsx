@@ -1441,7 +1441,7 @@ export default function Settings() {
             background: 'var(--bg)', border: '1px solid var(--border2)',
             borderRadius: 20, padding: '1px 8px', fontWeight: 700, fontSize: 10.5,
             color: 'var(--txt2)'
-          }}>v1.3.0</span>
+          }}>v1.4.0</span>
           <span>·</span>
           <span>อัพเดท 16 พ.ค. 2569</span>
         </div>
