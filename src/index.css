@@ -48,20 +48,135 @@ html, body, #root {
   height: 100dvh;
   overflow: hidden;
 }
-.page-content {
+/* PullToRefresh — scroll container แทน page-content */
+.ptr-scroll {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
+  min-height: 0;
+}
+.page-content {
   padding-bottom: calc(62px + env(safe-area-inset-bottom));
 }
 
-/* ── Topbar ── */
+/* ── App TopBar (shared, Daily Income style) ── */
+.app-topbar {
+  background: rgba(255,255,255,0.97);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.05);
+  padding: 0 .85rem;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  z-index: 50;
+}
+
+/* ปุ่ม Home — red pill */
+.app-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 13px 6px 10px;
+  border-radius: 20px;
+  background: #E31E24;
+  border: none;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #fff;
+  font-family: 'Sarabun', sans-serif;
+  transition: background .15s, transform .12s;
+  flex-shrink: 0;
+  letter-spacing: .01em;
+}
+.app-back-btn:hover  { background: #B01519; }
+.app-back-btn:active { transform: scale(0.93); }
+
+/* Brand */
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.app-brand-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #FFF0F0, #FFE0E0);
+  border: 2px solid rgba(227,30,36,.18);
+  box-shadow: 0 2px 8px rgba(0,0,0,.10);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.app-brand-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.app-brand-name {
+  font-family: 'Prompt', sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--txt);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+.app-brand-sub {
+  font-size: 10.5px;
+  color: var(--txt3);
+  font-weight: 500;
+  margin-top: 1px;
+  white-space: nowrap;
+}
+
+.app-topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ── Page sub-header (sticky, below app topbar) ── */
+.page-subbar {
+  background: var(--surf);
+  border-bottom: 1px solid var(--border);
+  padding: 0 1rem;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 30;
+}
+.subbar-title {
+  font-family: 'Prompt', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--txt);
+}
+
+/* ── Legacy .topbar (page-level, keep for modals/etc) ── */
 .topbar {
   background: var(--surf);
   border-bottom: 1px solid var(--border);
   padding: 0 1rem;
-  height: 56px;
+  min-height: 48px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -72,14 +187,14 @@ html, body, #root {
 }
 .topbar-title {
   font-family: 'Prompt', sans-serif;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 700;
   color: var(--txt);
 }
 
 /* ── Bottom Nav ── */
 .bottom-nav {
-  height: calc(62px + env(safe-area-inset-bottom));
+  height: calc(58px + env(safe-area-inset-bottom));
   padding-bottom: env(safe-area-inset-bottom);
   background: var(--surf);
   border-top: 1px solid var(--border);
@@ -88,6 +203,8 @@ html, body, #root {
   position: sticky;
   bottom: 0;
   z-index: 40;
+  /* subtle top shadow แทน border หนา */
+  box-shadow: 0 -1px 0 rgba(0,0,0,.06), 0 -4px 16px rgba(0,0,0,.04);
 }
 .nav-item {
   flex: 1;
@@ -95,18 +212,50 @@ html, body, #root {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 2px;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
-  transition: opacity 0.1s;
   padding: 0;
   border: none;
   background: none;
+  transition: transform .15s ease;
 }
-.nav-item:active { opacity: 0.6; }
-.nav-icon { font-size: 22px; line-height: 1; }
-.nav-label { font-size: 9.5px; font-weight: 600; color: var(--txt3); letter-spacing: 0.02em; }
-.nav-item.active .nav-label { color: var(--red); }
+/* tap feedback */
+.nav-item:active { transform: scale(0.88); }
+
+/* icon wrapper — pill สีแดงเมื่อ active */
+.nav-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 28px;
+  border-radius: 14px;
+  transition: background .2s ease, transform .2s cubic-bezier(.34,1.56,.64,1);
+}
+.nav-item.active .nav-pill {
+  background: rgba(227, 30, 36, 0.10);
+  transform: scale(1.05);
+}
+.nav-icon {
+  font-size: 20px;
+  line-height: 1;
+  transition: transform .2s cubic-bezier(.34,1.56,.64,1);
+}
+.nav-item.active .nav-icon { transform: scale(1.12); }
+
+/* label */
+.nav-label {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--txt3);
+  letter-spacing: 0.01em;
+  transition: color .2s ease, font-weight .2s ease;
+}
+.nav-item.active .nav-label {
+  color: var(--red);
+  font-weight: 700;
+}
 
 /* ── Segment Control ── */
 .segment {
@@ -445,6 +594,15 @@ html, body, #root {
 .conn-dot.offline { background: #DC2626; }
 .conn-dot.syncing { background: #D97706; animation: blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+/* X button bounce — เมื่อกด backdrop บน lockClose modal */
+@keyframes xBounce {
+  0%   { transform: scale(1)    rotate(0deg); }
+  20%  { transform: scale(1.35) rotate(-12deg); }
+  40%  { transform: scale(1.25) rotate(10deg); }
+  60%  { transform: scale(1.15) rotate(-6deg); }
+  80%  { transform: scale(1.05) rotate(3deg); }
+  100% { transform: scale(1)    rotate(0deg); }
+}
 
 /* ── Action grid (dashboard) ── */
 .action-grid {
@@ -607,3 +765,254 @@ html, body, #root {
 
 /* ── Scrollable page spacing ── */
 .page-pad { padding: 12px 0 24px; display: flex; flex-direction: column; gap: 12px; }
+
+/* ── Desktop Content Bar (วันที่ + Online) ── */
+.desk-content-bar {
+  display: none !important; /* hidden on mobile — !important overrides Tailwind base */
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 2rem 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surf);
+  gap: 12px;
+  flex-shrink: 0;
+}
+.desk-content-bar-date {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.dcb-page {
+  font-family: 'Prompt', sans-serif;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--txt);
+}
+.dcb-sep { color: var(--border2); font-size: 14px; }
+.dcb-date {
+  font-size: 13px;
+  color: var(--txt2);
+  font-weight: 500;
+}
+.dcb-time {
+  font-size: 12px;
+  color: var(--txt3);
+  font-weight: 500;
+}
+.desk-content-bar-right {
+  flex-shrink: 0;
+}
+@media (min-width: 900px) {
+  .desk-content-bar { display: flex !important; }
+}
+
+/* ═══════════════════════════════════════════════
+   DESKTOP SIDEBAR
+   ═══════════════════════════════════════════════ */
+.desk-sidebar {
+  display: none;
+  flex-direction: column;
+  width: 240px;
+  flex-shrink: 0;
+  height: 100dvh;
+  position: fixed;
+  left: 0; top: 0;
+  z-index: 150;
+  background: #fff;
+  border-right: 1px solid var(--border);
+  box-shadow: 1px 0 8px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+
+/* Brand header */
+.dsb-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 1.1rem 1.1rem .9rem;
+  border-bottom: 1px solid var(--border);
+}
+.dsb-brand-icon {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 2px solid rgba(227,30,36,0.15);
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.10);
+}
+.dsb-brand-icon img { width: 100%; height: 100%; object-fit: cover; }
+.dsb-brand-name {
+  font-family: 'Prompt', sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--txt);
+  line-height: 1.2;
+}
+.dsb-brand-sub { font-size: 10px; color: var(--txt3); font-weight: 400; }
+
+/* Scroll body */
+.dsb-scroll { flex: 1; overflow-y: auto; padding: .75rem .7rem; }
+
+/* Home btn */
+.dsb-home-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: .5rem .7rem;
+  border-radius: var(--r);
+  background: #FEF2F2;
+  border: none;
+  cursor: pointer;
+  font-family: 'Sarabun', sans-serif;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #B01519;
+  width: 100%;
+  margin-bottom: .75rem;
+  text-align: left;
+  transition: background .15s;
+}
+.dsb-home-btn:hover { background: #FEE2E2; }
+
+/* Section label */
+.dsb-sec-lbl {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--txt3);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: .1rem .5rem .4rem;
+  margin-top: .35rem;
+}
+
+/* Nav items */
+.dsb-nav { display: flex; flex-direction: column; gap: 2px; }
+.dsb-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: .6rem .7rem;
+  border-radius: 10px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: 'Sarabun', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--txt2);
+  width: 100%;
+  text-align: left;
+  transition: background .13s, color .13s;
+}
+.dsb-nav-item:hover { background: var(--surf2); }
+.dsb-nav-item.active {
+  background: #FFF0F0;
+  color: var(--red);
+  font-weight: 700;
+}
+.dsb-nav-ico { font-size: 17px; width: 24px; text-align: center; flex-shrink: 0; }
+
+/* User footer */
+.dsb-footer {
+  padding: .75rem 1rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+}
+.dsb-avatar {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 800;
+  color: #fff;
+  flex-shrink: 0;
+}
+.dsb-user-name { font-size: 12.5px; font-weight: 700; color: var(--txt); }
+.dsb-user-role { font-size: 10px; color: var(--txt3); }
+.dsb-date { margin-left: auto; font-size: 10.5px; color: var(--txt3); font-weight: 500; }
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — DESKTOP (≥900px)
+   ═══════════════════════════════════════════════ */
+@media (min-width: 900px) {
+  .app-shell {
+    flex-direction: row;
+  }
+  /* Show sidebar, hide mobile chrome */
+  .desk-sidebar   { display: flex; }
+  .app-topbar     { display: none; }
+  .bottom-nav     { display: none; }
+
+  /* Push content right of sidebar */
+  .ptr-scroll {
+    margin-left: 240px;
+  }
+  .page-content {
+    padding: 1.5rem 2rem;
+    padding-bottom: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+
+  /* Wider cards / grids */
+  .stock-grid   { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .pos-grid     { grid-template-columns: repeat(4, 1fr); }
+  .kpi-grid     { grid-template-columns: repeat(4, 1fr); }
+  .action-grid  { grid-template-columns: repeat(4, 1fr); }
+
+  /* Bottom sheet → centered dialog on desktop */
+  .modal-backdrop {
+    align-items: center;
+    justify-content: center;
+  }
+  .bottom-sheet {
+    border-radius: 20px;
+    max-width: 520px;
+    max-height: 88dvh;
+  }
+
+  /* Toast offset (no topbar) */
+  .toast { top: 20px; }
+}
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — TABLET (480–899px)
+   ═══════════════════════════════════════════════ */
+.topbar-refresh-btn {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--txt2);
+  transition: background .15s;
+}
+.topbar-refresh-btn:hover { background: var(--bg); }
+.topbar-refresh-btn:active { transform: scale(0.88); }
+@media (min-width: 900px) {
+  .hide-on-desktop { display: none !important; }
+}
+
+@media (min-width: 480px) and (max-width: 899px) {
+  /* Center content inside the scroll container */
+  .page-content {
+    max-width: 680px;
+    margin: 0 auto;
+    padding: 1rem 1.25rem;
+    padding-bottom: calc(62px + env(safe-area-inset-bottom) + 1rem);
+  }
+  .stock-grid  { grid-template-columns: repeat(3, 1fr); }
+  .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
+  .action-grid { grid-template-columns: repeat(4, 1fr); }
+}

@@ -9,14 +9,28 @@
   <meta name="apple-mobile-web-app-title" content="Inventory" />
   <meta name="theme-color" content="#E31E24" />
   <link rel="manifest" href="/bizice-inventory/manifest.json" />
-  <link rel="apple-touch-icon" href="https://truescale-group.github.io/mixue-ice-sakon/icon-192.png" />
+  <link rel="icon" type="image/png" href="./icon-inventory.png" />
+  <link rel="apple-touch-icon" href="./icon-inventory.png" />
   <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&family=Sarabun:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <title>Mixue Inventory</title>
   <script>
     (function () {
       const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/';
       try {
-        const s = JSON.parse(localStorage.getItem('bizice_session') || 'null');
+        const params = new URLSearchParams(location.search);
+        let s = JSON.parse(localStorage.getItem('bizice_session') || 'null');
+
+        // Fallback: if opened from Hub iframe with URL params but no localStorage session
+        // (rare in some browsers with storage partitioning)
+        if ((!s || !s.name) && params.get('user')) {
+          s = {
+            name: decodeURIComponent(params.get('user') || 'ผู้ใช้'),
+            role: params.get('mode') === 'editor' ? 'editor' : 'viewer',
+            expiry: Date.now() + 86400000
+          };
+          try { localStorage.setItem('bizice_session', JSON.stringify(s)); } catch(e){}
+        }
+
         if (!s || !s.name) { window.location.replace(HUB); return; }
         if (s.expiry && Date.now() > s.expiry) {
           localStorage.removeItem('bizice_session');
@@ -24,7 +38,7 @@
           return;
         }
         window._bizSession = s;
-        window._bizMode = new URLSearchParams(location.search).get('mode') || 'viewer';
+        window._bizMode = params.get('mode') || s.role || 'viewer';
       } catch (e) { window.location.replace(HUB); }
     })();
   </script>

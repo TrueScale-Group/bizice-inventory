@@ -6,18 +6,20 @@ import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { Toast } from '../components/Toast'
 import { useSession } from '../hooks/useSession'
-import { beepClick, beepSuccess } from '../utils/audio'
+import { beepClick, beepSuccess, beepAdd, beepRemove } from '../utils/audio'
 import { toDateKey, toThaiTime } from '../utils/formatDate'
+import { COL } from '../constants/collections'
 
 const CATS = [
-  { id: 'fav',      label: '⭐ ของฉัน' },
-  { id: 'all',      label: 'ทั้งหมด' },
-  { id: 'แยม',     label: '🍓 แยม' },
-  { id: 'ผลไม้',   label: '🍋 ผลไม้' },
-  { id: 'ไซรัป',   label: '🍯 ไซรัป' },
-  { id: 'ท็อปปิ้ง', label: '💎 ท็อปปิ้ง' },
-  { id: 'วัตถุดิบ', label: '🥛 วัตถุดิบ' },
-  { id: 'บรรจุภัณฑ์', label: '🥤 บรรจุ' },
+  { id: 'fav',        name: 'ของฉัน',    emoji: '⭐' },
+  { id: 'all',        name: 'ทั้งหมด',   emoji: '🔍' },
+  { id: 'แยม',       name: 'แยม',        emoji: '🍓' },
+  { id: 'ผลไม้',     name: 'ผลไม้',      emoji: '🍋' },
+  { id: 'ไซรัป',     name: 'ไซรัป',      emoji: '🍯' },
+  { id: 'ท็อปปิ้ง',  name: 'ท็อปปิ้ง',  emoji: '💎' },
+  { id: 'วัตถุดิบ',  name: 'วัตถุดิบ',   emoji: '🥛' },
+  { id: 'บรรจุภัณฑ์', name: 'บรรจุ',    emoji: '🥤' },
+  { id: 'อื่นๆ', name: 'อื่นๆ', emoji: '🔖' },
 ]
 
 export default function CutStock() {
@@ -38,13 +40,14 @@ export default function CutStock() {
   const [selectedStaff, setSelectedStaff] = useState(name)
   const [toast, setToast] = useState('')
   const [confirmLoading, setConfirmLoading] = useState(false)
+  const [cutNote, setCutNote] = useState('')
 
   useEffect(() => {
-    const u1 = onSnapshot(collection(db, 'items'), snap => setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
-    const u2 = onSnapshot(collection(db, 'stock_balances'), snap => setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
-    const u3 = onSnapshot(collection(db, 'quick_templates'), snap => setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0))))
-    const u4 = onSnapshot(collection(db, 'warehouses'), snap => {
-      const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.type === 'branch' && w.active !== false)
+    const u1 = onSnapshot(collection(db, COL.ITEMS), snap => setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+    const u2 = onSnapshot(collection(db, COL.STOCK_BALANCES), snap => setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+    const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0))))
+    const u4 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
+      const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
       setWarehouses(whs)
       if (!shopWH && whs.length > 0) setShopWH(whs[0].id)
     })
@@ -67,7 +70,7 @@ export default function CutStock() {
   }
 
   function addItem(item) {
-    beepClick()
+    beepAdd()
     setCart(c => ({ ...c, [item.id]: (c[item.id] || 0) + 1 }))
   }
 
@@ -107,6 +110,11 @@ export default function CutStock() {
   async function confirmCut() {
     if (cartItems.length === 0 || confirmLoading) return
     setConfirmLoading(true)
+    if (warehouses.find(w => w.id === shopWH)?.type === 'main' && !cutNote.trim()) {
+      setToast('⚠️ กรุณาระบุหมายเหตุ เนื่องจากตัดจากคลังกลาง')
+      setConfirmLoading(false)
+      return
+    }
     try {
       const today = toDateKey()
       const now = serverTimestamp()
@@ -118,17 +126,18 @@ export default function CutStock() {
       }))
 
       // 1. Add cut_stock_logs
-      await addDoc(collection(db, 'cut_stock_logs'), {
+      await addDoc(collection(db, COL.CUT_STOCK_LOGS), {
         date: today, warehouseId: shopWH, shopName,
         staffPhone: phone, staffName: selectedStaff,
-        items: logItems, totalCost: 0, timestamp: now
+        items: logItems, totalCost: 0, timestamp: now,
+        note: cutNote || ''
       })
 
       // 2+3. Batch: reduce stock_balances + add stock_movements
       const batch = writeBatch(db)
       for (const { item, qty } of cartItems) {
         const balId = `${item.id}_${shopWH}`
-        const balRef = doc(db, 'stock_balances', balId)
+        const balRef = doc(db, COL.STOCK_BALANCES, balId)
         const balSnap = await getDoc(balRef)
         if (balSnap.exists()) {
           batch.update(balRef, { qty: Math.max(0, (balSnap.data().qty || 0) - qty), lastUpdated: now })
@@ -136,7 +145,7 @@ export default function CutStock() {
       }
 
       // 4. Audit log
-      batch.set(doc(collection(db, 'audit_logs')), {
+      batch.set(doc(collection(db, COL.AUDIT_LOGS)), {
         action: 'cut_stock', staffPhone: phone, staffName: selectedStaff,
         warehouseId: shopWH, detail: `ตัด ${cartItems.length} รายการ`, timestamp: now
       })
@@ -149,7 +158,7 @@ export default function CutStock() {
         const newStock = Math.max(0, getStock(item.id) - qty)
         if (newStock < (item.minQty || 0)) {
           lowItems.push(item.name)
-          await addDoc(collection(db, 'low_stock_alerts'), {
+          await addDoc(collection(db, COL.LOW_STOCK_ALERTS), {
             itemId: item.id, itemName: item.name, warehouseId: shopWH,
             currentQty: newStock, minQty: item.minQty || 0,
             sentAt: now, read: false
@@ -164,6 +173,7 @@ export default function CutStock() {
         setToast(`✅ ตัดสต็อก ${cartItems.length} รายการเรียบร้อย`)
       }
       setCart({})
+      setCutNote('')
       setCartOpen(false)
     } catch (e) {
       setToast('❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง')
@@ -182,11 +192,12 @@ export default function CutStock() {
     <div className="page-pad">
       {toast && <Toast message={toast} onDone={() => setToast('')} />}
 
-      {/* Topbar */}
-      <div className="topbar">
+      {/* Sub-header */}
+      <div className="page-subbar">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button style={{ border: '1.5px solid var(--border2)', borderRadius: 20, padding: '4px 10px',
-            fontSize: 12, fontWeight: 700, background: 'var(--surf)', cursor: 'pointer' }}
+          <span className="subbar-title">ตัดสต็อก</span>
+          <button style={{ border: '1.5px solid var(--border2)', borderRadius: 20, padding: '3px 10px',
+            fontSize: 12, fontWeight: 700, background: 'var(--surf2)', cursor: 'pointer' }}
             onClick={() => {
               const next = warehouses[(warehouses.findIndex(w => w.id === shopWH) + 1) % (warehouses.length || 1)]
               if (next) setShopWH(next.id)
@@ -221,15 +232,6 @@ export default function CutStock() {
         </div>
       )}
 
-      {/* Category chips */}
-      <div className="chip-row">
-        {CATS.map(c => (
-          <button key={c.id} className={`chip${cat === c.id ? ' active' : ''}`} onClick={() => setCat(c.id)}>
-            {c.label}
-          </button>
-        ))}
-      </div>
-
       {/* Quick templates */}
       {templates.length > 0 && (
         <div style={{ display: 'flex', gap: 8, overflow: 'auto', padding: '0 1rem', scrollbarWidth: 'none' }}>
@@ -245,32 +247,60 @@ export default function CutStock() {
         </div>
       )}
 
-      {/* POS Grid */}
-      <div className="pos-grid">
-        {filteredItems.map(item => {
-          const qty = cart[item.id] || 0
-          const stock = getStock(item.id)
-          const isOut = stock <= 0
+      {/* Sidebar + POS Grid */}
+      <div style={{ display: 'flex', gap: 0, margin: '0 1rem', borderRadius: 14,
+        border: '1px solid var(--border)', overflow: 'hidden', background: 'var(--surf)' }}>
 
-          return (
-            <div key={item.id} className={`pos-card${qty > 0 ? ' selected' : ''}${isOut ? ' out-of-stock' : ''}`}
-              onClick={() => !isOut && addItem(item)}>
-              {qty > 0 && <span className="pos-qty-badge">{qty}</span>}
-              <button className="pos-fav" onClick={e => { e.stopPropagation(); toggleFav(item.id) }}>
-                {faves.has(item.id) ? '⭐' : '☆'}
+        {/* Left: category sidebar */}
+        <div style={{ width: 68, flexShrink: 0, overflowY: 'auto', background: 'var(--bg)',
+          borderRight: '1px solid var(--border)' }}>
+          {CATS.map(c => {
+            const active = cat === c.id
+            return (
+              <button key={c.id} onClick={() => setCat(c.id)}
+                style={{ width: '100%', border: 'none', cursor: 'pointer', padding: '10px 4px',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+                  background: active ? 'var(--surf)' : 'transparent',
+                  borderLeft: active ? '3px solid var(--red)' : '3px solid transparent',
+                  transition: 'all .15s' }}>
+                <span style={{ fontSize: 18, lineHeight: 1 }}>{c.emoji}</span>
+                <span style={{ fontSize: 9.5, fontWeight: active ? 700 : 500, lineHeight: 1.2,
+                  color: active ? 'var(--red)' : 'var(--txt3)', textAlign: 'center', wordBreak: 'break-word', maxWidth: 60 }}>
+                  {c.name}
+                </span>
               </button>
-              <div className="pos-emoji">{item.img || '📦'}</div>
-              <div className="pos-name">{item.name}</div>
-              <div className="pos-stock">เหลือ {stock} {item.unitUse}</div>
-              <div className="pos-counter" onClick={e => e.stopPropagation()}>
-                <button className="pos-btn minus" onClick={() => setQty(item.id, qty - 1)}>−</button>
-                <span className="pos-qty-num">{qty}</span>
-                <button className="pos-btn plus" onClick={() => { beepClick(); setQty(item.id, qty + 1) }}>+</button>
-              </div>
-              <div className="pos-unit">{item.unitUse}</div>
-            </div>
-          )
-        })}
+            )
+          })}
+        </div>
+
+        {/* Right: POS cards */}
+        <div style={{ flex: 1, overflowY: 'auto', maxHeight: 'calc(100vh - 280px)', padding: 8 }}>
+          <div className="pos-grid" style={{ margin: 0 }}>
+            {filteredItems.map(item => {
+              const qty = cart[item.id] || 0
+              const stock = getStock(item.id)
+              const isOut = stock <= 0
+              return (
+                <div key={item.id} className={`pos-card${qty > 0 ? ' selected' : ''}${isOut ? ' out-of-stock' : ''}`}
+                  onClick={() => !isOut && addItem(item)}>
+                  {qty > 0 && <span className="pos-qty-badge">{qty}</span>}
+                  <button className="pos-fav" onClick={e => { e.stopPropagation(); toggleFav(item.id) }}>
+                    {faves.has(item.id) ? '⭐' : '☆'}
+                  </button>
+                  <div className="pos-emoji">{item.img || '📦'}</div>
+                  <div className="pos-name">{item.name}</div>
+                  <div className="pos-stock">เหลือ {stock} {item.unitUse}</div>
+                  <div className="pos-counter" onClick={e => e.stopPropagation()}>
+                    <button className="pos-btn minus" onClick={() => { if (qty > 0) { beepRemove(); setQty(item.id, qty - 1) } }}>−</button>
+                    <span className="pos-qty-num">{qty}</span>
+                    <button className="pos-btn plus" onClick={() => { beepAdd(); setQty(item.id, qty + 1) }}>+</button>
+                  </div>
+                  <div className="pos-unit">{item.unitUse}</div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
       </div>
 
       {/* Cart confirm popup */}
@@ -341,6 +371,19 @@ export default function CutStock() {
                       </span>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Note for main warehouse */}
+              {warehouses.find(w => w.id === shopWH)?.type === 'main' && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#C2410C', marginBottom: 4 }}>
+                    ⚠️ ตัดจากคลังกลาง — ต้องระบุหมายเหตุ *
+                  </div>
+                  <textarea value={cutNote} onChange={e => setCutNote(e.target.value)}
+                    placeholder="ระบุเหตุผลที่ตัดจากคลังกลาง..."
+                    style={{ width: '100%', borderRadius: 10, border: '1.5px solid #F97316', padding: '8px 10px',
+                      fontFamily: 'Sarabun', fontSize: 13, resize: 'none', height: 72, outline: 'none', boxSizing: 'border-box' }} />
                 </div>
               )}
             </div>

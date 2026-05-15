@@ -15,10 +15,10 @@ export function BottomNav({ active, onChange }) {
           className={`nav-item${active === t.id ? ' active' : ''}`}
           onClick={() => onChange(t.id)}
         >
-          <span className="nav-icon">{t.icon}</span>
-          <span className="nav-label" style={active === t.id ? { color: 'var(--red)' } : {}}>
-            {t.label}
+          <span className="nav-pill">
+            <span className="nav-icon">{t.icon}</span>
           </span>
+          <span className="nav-label">{t.label}</span>
         </button>
       ))}
     </nav>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { db } from '../firebase'
 import { collection, query, where, onSnapshot } from 'firebase/firestore'
+import { COL } from '../constants/collections'
 
 export function useStock(warehouseId) {
   const [balances, setBalances] = useState([])
@@ -14,8 +15,8 @@ export function useStock(warehouseId) {
     }
     setLoading(true)
     const q = warehouseId === 'all'
-      ? query(collection(db, 'stock_balances'))
-      : query(collection(db, 'stock_balances'), where('warehouseId', '==', warehouseId))
+      ? query(collection(db, COL.STOCK_BALANCES))
+      : query(collection(db, COL.STOCK_BALANCES), where('warehouseId', '==', warehouseId))
 
     const unsub = onSnapshot(q, snap => {
       setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() })))
