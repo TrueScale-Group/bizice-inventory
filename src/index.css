@@ -603,6 +603,14 @@ html, body, #root {
   80%  { transform: scale(1.05) rotate(3deg); }
   100% { transform: scale(1)    rotate(0deg); }
 }
+/* Guard bar shake — เมื่อพยายามปิดขณะ confirm bar แสดงอยู่ */
+@keyframes guardBarShake {
+  0%,100% { transform: translateX(0); }
+  15%     { transform: translateX(-7px); }
+  35%     { transform: translateX(7px); }
+  55%     { transform: translateX(-4px); }
+  75%     { transform: translateX(4px); }
+}
 
 /* ── Action grid (dashboard) ── */
 .action-grid {

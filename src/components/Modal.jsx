@@ -7,15 +7,16 @@ import { useEffect, useRef, useState } from 'react'
  *   open       — boolean
  *   onClose    — fn
  *   title      — string
- *   lockClose  — boolean  เมื่อ true: กด backdrop ไม่ปิด
- *                          กด X ครั้งแรก → แสดง confirm bar "ออกจริงไหม?"
- *                          กด X อีกครั้ง (หรือ ✓ ยืนยัน) → ปิด
+ *   lockClose  — boolean  เมื่อ true: กด backdrop/X ครั้งแรก → แสดง confirm bar
+ *                          กด backdrop/X ขณะ bar แสดง → shake bar + bounce X (ไม่ปิด)
+ *                          กด "ออก" ใน bar เท่านั้น → ปิด
  *   children
  *   footer
  */
 export function Modal({ open, onClose, title, children, footer, lockClose = false }) {
-  const [xBounce, setXBounce]       = useState(false)
+  const [xBounce,     setXBounce]     = useState(false)
   const [confirmExit, setConfirmExit] = useState(false)
+  const [barShake,    setBarShake]    = useState(false)
   const xBtnRef = useRef(null)
 
   useEffect(() => {
@@ -24,24 +25,30 @@ export function Modal({ open, onClose, title, children, footer, lockClose = fals
     return () => { document.body.style.overflow = '' }
   }, [open])
 
-  // reset confirmExit when modal closes
-  useEffect(() => { if (!open) setConfirmExit(false) }, [open])
+  useEffect(() => { if (!open) { setConfirmExit(false); setBarShake(false) } }, [open])
 
   if (!open) return null
 
+  function shake() {
+    setXBounce(true)
+    setBarShake(false)
+    // double-rAF to restart animation even if already animating
+    requestAnimationFrame(() => requestAnimationFrame(() => setBarShake(true)))
+  }
+
   function handleBackdrop(e) {
     if (e.target !== e.currentTarget) return
-    if (lockClose) {
-      setXBounce(true)
-    } else {
-      onClose()
-    }
+    if (!lockClose) { onClose(); return }
+    if (confirmExit) { shake(); return }   // bar แสดงอยู่ → shake ห้ามออก
+    setConfirmExit(true)
+    setXBounce(true)
   }
 
   function handleX() {
     if (!lockClose) { onClose(); return }
-    if (confirmExit) { onClose(); return }   // กด X ครั้ง 2 → ปิดเลย
+    if (confirmExit) { shake(); return }   // bar แสดงอยู่ → shake ห้ามออก
     setConfirmExit(true)
+    setXBounce(true)
   }
 
   return (
@@ -54,20 +61,24 @@ export function Modal({ open, onClose, title, children, footer, lockClose = fals
             ref={xBtnRef}
             className="sheet-close"
             onClick={handleX}
-            style={xBounce ? { animation: 'xBounce 0.4s ease' } : {}}
+            style={xBounce ? { animation: 'xBounce 0.45s ease' } : {}}
             onAnimationEnd={() => setXBounce(false)}
           >
             ✕
           </button>
         </div>
 
-        {/* Confirm-exit bar — แสดงเมื่อ lockClose + กด X ครั้งแรก */}
+        {/* Confirm-exit bar */}
         {confirmExit && (
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            background: '#FFF7ED', borderBottom: '1px solid #FED7AA',
-            padding: '8px 16px', gap: 10, flexShrink: 0,
-          }}>
+          <div
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              background: '#FFF7ED', borderBottom: '1px solid #FED7AA',
+              padding: '8px 16px', gap: 10, flexShrink: 0,
+              animation: barShake ? 'guardBarShake 0.4s ease' : 'none',
+            }}
+            onAnimationEnd={() => setBarShake(false)}
+          >
             <span style={{ fontSize: 13, color: '#92400E', fontWeight: 600 }}>
               ⚠️ ออกโดยไม่บันทึก?
             </span>
