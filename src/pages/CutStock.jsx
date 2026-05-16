@@ -43,24 +43,30 @@ export default function CutStock() {
   const [confirmLoading, setConfirmLoading] = useState(false)
   const [cutNote, setCutNote] = useState('')
 
+  // Items, templates, warehouses — ไม่ขึ้นกับ warehouse ที่เลือก
   useEffect(() => {
     const u1 = onSnapshot(collection(db, COL.ITEMS), snap => setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
-    const u2 = onSnapshot(collection(db, COL.STOCK_BALANCES), snap => setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
     const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0))))
     const u4 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
       const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
       setWarehouses(whs)
       if (!shopWH && whs.length > 0) {
-        // ตั้งต้นที่สาขา (warehouse ที่ type === 'shop' หรือ isShop === true)
-        // fallback: warehouse ที่ไม่ใช่อันแรก (มักเป็นคลังกลาง) → เลือกอันที่ 2 เป็นต้นไป
         const shop = whs.find(w => w.type === 'shop' || w.isShop === true)
           || whs.find((_, i) => i > 0)
           || whs[0]
         setShopWH(shop.id)
       }
     })
-    return () => { u1(); u2(); u3(); u4() }
+    return () => { u1(); u3(); u4() }
   }, [])
+
+  // Stock balances — filter เฉพาะ warehouse ที่เลือก ลด reads ~50%
+  useEffect(() => {
+    if (!shopWH) return
+    const q = query(collection(db, COL.STOCK_BALANCES), where('warehouseId', '==', shopWH))
+    const unsub = onSnapshot(q, snap => setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+    return () => unsub()
+  }, [shopWH])
 
   function getStock(itemId) {
     const total = balances.filter(b => b.itemId === itemId && b.warehouseId === shopWH)

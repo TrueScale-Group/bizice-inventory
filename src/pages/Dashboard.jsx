@@ -160,7 +160,9 @@ export default function Dashboard() {
   // Modals
   const [receiveOpen, setReceiveOpen] = useState(false)
   const [transferOpen, setTransferOpen] = useState(false)
-  const [refillOpen, setRefillOpen] = useState(false)
+  const [refillOpen, setRefillOpen]   = useState(false)
+  const [refillStep, setRefillStep]   = useState('branch') // 'branch' | 'item'
+  const [refillBranch, setRefillBranch] = useState('')
   const [wasteOpen, setWasteOpen] = useState(false)
   const [bellOpen, setBellOpen] = useState(false)
 
@@ -298,13 +300,7 @@ export default function Dashboard() {
     return () => unsub()
   }, [])
 
-  // Load balances
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, COL.STOCK_BALANCES), snap => {
-      setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    })
-    return () => unsub()
-  }, [])
+  // balances โหลดจาก listener ด้านล่าง (Load low/out stock) ที่มี wh filter อยู่แล้ว
 
   // Load sources from settings
   useEffect(() => {
@@ -393,9 +389,11 @@ export default function Dashboard() {
       ? query(collection(db, COL.STOCK_BALANCES))
       : query(collection(db, COL.STOCK_BALANCES), where('warehouseId', '==', wh))
     const unsub = onSnapshot(q, snap => {
-      const balances = snap.docs.map(d => d.data())
+      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      // เป็น listener เดียวของ balances — ใช้ทั้ง KPI และ state
+      setBalances(docs)
       let low = 0, out = 0
-      balances.forEach(b => {
+      docs.forEach(b => {
         const item = items.find(i => i.id === b.itemId)
         if (!item) return
         if (b.qty <= 0) out++
@@ -983,7 +981,7 @@ export default function Dashboard() {
               <span className="action-icon">🚚</span>
               <span className="action-label">โอนสินค้า</span>
             </button>
-            <button className="action-btn" onClick={() => setRefillOpen(true)}>
+            <button className="action-btn" onClick={() => { setRefillStep('branch'); setRefillBranch(''); setRefillOpen(true) }}>
               <span className="action-icon" style={{ position: 'relative' }}>
                 🔔
                 {alerts.length > 0 && (
@@ -1232,7 +1230,7 @@ export default function Dashboard() {
 
       {/* Modal: รับสินค้า */}
       <Modal open={receiveOpen} onClose={() => setReceiveOpen(false)} title="รับสินค้าเข้าคลัง"
-        lockClose={!!(rcv.itemId || rcv.qty)}
+        lockClose={true}
         footer={rcv.itemId && <button className="btn-primary" onClick={submitReceive} disabled={receiveSaving}>{receiveSaving ? 'กำลังบันทึก...' : '✅ บันทึกรับสินค้า'}</button>}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {/* Item Picker */}
@@ -1293,34 +1291,104 @@ export default function Dashboard() {
         </div>
       </Modal>
 
-      {/* ══ Modal: แจ้งเติมของ (Staff กดแจ้ง → จบ) ══ */}
+      {/* ══ Modal: แจ้งเติมของ — Step 1: เลือกสาขา / Step 2: เลือก item ══ */}
       <Modal open={refillOpen}
-        onClose={() => { setRefillOpen(false); setRefillSelected(new Set()); setRefillQtys({}); setRefillUnits({}); setRefillCat('low') }}
-        title="แจ้งเติมของ"
-        lockClose={refillSelected.size > 0}
-        footer={
-          <button className="btn-primary" onClick={submitRefill}
-            disabled={refillSaving || refillSelected.size === 0}
-            style={{ opacity: refillSaving || refillSelected.size === 0 ? 0.5 : 1 }}>
-            {refillSaving ? 'กำลังส่ง...' : `🔔 แจ้งเติมของ (${refillSelected.size} รายการ)`}
-          </button>
+        onClose={() => { setRefillOpen(false); setRefillSelected(new Set()); setRefillQtys({}); setRefillUnits({}); setRefillCat('low'); setRefillStep('branch'); setRefillBranch('') }}
+        title={refillStep === 'branch' ? 'แจ้งเติมของ — เลือกสาขา' : `แจ้งเติมของ — ${warehouses.find(w => w.id === refillBranch)?.name || ''}`}
+        lockClose={true}
+        footer={refillStep === 'branch'
+          ? (
+            <button className="btn-primary"
+              disabled={!refillBranch}
+              style={{ opacity: refillBranch ? 1 : 0.4 }}
+              onClick={() => refillBranch && setRefillStep('item')}>
+              ถัดไป → เลือกรายการ
+            </button>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => { setRefillStep('branch'); setRefillSelected(new Set()); setRefillQtys({}) }}
+                style={{ flex: '0 0 auto', border: '1.5px solid var(--border)', borderRadius: 12,
+                  padding: '12px 16px', fontSize: 13, background: 'var(--bg)',
+                  color: 'var(--txt2)', cursor: 'pointer', fontWeight: 600 }}>
+                ← สาขา
+              </button>
+              <button className="btn-primary" style={{ flex: 1 }} onClick={submitRefill}
+                disabled={refillSaving || refillSelected.size === 0}
+                style={{ flex: 1, opacity: refillSaving || refillSelected.size === 0 ? 0.5 : 1 }}>
+                {refillSaving ? 'กำลังส่ง...' : `🔔 แจ้งเติมของ (${refillSelected.size} รายการ)`}
+              </button>
+            </div>
+          )
         }>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ fontSize: 12, color: '#92400E', background: '#FFF7ED',
-            borderRadius: 10, padding: '8px 12px', border: '1px solid #FDE68A' }}>
-            🔔 เลือกรายการที่ต้องการเติม · คลังจะดำเนินการสร้างใบโอนให้
+
+        {/* ── Step 1: เลือกสาขา ─────────────────────────── */}
+        {refillStep === 'branch' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 13, color: '#92400E', background: '#FFF7ED',
+              borderRadius: 10, padding: '10px 14px', border: '1px solid #FDE68A' }}>
+              🏪 เลือกสาขาที่ต้องการแจ้งเติมของ
+            </div>
+            {warehouses.filter(w => w.active !== false).map(wh => {
+              const selected = refillBranch === wh.id
+              const lowCount = items.filter(item => {
+                const qty = balances.filter(b => b.itemId === item.id && b.warehouseId === wh.id)
+                  .reduce((s, b) => s + (b.qty || 0), 0)
+                return qty <= (item.minQty || 0)
+              }).length
+              return (
+                <button key={wh.id} onClick={() => setRefillBranch(wh.id)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 14,
+                    padding: '14px 16px', borderRadius: 14, cursor: 'pointer',
+                    border: `2px solid ${selected ? '#F59E0B' : 'var(--border)'}`,
+                    background: selected ? '#FFFBEB' : 'var(--bg)',
+                    transition: 'all .15s', textAlign: 'left', width: '100%' }}>
+                  {/* Radio circle */}
+                  <div style={{ width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+                    border: `2px solid ${selected ? '#F59E0B' : 'var(--border2)'}`,
+                    background: selected ? '#F59E0B' : '#fff',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {selected && <span style={{ color: '#fff', fontSize: 14, fontWeight: 800, lineHeight: 1 }}>✓</span>}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 15, color: selected ? '#92600A' : 'var(--txt1)' }}>
+                      🏪 {wh.name}
+                    </div>
+                    <div style={{ fontSize: 11, marginTop: 3,
+                      color: lowCount > 0 ? '#DC2626' : '#16A34A', fontWeight: 600 }}>
+                      {lowCount > 0 ? `⚠️ Stock ต่ำ/หมด ${lowCount} รายการ` : '✅ Stock ปกติทุกรายการ'}
+                    </div>
+                  </div>
+                  {selected && <span style={{ fontSize: 18 }}>→</span>}
+                </button>
+              )
+            })}
+          </div>
+        )}
+
+        {/* ── Step 2: เลือก item ────────────────────────── */}
+        {refillStep === 'item' && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {/* Branch pill */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            background: '#FFF7ED', borderRadius: 10, padding: '8px 12px', border: '1px solid #FDE68A' }}>
+            <span style={{ fontSize: 12, color: '#92400E', fontWeight: 600 }}>
+              🏪 {warehouses.find(w => w.id === refillBranch)?.name} · เลือกรายการที่ต้องการเติม
+            </span>
           </div>
           {(() => {
+            // กรอง balances เฉพาะสาขาที่เลือก
+            const branchBal = refillBranch
+              ? balances.filter(b => b.warehouseId === refillBranch)
+              : balances
             const allItems = items.filter(item => {
-              const qty = balances.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
+              const qty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               return qty <= (item.minQty || 0)
             })
             const others = items.filter(item => {
-              const qty = balances.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
+              const qty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               return qty > (item.minQty || 0)
             })
             const renderItem = (item) => {
-              const stockQty = balances.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
+              const stockQty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               const checked  = refillSelected.has(item.id)
               const isOut    = stockQty <= 0
               const currentQty  = refillQtys[item.id]  || 0
@@ -1510,7 +1578,7 @@ export default function Dashboard() {
               </>
             )
           })()}
-        </div>
+        </div>}{/* end step item */}
       </Modal>
 
       {/* ══ Modal: สร้างใบโอน + นำส่ง (Owner/คลัง) ══ */}
@@ -1913,7 +1981,7 @@ export default function Dashboard() {
 
       {/* Modal: บันทึกของเสีย */}
       <Modal open={wasteOpen} onClose={() => setWasteOpen(false)} title="บันทึกของเสีย"
-        lockClose={!!(waste.itemId || waste.qty)}
+        lockClose={true}
         footer={waste.itemId && <button className="btn-primary" onClick={saveWaste} disabled={wasteSaving}>
           {wasteSaving ? 'กำลังบันทึก...' : '💾 บันทึก'}
         </button>}>
