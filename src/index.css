@@ -414,6 +414,8 @@ html, body, #root {
   z-index: 50;
   display: flex;
   align-items: flex-end;
+  touch-action: none;        /* ป้องกัน touch events ทะลุ backdrop */
+  user-select: none;
 }
 .bottom-sheet {
   background: var(--surf);
@@ -424,6 +426,8 @@ html, body, #root {
   flex-direction: column;
   overflow: hidden;
   padding-bottom: env(safe-area-inset-bottom);
+  overscroll-behavior: contain;  /* ป้องกัน swipe-to-dismiss บน iOS */
+  touch-action: pan-y;
 }
 .sheet-handle {
   width: 36px;
@@ -480,6 +484,9 @@ html, body, #root {
 .kpi-val { font-family: 'Prompt', sans-serif; font-size: 22px; font-weight: 700; }
 .kpi-sub { font-size: 11px; color: var(--txt3); margin-top: 2px; }
 
+/* ── POS sidebar (CutStock) ── */
+.pos-sidebar { width: 68px; }
+
 /* ── POS card (CutStock) ── */
 .pos-grid {
   display: grid;
@@ -504,6 +511,7 @@ html, body, #root {
 }
 .pos-card.selected { border-color: var(--red); }
 .pos-card.out-of-stock { opacity: 0.4; pointer-events: none; }
+.pos-card.viewer-lock { cursor: default; }
 .pos-qty-badge {
   position: absolute;
   top: 6px;
@@ -974,6 +982,10 @@ html, body, #root {
   .pos-grid     { grid-template-columns: repeat(4, 1fr); }
   .kpi-grid     { grid-template-columns: repeat(4, 1fr); }
   .action-grid  { grid-template-columns: repeat(4, 1fr); }
+  .pos-sidebar  { width: 96px; }
+  .pos-sidebar button { padding: 14px 8px !important; }
+  .pos-sidebar button span:first-child { font-size: 24px !important; }
+  .pos-sidebar button span:last-child  { font-size: 11px !important; max-width: 80px !important; }
 
   /* Bottom sheet → centered dialog on desktop */
   .modal-backdrop {
@@ -1037,6 +1049,10 @@ html, body, #root {
   .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
   .action-grid { grid-template-columns: repeat(4, 1fr); }
   .pos-grid    { grid-template-columns: repeat(3, 1fr); }
+  .pos-sidebar { width: 88px; }
+  .pos-sidebar button { padding: 12px 6px !important; }
+  .pos-sidebar button span:first-child { font-size: 22px !important; }
+  .pos-sidebar button span:last-child  { font-size: 10.5px !important; max-width: 76px !important; }
   /* Bottom nav — centered floating */
   .bottom-nav {
     max-width: 600px;

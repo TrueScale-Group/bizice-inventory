@@ -23,7 +23,8 @@ const CATS = [
 ]
 
 export default function CutStock() {
-  const { name, phone } = useSession()
+  const { name, phone, isEditor } = useSession()
+  const canEdit = isEditor()
   const FAVES_KEY = `fav_${phone}`
 
   const [cat, setCat] = useState('all')
@@ -49,7 +50,14 @@ export default function CutStock() {
     const u4 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
       const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
       setWarehouses(whs)
-      if (!shopWH && whs.length > 0) setShopWH(whs[0].id)
+      if (!shopWH && whs.length > 0) {
+        // ตั้งต้นที่สาขา (warehouse ที่ type === 'shop' หรือ isShop === true)
+        // fallback: warehouse ที่ไม่ใช่อันแรก (มักเป็นคลังกลาง) → เลือกอันที่ 2 เป็นต้นไป
+        const shop = whs.find(w => w.type === 'shop' || w.isShop === true)
+          || whs.find((_, i) => i > 0)
+          || whs[0]
+        setShopWH(shop.id)
+      }
     })
     return () => { u1(); u2(); u3(); u4() }
   }, [])
@@ -192,6 +200,16 @@ export default function CutStock() {
     <div className="page-pad">
       {toast && <Toast message={toast} onDone={() => setToast('')} />}
 
+      {/* Viewer banner */}
+      {!canEdit && (
+        <div style={{ margin: '0 0 8px', padding: '8px 14px', background: '#EFF6FF',
+          border: '1.5px solid #BFDBFE', borderRadius: 12, display: 'flex', alignItems: 'center',
+          gap: 8, fontSize: 13, color: '#1E40AF', fontWeight: 600 }}>
+          <span>👁️</span>
+          <span>Viewer Mode — ดูข้อมูลได้เท่านั้น ไม่สามารถตัดสต็อกได้</span>
+        </div>
+      )}
+
       {/* Sub-header */}
       <div className="page-subbar">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -208,22 +226,24 @@ export default function CutStock() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer' }}
             onClick={() => setPatternOpen(true)}>📊</button>
-          <button onClick={() => cartCount > 0 && setCartOpen(true)}
-            style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', position: 'relative' }}>
-            🛒
-            {cartCount > 0 && (
-              <span style={{ position: 'absolute', top: -4, right: -6, background: 'var(--red)',
-                color: '#fff', borderRadius: '50%', width: 16, height: 16, fontSize: 10,
-                display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>
-                {cartCount}
-              </span>
-            )}
-          </button>
+          {canEdit && (
+            <button onClick={() => cartCount > 0 && setCartOpen(true)}
+              style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', position: 'relative' }}>
+              🛒
+              {cartCount > 0 && (
+                <span style={{ position: 'absolute', top: -4, right: -6, background: 'var(--red)',
+                  color: '#fff', borderRadius: '50%', width: 16, height: 16, fontSize: 10,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>
+                  {cartCount}
+                </span>
+              )}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Cart bar */}
-      {cartCount > 0 && (
+      {/* Cart bar — editor only */}
+      {canEdit && cartCount > 0 && (
         <div style={{ padding: '0 1rem' }}>
           <div className="cart-bar" onClick={() => setCartOpen(true)}>
             <span className="cart-bar-txt">🛒 ตะกร้า — {cartItems.length} รายการ · กดเพื่อยืนยันตัดสต็อก</span>
@@ -252,7 +272,7 @@ export default function CutStock() {
         border: '1px solid var(--border)', overflow: 'hidden', background: 'var(--surf)' }}>
 
         {/* Left: category sidebar */}
-        <div style={{ width: 68, flexShrink: 0, overflowY: 'auto', background: 'var(--bg)',
+        <div className="pos-sidebar" style={{ flexShrink: 0, overflowY: 'auto', background: 'var(--bg)',
           borderRight: '1px solid var(--border)' }}>
           {CATS.map(c => {
             const active = cat === c.id
@@ -275,14 +295,28 @@ export default function CutStock() {
 
         {/* Right: POS cards */}
         <div style={{ flex: 1, overflowY: 'auto', maxHeight: 'calc(100vh - 280px)', padding: 8 }}>
+          {filteredItems.length === 0 && cat === 'fav' && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              height: 200, gap: 10, color: 'var(--txt3)' }}>
+              <span style={{ fontSize: 36 }}>⭐</span>
+              <div style={{ fontSize: 14, fontWeight: 600 }}>ยังไม่มีรายการโปรด</div>
+              <div style={{ fontSize: 12 }}>กดดาว ☆ บนสินค้าเพื่อเพิ่มเข้า "ของฉัน"</div>
+            </div>
+          )}
+          {filteredItems.length === 0 && cat !== 'fav' && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+              height: 120, color: 'var(--txt3)', fontSize: 13 }}>
+              ไม่มีสินค้าในหมวดนี้
+            </div>
+          )}
           <div className="pos-grid" style={{ margin: 0 }}>
             {filteredItems.map(item => {
               const qty = cart[item.id] || 0
               const stock = getStock(item.id)
               const isOut = stock <= 0
               return (
-                <div key={item.id} className={`pos-card${qty > 0 ? ' selected' : ''}${isOut ? ' out-of-stock' : ''}`}
-                  onClick={() => !isOut && addItem(item)}>
+                <div key={item.id} className={`pos-card${qty > 0 ? ' selected' : ''}${isOut ? ' out-of-stock' : ''}${!canEdit ? ' viewer-lock' : ''}`}
+                  onClick={() => canEdit && !isOut && addItem(item)}>
                   {qty > 0 && <span className="pos-qty-badge">{qty}</span>}
                   <button className="pos-fav" onClick={e => { e.stopPropagation(); toggleFav(item.id) }}>
                     {faves.has(item.id) ? '⭐' : '☆'}
@@ -290,11 +324,13 @@ export default function CutStock() {
                   <div className="pos-emoji">{item.img || '📦'}</div>
                   <div className="pos-name">{item.name}</div>
                   <div className="pos-stock">เหลือ {stock} {item.unitUse}</div>
-                  <div className="pos-counter" onClick={e => e.stopPropagation()}>
-                    <button className="pos-btn minus" onClick={() => { if (qty > 0) { beepRemove(); setQty(item.id, qty - 1) } }}>−</button>
-                    <span className="pos-qty-num">{qty}</span>
-                    <button className="pos-btn plus" onClick={() => { beepAdd(); setQty(item.id, qty + 1) }}>+</button>
-                  </div>
+                  {canEdit && (
+                    <div className="pos-counter" onClick={e => e.stopPropagation()}>
+                      <button className="pos-btn minus" onClick={() => { if (qty > 0) { beepRemove(); setQty(item.id, qty - 1) } }}>−</button>
+                      <span className="pos-qty-num">{qty}</span>
+                      <button className="pos-btn plus" onClick={() => { beepAdd(); setQty(item.id, qty + 1) }}>+</button>
+                    </div>
+                  )}
                   <div className="pos-unit">{item.unitUse}</div>
                 </div>
               )
@@ -305,12 +341,16 @@ export default function CutStock() {
 
       {/* Cart confirm popup */}
       {cartOpen && (
-        <div className="modal-backdrop" onClick={e => e.target === e.currentTarget && setCartOpen(false)}>
-          <div className="bottom-sheet">
+        <div className="modal-backdrop"
+          onClick={e => { e.stopPropagation(); e.preventDefault() }}
+          onTouchStart={e => { e.stopPropagation(); e.preventDefault() }}
+          onTouchEnd={e => { e.stopPropagation(); e.preventDefault() }}
+          onPointerDown={e => { e.stopPropagation(); e.preventDefault() }}>
+          <div className="bottom-sheet" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()}>
             <div className="sheet-handle" />
             <div className="sheet-header">
               <span className="sheet-title">ยืนยันตัดสต็อก</span>
-              <button className="sheet-close" onClick={() => setCartOpen(false)}>✕</button>
+              <button className="sheet-close" onClick={() => !confirmLoading && setCartOpen(false)}>✕</button>
             </div>
             <div className="sheet-body">
               {/* Log info */}
