@@ -48,7 +48,13 @@ export default function Warehouse() {
     const u1 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
       const wList = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
       setWarehouses(wList)
-      if (wList.length > 0) setScope(prev => prev || wList[0].id)
+      if (wList.length > 0) {
+        // Default: สาขา (type==='shop' หรือ isShop===true) → fallback อันที่ 2 → อันแรก
+        const shop = wList.find(w => w.type === 'shop' || w.isShop === true)
+          || wList.find((_, i) => i > 0)
+          || wList[0]
+        setScope(prev => prev || shop.id)
+      }
     })
     const u2 = onSnapshot(collection(db, COL.ITEMS), snap => {
       setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })))
