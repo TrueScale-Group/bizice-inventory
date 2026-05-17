@@ -25,6 +25,7 @@
         if ((!s || !s.name) && params.get('user')) {
           s = {
             name: decodeURIComponent(params.get('user') || 'ผู้ใช้'),
+            phone: decodeURIComponent(params.get('phone') || ''),
             role: params.get('mode') === 'owner' ? 'owner' : params.get('mode') === 'editor' ? 'editor' : 'viewer',
             expiry: Date.now() + 86400000
           };
