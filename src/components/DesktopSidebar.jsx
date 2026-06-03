@@ -1,9 +1,5 @@
 function goHome() {
-  if (window.parent !== window) {
-    window.parent.postMessage('closeApp', '*')
-  } else {
-    window.location.href = 'https://truescale-group.github.io/mixue-ice-sakon/'
-  }
+  window.top.location.href = 'https://truescale-group.github.io/mixue-ice-sakon/'
 }
 
 const NAV_ITEMS = [
@@ -19,6 +15,9 @@ export default function DesktopSidebar({ tab, onChange }) {
   const name    = session.name  || 'ผู้ใช้งาน'
   const role    = session.role  || 'viewer'
   const initial = name.charAt(0).toUpperCase()
+  // รูปโปรไฟล์จาก Hub: s.photo → bizice_avatar_<phone> (same-origin)
+  const photo   = session.photo ||
+    (session.phone ? (() => { try { return localStorage.getItem('bizice_avatar_' + session.phone) } catch { return null } })() : null) || null
 
   // role badge colour
   const roleColor = role === 'owner'  ? '#E31E24' :
@@ -71,8 +70,10 @@ export default function DesktopSidebar({ tab, onChange }) {
 
       {/* ─── User footer ─── */}
       <div className="dsb-footer">
-        <div className="dsb-avatar" style={{ background: roleColor }}>
-          {initial}
+        <div className="dsb-avatar" style={photo
+          ? { backgroundImage: `url(${photo})`, backgroundSize: 'cover', backgroundPosition: 'center' }
+          : { background: roleColor }}>
+          {photo ? '' : initial}
         </div>
         <div>
           <div className="dsb-user-name">{name}</div>

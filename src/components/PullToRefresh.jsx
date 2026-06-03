@@ -1,7 +1,7 @@
 import { useRef, useState, useCallback } from 'react'
 
-const THRESHOLD = 68
-const MAX_PULL  = 88
+const THRESHOLD = 100   /* ดึงแรงขึ้น ป้องกัน trigger โดยไม่ตั้งใจ */
+const MAX_PULL  = 115
 const CIRC      = 126
 
 /**

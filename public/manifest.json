@@ -1,0 +1,20 @@
+{
+  "name": "Mixue Inventory",
+  "short_name": "Inventory",
+  "description": "BizICE Inventory — สต็อกวัตถุดิบ Mixue",
+  "start_url": "/bizice-inventory/",
+  "scope": "/bizice-inventory/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FFFFFF",
+  "theme_color": "#E31E24",
+  "lang": "th",
+  "icons": [
+    {
+      "src": "./icon-inventory.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

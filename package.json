@@ -1,7 +1,7 @@
 {
   "name": "bizice-inventory",
   "private": true,
-  "version": "1.5.0",
+  "version": "2.0.36",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
   "dependencies": {
     "firebase": "^10.12.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "xlsx-js-style": "^1.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.1",

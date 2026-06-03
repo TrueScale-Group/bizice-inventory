@@ -10,9 +10,6 @@ export function ConnectionStatus() {
         <span className={`conn-dot ${state}`} />
         <span>{labels[state]}</span>
       </div>
-      {state === 'online' && lastSync && (
-        <span style={{ fontSize: 9, color: 'var(--txt3)' }}>{lastSync} น.</span>
-      )}
       {state === 'offline' && (
         <span style={{ fontSize: 9, color: '#DC2626' }}>⚠️ ไม่มีสัญญาณ</span>
       )}

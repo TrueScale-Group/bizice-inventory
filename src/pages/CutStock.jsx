@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback } from 'react'
 import { db } from '../firebase'
-import { collection, query, where, onSnapshot, addDoc, writeBatch,
-         doc, getDoc, updateDoc, serverTimestamp, increment } from 'firebase/firestore'
+import { collection, query, where, onSnapshot, serverTimestamp } from 'firebase/firestore'
 import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { Toast } from '../components/Toast'
 import { useSession } from '../hooks/useSession'
+import { useOnline }  from '../hooks/useOnline'
 import { beepClick, beepSuccess, beepAdd, beepRemove } from '../utils/audio'
 import { toDateKey, toThaiTime } from '../utils/formatDate'
 import { COL } from '../constants/collections'
+import { cutStock } from '../utils/cutStock'
+import { formatStockQty, balanceId } from '../utils/unit'
 
 const CATS = [
   { id: 'fav',        name: 'ของฉัน',    emoji: '⭐' },
@@ -24,10 +26,13 @@ const CATS = [
 
 export default function CutStock() {
   const { name, phone, isEditor } = useSession()
-  const canEdit = isEditor()
+  const online = useOnline()
+  const canEdit = isEditor() && online   // ❌ offline → ห้ามแก้ไข
   const FAVES_KEY = `fav_${phone}`
 
+  const [loading, setLoading] = useState(true)
   const [cat, setCat] = useState('all')
+  const [search, setSearch] = useState('')
   const [items, setItems] = useState([])
   const [balances, setBalances] = useState([])
   const [templates, setTemplates] = useState([])
@@ -45,7 +50,7 @@ export default function CutStock() {
 
   // Items, templates, warehouses — ไม่ขึ้นกับ warehouse ที่เลือก
   useEffect(() => {
-    const u1 = onSnapshot(collection(db, COL.ITEMS), snap => setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+    const u1 = onSnapshot(collection(db, COL.ITEMS), snap => { setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))); setLoading(false) })
     const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0))))
     const u4 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
       const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
@@ -89,8 +94,17 @@ export default function CutStock() {
   }
 
   function setQty(itemId, qty) {
-    if (qty <= 0) setCart(c => { const n = { ...c }; delete n[itemId]; return n })
-    else setCart(c => ({ ...c, [itemId]: qty }))
+    if (qty <= 0) {
+      setCart(c => {
+        const n = { ...c }
+        delete n[itemId]
+        // ถ้าตะกร้าว่าง → ปิด confirm modal
+        if (Object.keys(n).length === 0) setCartOpen(false)
+        return n
+      })
+    } else {
+      setCart(c => ({ ...c, [itemId]: qty }))
+    }
   }
 
   function applyTemplate(tpl) {
@@ -114,11 +128,12 @@ export default function CutStock() {
     return acc
   }, {})
 
-  // Pre-cut warnings
+  // Pre-cut warnings (เปรียบเทียบใน unitUse — qty ใน cart ก็คือ unitUse อยู่แล้ว)
   const warnings = cartItems.filter(({ item, qty }) => {
     const stock = getStock(item.id)
-    const qtyBase = qty // simplified
-    return (stock - qtyBase) < (item.minQty || 0)
+    const bal   = balances.find(b => b.itemId === item.id && b.warehouseId === shopWH)
+    const minQ  = bal?.minQty || 0
+    return (stock - qty) < minQ
   })
 
   async function confirmCut() {
@@ -130,81 +145,87 @@ export default function CutStock() {
       return
     }
     try {
-      const today = toDateKey()
-      const now = serverTimestamp()
       const shopName = warehouses.find(w => w.id === shopWH)?.name || ''
-
-      const logItems = cartItems.map(({ item, qty }) => ({
-        itemId: item.id, itemName: item.name, img: item.img || '📦',
-        qtyUse: qty, unitUse: item.unitUse, costTotal: 0
-      }))
-
-      // 1. Add cut_stock_logs
-      await addDoc(collection(db, COL.CUT_STOCK_LOGS), {
-        date: today, warehouseId: shopWH, shopName,
-        staffPhone: phone, staffName: selectedStaff,
-        items: logItems, totalCost: 0, timestamp: now,
-        note: cutNote || ''
+      const result = await cutStock({
+        cuts: cartItems.map(({ item, qty }) => ({
+          itemId: item.id, itemName: item.name, img: item.img || '📦',
+          qtyUse: qty, item, costPerUnit: item.unitPrice || 0,
+        })),
+        staffPhone: phone,
+        staffName: selectedStaff,
+        shopName,
+        warehouseId: shopWH,
+        note: cutNote || '',
       })
-
-      // 2+3. Batch: reduce stock_balances + add stock_movements
-      const batch = writeBatch(db)
-      for (const { item, qty } of cartItems) {
-        const balId = `${item.id}_${shopWH}`
-        const balRef = doc(db, COL.STOCK_BALANCES, balId)
-        const balSnap = await getDoc(balRef)
-        if (balSnap.exists()) {
-          batch.update(balRef, { qty: Math.max(0, (balSnap.data().qty || 0) - qty), lastUpdated: now })
-        }
-      }
-
-      // 4. Audit log
-      batch.set(doc(collection(db, COL.AUDIT_LOGS)), {
-        action: 'cut_stock', staffPhone: phone, staffName: selectedStaff,
-        warehouseId: shopWH, detail: `ตัด ${cartItems.length} รายการ`, timestamp: now
-      })
-
-      await batch.commit()
-
-      // 5. Check low stock alerts
-      const lowItems = []
-      for (const { item, qty } of cartItems) {
-        const newStock = Math.max(0, getStock(item.id) - qty)
-        if (newStock < (item.minQty || 0)) {
-          lowItems.push(item.name)
-          await addDoc(collection(db, COL.LOW_STOCK_ALERTS), {
-            itemId: item.id, itemName: item.name, warehouseId: shopWH,
-            currentQty: newStock, minQty: item.minQty || 0,
-            sentAt: now, read: false
-          })
-        }
-      }
 
       beepSuccess()
-      if (lowItems.length > 0) {
-        setToast(`🔔 แจ้ง stock ต่ำ: ${lowItems.join(', ')}`)
-      } else {
-        setToast(`✅ ตัดสต็อก ${cartItems.length} รายการเรียบร้อย`)
-      }
+      const count = cartItems.length
       setCart({})
       setCutNote('')
       setCartOpen(false)
+
+      // Auto Alert Toast — แสดงตามสถานะ stock หลังตัด
+      const low = result?.lowItems || []
+      if (low.length === 0) {
+        setToast(`✅ ตัดสต็อก ${count} รายการเรียบร้อย`)
+      } else {
+        const outs = low.filter(l => l.status === 'out')
+        const lows = low.filter(l => l.status === 'low')
+        // Queue toasts (แสดงทีละอันด้วย setTimeout)
+        setToast(`✅ ตัดสต็อก ${count} รายการเรียบร้อย`)
+        if (outs.length) {
+          setTimeout(() => {
+            setToast(`🔴 หมดสต็อก: ${outs.map(o => o.itemName).join(', ')}`)
+          }, 2200)
+        }
+        if (lows.length) {
+          setTimeout(() => {
+            const msg = lows.length === 1
+              ? `🟡 ${lows[0].itemName} เหลือ ${lows[0].qty} ${lows[0].unit} (min ${lows[0].minQty})`
+              : `🟡 Stock ต่ำ ${lows.length} รายการ: ${lows.map(l => l.itemName).join(', ')}`
+            setToast(msg)
+          }, outs.length ? 4400 : 2200)
+        }
+      }
     } catch (e) {
-      setToast('❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้ง')
+      console.error('[cutStock]', e)
+      setToast('❌ ' + (e.message || 'เกิดข้อผิดพลาด ลองใหม่อีกครั้ง'))
     } finally {
       setConfirmLoading(false)
     }
   }
 
   const filteredItems = items.filter(i => {
-    if (cat === 'fav') return faves.has(i.id)
-    if (cat !== 'all') return i.category === cat
+    // ซ่อน item ที่ถูกปิดสำหรับ warehouse นี้
+    if (shopWH && i.visibleIn?.[shopWH] === false) return false
+    // search match — บน displayName / name (case-insensitive, Thai-friendly)
+    if (search.trim()) {
+      const q = search.trim().toLowerCase()
+      const name = (i.displayName || i.name || '').toLowerCase()
+      if (!name.includes(q)) return false
+    }
+    if (cat === 'fav' && !search.trim()) return faves.has(i.id)
+    if (cat !== 'all' && cat !== 'fav' && !search.trim()) return i.category === cat
     return true
+  }).sort((a, b) => {
+    // เรียงตาม sortOrder (จาก Settings → "ลากเพื่อเรียงลำดับ")
+    const oa = a.sortOrder ?? 999
+    const ob = b.sortOrder ?? 999
+    if (oa !== ob) return oa - ob
+    return (a.name || '').localeCompare(b.name || '', 'th')
   })
 
   return (
     <div className="page-pad">
       {toast && <Toast message={toast} onDone={() => setToast('')} />}
+
+      {loading && (
+        <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'48px 0',gap:12}}>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+          <div style={{width:40,height:40,borderRadius:'50%',border:'3px solid #F3F4F6',borderTopColor:'#E31E24',animation:'spin .7s linear infinite'}}/>
+          <div style={{fontSize:13,fontWeight:700,color:'#9CA3AF'}}>กำลังโหลด...</div>
+        </div>
+      )}
 
       {/* Viewer banner */}
       {!canEdit && (
@@ -234,29 +255,53 @@ export default function CutStock() {
             onClick={() => setPatternOpen(true)}>📊</button>
           {canEdit && (
             <button onClick={() => cartCount > 0 && setCartOpen(true)}
-              style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', position: 'relative' }}>
-              🛒
+              title={cartCount > 0 ? 'กดเพื่อยืนยันตัดสต็อก' : 'ตะกร้าว่าง'}
+              style={{
+                background: cartCount > 0 ? 'var(--red)' : 'transparent',
+                border: cartCount > 0 ? '2px solid var(--red-d)' : '2px solid transparent',
+                borderRadius: 12,
+                padding: cartCount > 0 ? '6px 12px' : '6px',
+                fontSize: 18,
+                cursor: cartCount > 0 ? 'pointer' : 'default',
+                position: 'relative',
+                transition: 'all .15s',
+                boxShadow: cartCount > 0 ? '0 2px 8px rgba(227,30,36,0.35)' : 'none',
+                animation: cartCount > 0 ? 'cartPulse 1.6s ease-in-out infinite' : 'none',
+              }}>
+              <span style={{ filter: cartCount > 0 ? 'grayscale(0) brightness(1.5)' : 'none' }}>🛒</span>
               {cartCount > 0 && (
-                <span style={{ position: 'absolute', top: -4, right: -6, background: 'var(--red)',
-                  color: '#fff', borderRadius: '50%', width: 16, height: 16, fontSize: 10,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>
+                <span style={{ position: 'absolute', top: -6, right: -6, background: '#fff',
+                  color: 'var(--red)', borderRadius: '50%', width: 18, height: 18, fontSize: 10,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700,
+                  border: '2px solid var(--red-d)' }}>
                   {cartCount}
                 </span>
               )}
             </button>
           )}
         </div>
+        <style>{`@keyframes cartPulse{
+          0%,100%{box-shadow:0 2px 8px rgba(227,30,36,0.35)}
+          50%{box-shadow:0 2px 16px rgba(227,30,36,0.7)}
+        }`}</style>
       </div>
 
-      {/* Cart bar — editor only */}
-      {canEdit && cartCount > 0 && (
-        <div style={{ padding: '0 1rem' }}>
-          <div className="cart-bar" onClick={() => setCartOpen(true)}>
-            <span className="cart-bar-txt">🛒 ตะกร้า — {cartItems.length} รายการ · กดเพื่อยืนยันตัดสต็อก</span>
-            <span className="cart-bar-arrow">›</span>
-          </div>
+      {/* Search */}
+      <div style={{ padding: '0 1rem', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div className="search-wrap" style={{ margin: 0, flex: 1 }}>
+          <span className="search-icon">🔍</span>
+          <input className="search-input" placeholder="ค้นหาวัตถุดิบที่จะตัดสต็อก..."
+            value={search} onChange={e => setSearch(e.target.value)} />
+          {search && (
+            <button className="search-clear" onClick={() => setSearch('')} title="ล้าง">✕</button>
+          )}
         </div>
-      )}
+        {search && (
+          <span style={{ fontSize: 12, color: 'var(--txt3)', whiteSpace: 'nowrap', fontWeight: 600 }}>
+            {filteredItems.length} รายการ
+          </span>
+        )}
+      </div>
 
       {/* Quick templates */}
       {templates.length > 0 && (
@@ -328,8 +373,21 @@ export default function CutStock() {
                     {faves.has(item.id) ? '⭐' : '☆'}
                   </button>
                   <div className="pos-emoji">{item.img || '📦'}</div>
-                  <div className="pos-name">{item.name}</div>
-                  <div className="pos-stock">เหลือ {stock} {item.unitUse}</div>
+                  <div className="pos-name">{item.displayName || item.name}</div>
+                  <div className="pos-stock">เหลือ {formatStockQty(stock, item)}</div>
+                  {(() => {
+                    const u = item.unitUse || item.unitBase || ''
+                    const fmtN = n => Number.isInteger(n) ? n : Number(Number(n).toFixed(2))
+                    const f = formatStockQty(stock, item)
+                    const s = `${fmtN(stock)} ${u}`
+                    const showSub = u && f !== s
+                    // Always reserve space (height 14px) so steppers stay aligned across cards
+                    return (
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', height: 16, lineHeight: '16px', marginBottom: 4, textAlign: 'center', visibility: (u && f !== s) ? 'visible' : 'hidden' }}>
+                        {showSub ? `(รวม ${fmtN(stock)} ${u})` : ' '}
+                      </div>
+                    )
+                  })()}
                   {canEdit && (
                     <div className="pos-counter" onClick={e => e.stopPropagation()}>
                       <button className="pos-btn minus" onClick={() => { if (qty > 0) { beepRemove(); setQty(item.id, qty - 1) } }}>−</button>
@@ -352,92 +410,136 @@ export default function CutStock() {
           onTouchStart={e => { e.stopPropagation(); e.preventDefault() }}
           onTouchEnd={e => { e.stopPropagation(); e.preventDefault() }}
           onPointerDown={e => { e.stopPropagation(); e.preventDefault() }}>
-          <div className="bottom-sheet" onClick={e => e.stopPropagation()} onTouchStart={e => e.stopPropagation()}>
+          <div className="bottom-sheet confirm-sheet"
+            onClick={e => e.stopPropagation()}
+            onTouchStart={e => e.stopPropagation()}
+            onTouchEnd={e => e.stopPropagation()}
+            onPointerDown={e => e.stopPropagation()}
+            style={{ maxHeight: '88svh', display: 'flex', flexDirection: 'column' }}>
             <div className="sheet-handle" />
-            <div className="sheet-header">
-              <span className="sheet-title">ยืนยันตัดสต็อก</span>
-              <button className="sheet-close" onClick={() => !confirmLoading && setCartOpen(false)}>✕</button>
-            </div>
-            <div className="sheet-body">
-              {/* Log info */}
-              <div style={{ background: 'var(--bg)', borderRadius: 10, padding: 12, marginBottom: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: 'var(--txt2)', width: 40 }}>โดย</span>
-                  <select className="fi" style={{ flex: 1 }} value={selectedStaff}
-                    onChange={e => setSelectedStaff(e.target.value)}>
-                    <option value={name}>{name}</option>
-                    {staffList.map(s => <option key={s.phone} value={s.name}>{s.name}</option>)}
-                  </select>
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: 'var(--txt2)', width: 40 }}>สาขา</span>
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>
-                    {warehouses.find(w => w.id === shopWH)?.name || ''}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: 'var(--txt2)', width: 40 }}>เวลา</span>
-                  <span style={{ fontSize: 13 }}>{new Date().toLocaleTimeString('th-TH')}</span>
+
+            {/* Header compact */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 16px 10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {/* Snowking mascot animation */}
+                <span className="scissors-spin" style={{ fontSize: 24, lineHeight: 1 }}>✂️</span>
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--txt1)' }}>ยืนยันตัดสต็อก</div>
+                  <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                    {warehouses.find(w => w.id === shopWH)?.name} · {new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })}
+                  </div>
                 </div>
               </div>
+              <button className="sheet-close" onClick={() => !confirmLoading && setCartOpen(false)}>✕</button>
+            </div>
 
-              {/* Items by category */}
-              {Object.entries(cartByCategory).map(([category, list]) => (
-                <div key={category} style={{ marginBottom: 12 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--txt3)', marginBottom: 6 }}>{category}</div>
-                  {list.map(({ item, qty }) => {
-                    const stock = getStock(item.id)
-                    const after = Math.max(0, stock - qty)
-                    return (
-                      <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8,
-                        padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
-                        <input type="checkbox" defaultChecked style={{ width: 16, height: 16 }} />
-                        <span style={{ fontSize: 18 }}>{item.img}</span>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600 }}>{item.name}</div>
-                          <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
-                            {qty} {item.unitUse} → เหลือ {after} {item.unitUse}
+            <div className="sheet-body" style={{ flex: 1, minHeight: 0, overflowY: 'auto', WebkitOverflowScrolling: 'touch', padding: '0 16px 8px' }}>
+
+              {/* Staff selector — compact inline */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
+                background: 'var(--bg)', borderRadius: 10, padding: '8px 12px' }}>
+                <span style={{ fontSize: 11, color: 'var(--txt3)', flexShrink: 0 }}>👤 โดย</span>
+                <select className="fi" style={{ flex: 1, fontSize: 13, padding: '4px 8px', border: 'none',
+                  background: 'transparent', fontWeight: 600 }}
+                  value={selectedStaff} onChange={e => setSelectedStaff(e.target.value)}>
+                  <option value={name}>{name}</option>
+                  {staffList.map(s => <option key={s.phone} value={s.name}>{s.name}</option>)}
+                </select>
+              </div>
+
+              {/* Items — compact rows */}
+              <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid var(--border)', marginBottom: 10 }}>
+                {Object.entries(cartByCategory).map(([category, list], ci) => (
+                  <div key={category}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt3)',
+                      background: 'var(--bg)', padding: '4px 12px', letterSpacing: '0.5px',
+                      borderTop: ci > 0 ? '1px solid var(--border)' : 'none' }}>
+                      {category.toUpperCase()}
+                    </div>
+                    {list.map(({ item, qty }, idx) => {
+                      const stock = getStock(item.id)
+                      const afterStock = Math.max(0, stock - qty)
+                      const bal = balances.find(b => b.itemId === item.id && b.warehouseId === shopWH)
+                      const minQ = bal?.minQty || 0
+                      const isLow = afterStock <= minQ
+                      return (
+                        <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8,
+                          padding: '8px 12px', borderTop: idx > 0 ? '1px solid var(--border)' : 'none',
+                          background: 'var(--surf)' }}>
+                          <span style={{ fontSize: 20 }}>{item.img}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt1)',
+                              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {item.displayName || item.name}
+                            </div>
+                            <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                              −{qty} {item.unitUse} · {confirmLoading
+                                ? <span style={{ color: 'var(--txt3)' }}>กำลังบันทึก...</span>
+                                : <>เหลือ <strong style={{ color: isLow ? '#DC2626' : 'var(--txt2)' }}>{formatStockQty(afterStock, item)}</strong></>}
+                            </div>
+                          </div>
+                          {/* qty editor (−/+/×) */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                            <button onClick={() => { if (qty > 1) setQty(item.id, qty - 1); else setQty(item.id, 0) }}
+                              style={{ width: 24, height: 24, borderRadius: 6, border: 'none',
+                                background: '#F2F2F7', color: 'var(--txt2)', fontWeight: 700,
+                                cursor: 'pointer', fontSize: 13 }}>−</button>
+                            <input type="number" value={qty} min="0"
+                              onChange={e => {
+                                const n = parseFloat(e.target.value)
+                                if (!isFinite(n) || n <= 0) setQty(item.id, 0)
+                                else setQty(item.id, n)
+                              }}
+                              style={{ width: 44, padding: '3px 4px', borderRadius: 6,
+                                border: '1.5px solid var(--red)', background: '#FFF1F2',
+                                fontSize: 13, fontWeight: 700, color: 'var(--red)',
+                                textAlign: 'center', outline: 'none' }}/>
+                            <button onClick={() => setQty(item.id, qty + 1)}
+                              style={{ width: 24, height: 24, borderRadius: 6, border: 'none',
+                                background: 'var(--red-p)', color: 'var(--red)', fontWeight: 700,
+                                cursor: 'pointer', fontSize: 13 }}>+</button>
+                            <button onClick={() => setQty(item.id, 0)}
+                              title="ลบรายการนี้"
+                              style={{ width: 24, height: 24, borderRadius: 6, border: 'none',
+                                background: '#FEE2E2', color: '#DC2626', fontWeight: 700,
+                                cursor: 'pointer', fontSize: 11, marginLeft: 2 }}>✕</button>
                           </div>
                         </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              ))}
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
 
-              {/* Warnings */}
+              {/* Warnings compact */}
               {warnings.length > 0 && (
-                <div style={{ background: '#FFF7ED', borderRadius: 10, padding: 12, marginTop: 8 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: '#92600A', marginBottom: 6 }}>⚠️ คำเตือน stock ต่ำ</div>
-                  {warnings.map(({ item, qty }) => (
-                    <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-                      <input type="checkbox" style={{ width: 15, height: 15 }} />
-                      <span style={{ fontSize: 12, color: '#92600A' }}>
-                        {item.name} จะเหลือน้อยกว่า min ({item.minQty} {item.unitUse})
-                      </span>
-                    </div>
-                  ))}
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: '#FFFBEB',
+                  border: '1px solid #FDE68A', borderRadius: 10, padding: '8px 12px', marginBottom: 10 }}>
+                  <span style={{ fontSize: 14 }}>⚠️</span>
+                  <div style={{ fontSize: 11, color: '#92400E', flex: 1 }}>
+                    {warnings.map(({ item }) => item.name).join(', ')} ใกล้หมด
+                  </div>
                 </div>
               )}
 
               {/* Note for main warehouse */}
               {warehouses.find(w => w.id === shopWH)?.type === 'main' && (
-                <div style={{ marginTop: 8 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: '#C2410C', marginBottom: 4 }}>
-                    ⚠️ ตัดจากคลังกลาง — ต้องระบุหมายเหตุ *
-                  </div>
-                  <textarea value={cutNote} onChange={e => setCutNote(e.target.value)}
-                    placeholder="ระบุเหตุผลที่ตัดจากคลังกลาง..."
-                    style={{ width: '100%', borderRadius: 10, border: '1.5px solid #F97316', padding: '8px 10px',
-                      fontFamily: 'Sarabun', fontSize: 13, resize: 'none', height: 72, outline: 'none', boxSizing: 'border-box' }} />
-                </div>
+                <textarea value={cutNote} onChange={e => setCutNote(e.target.value)}
+                  placeholder="⚠️ ตัดจากคลังกลาง — ระบุเหตุผล..."
+                  style={{ width: '100%', borderRadius: 10, border: '1.5px solid #F97316', padding: '8px 12px',
+                    fontFamily: 'Sarabun', fontSize: 13, resize: 'none', height: 64,
+                    outline: 'none', boxSizing: 'border-box', background: '#FFF7ED' }} />
               )}
             </div>
 
-            <div style={{ padding: '0 16px 16px', display: 'flex', gap: 10 }}>
-              <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setCartOpen(false)}>ยกเลิก</button>
-              <button className="btn-primary" style={{ flex: 2 }} onClick={confirmCut} disabled={confirmLoading}>
-                {confirmLoading ? 'กำลังบันทึก...' : '✓ ยืนยันตัดสต็อก'}
+            <div style={{ padding: '10px 16px', display: 'flex', gap: 8, borderTop: '1px solid var(--border)', background: 'var(--surf)', flexShrink: 0 }}>
+              <button className="btn-secondary" style={{ flex: 1, padding: '11px 0', fontSize: 14 }}
+                onClick={() => setCartOpen(false)}>ยกเลิก</button>
+              <button className="btn-primary" style={{ flex: 2, padding: '11px 0', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                onClick={confirmCut} disabled={confirmLoading}>
+                {confirmLoading
+                  ? <><span className="snowking-spin" style={{ fontSize: 16 }}>✂️</span> กำลังบันทึก...</>
+                  : <>✓ ยืนยันตัดสต็อก</>}
               </button>
             </div>
           </div>
@@ -445,12 +547,131 @@ export default function CutStock() {
       )}
 
       {/* Usage Pattern popup */}
-      <Modal open={patternOpen} onClose={() => setPatternOpen(false)} title="📊 รูปแบบการใช้งาน">
-        <div style={{ color: 'var(--txt3)', textAlign: 'center', padding: '20px 0', fontSize: 14 }}>
-          ดูรายงานการใช้งานเฉลี่ย 7 วัน และแนะนำสั่งซื้อ<br />
-          <span style={{ fontSize: 12, marginTop: 8, display: 'block' }}>ข้อมูลจะแสดงเมื่อมีประวัติตัดสต็อก</span>
-        </div>
-      </Modal>
+      <UsagePatternPopup
+        open={patternOpen}
+        onClose={() => setPatternOpen(false)}
+        warehouseId={shopWH}
+        items={items}
+        balances={balances}
+      />
     </div>
+  )
+}
+
+/* ─────────────────────────────────────────────────────────────
+   UsagePatternPopup — 7/30 วัน + แนะนำสั่งซื้อ
+───────────────────────────────────────────────────────────── */
+function UsagePatternPopup({ open, onClose, warehouseId, items = [], balances = [] }) {
+  const [days, setDays] = useState(7)
+  const [logs, setLogs] = useState([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!open || !warehouseId) return
+    setLoading(true)
+    const today = new Date()
+    const start = new Date(today.getTime() - (days - 1) * 86400000)
+    const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+    const q = query(
+      collection(db, COL.CUT_STOCK_LOGS),
+      where('warehouseId', '==', warehouseId),
+      where('date', '>=', fmt(start)),
+      where('date', '<=', fmt(today)),
+    )
+    const unsub = onSnapshot(q, snap => {
+      setLogs(snap.docs.map(d => d.data()).filter(d => !d.deletedAt))
+      setLoading(false)
+    })
+    return () => unsub()
+  }, [open, warehouseId, days])
+
+  // Aggregate per item
+  const itemUsage = {}
+  logs.forEach(log => {
+    (log.items || []).forEach(it => {
+      const k = it.itemId
+      if (!itemUsage[k]) {
+        const master = items.find(i => i.id === k)
+        itemUsage[k] = {
+          itemId: k,
+          name: it.itemName,
+          img: it.img || master?.img || '📦',
+          unitUse: it.unitUse || master?.unitUse || '',
+          total: 0,
+        }
+      }
+      itemUsage[k].total += Number(it.qtyUse) || 0
+    })
+  })
+  const rows = Object.values(itemUsage)
+    .map(r => {
+      const bal = balances.find(b => b.itemId === r.itemId && b.warehouseId === warehouseId)
+      const avgPerDay = r.total / days
+      const suggestQty = Math.round(avgPerDay * 7 * 1.2)   // 7 วัน + buffer 20%
+      const current = bal?.qty || 0
+      return { ...r, avgPerDay, suggestQty, current, gap: Math.max(0, suggestQty - current) }
+    })
+    .sort((a, b) => b.total - a.total)
+
+  return (
+    <Modal open={open} onClose={onClose} title="📊 รูปแบบการใช้งาน">
+      <div style={{ padding: '0 16px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {/* Period pills */}
+        <div style={{ display: 'flex', gap: 6 }}>
+          {[7, 30].map(n => (
+            <button key={n} onClick={() => setDays(n)}
+              style={{ padding: '6px 14px', border: 'none', borderRadius: 20, fontSize: 12,
+                fontWeight: 700, cursor: 'pointer',
+                background: days === n ? 'var(--red)' : 'var(--bg)',
+                color: days === n ? '#fff' : 'var(--txt2)' }}>
+              {n} วัน
+            </button>
+          ))}
+        </div>
+
+        {loading && (
+          <div style={{ textAlign: 'center', padding: 20, fontSize: 12, color: 'var(--txt3)' }}>
+            กำลังโหลด...
+          </div>
+        )}
+
+        {!loading && rows.length === 0 && (
+          <div style={{ textAlign: 'center', padding: 30, fontSize: 13, color: 'var(--txt3)' }}>
+            ยังไม่มีประวัติตัดสต็อก {days} วันที่ผ่านมา
+          </div>
+        )}
+
+        {!loading && rows.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>
+              📋 ใช้ทั้งหมด {rows.length} รายการ · แนะนำสั่งซื้อสำหรับสัปดาห์หน้า
+            </div>
+            {rows.map(r => (
+              <div key={r.itemId} style={{ background: 'var(--bg)', borderRadius: 10,
+                padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ fontSize: 22 }}>{r.img}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--txt)' }}>{r.name}</div>
+                  <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                    ใช้ {r.total.toFixed(1)} {r.unitUse} · เฉลี่ย {r.avgPerDay.toFixed(2)}/วัน
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 10, color: 'var(--txt3)' }}>แนะนำสั่ง</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--red)' }}>
+                    {r.suggestQty} {r.unitUse}
+                  </div>
+                  {r.gap > 0 && (
+                    <div style={{ fontSize: 10, color: '#D97706', fontWeight: 700 }}>
+                      ขาด {r.gap}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
   )
 }

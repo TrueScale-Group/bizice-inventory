@@ -6,6 +6,10 @@ import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { useSession } from '../hooks/useSession'
 import { Toast } from '../components/Toast'
+import IntegrationModal from '../components/IntegrationModal'
+import QuickTemplateModal from '../components/QuickTemplateModal'
+import SeedStockModal from '../components/SeedStockModal'
+import DataSheetModal from '../components/DataSheetModal'
 import { COL } from '../constants/collections'
 import { beepAdd, beepRemove } from '../utils/audio'
 
@@ -14,6 +18,53 @@ const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/'
 const CAT_EMOJI = {
   'แยม': '🍓', 'ผลไม้': '🍑', 'ไซรัป': '🍯',
   'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
+}
+
+// ── เลือก level ที่ user ใน CM เลือกเป็น "หน่วยใช้" ──
+//   CM มี item.unit = finalUnit ที่ user เลือกใน dropdown "หน่วยที่ใช้ตัดสต็อก"
+//   หา index ของ level ที่ตรงกับ item.unit (default = level[1] ถ้าไม่เจอ)
+function findUseLevelIdx(levels, finalUnit) {
+  if (!Array.isArray(levels) || levels.length === 0) return -1
+  if (finalUnit) {
+    const i = levels.findIndex(l => l.name === finalUnit)
+    if (i >= 1) return i        // เลือก level >= 1 (level 0 = base ห้ามเป็น unitUse)
+  }
+  return Math.min(1, levels.length - 1)   // default = level[1]
+}
+
+// ── คำนวณ cumulative factor จาก base ถึง level[idx] ──
+//   levels เก็บแบบ per-parent: total = level[1].qty × level[2].qty × ...
+function cumulativeFactor(levels, idx) {
+  let f = 1
+  for (let i = 1; i <= idx; i++) f *= Number(levels[i]?.qty || 1)
+  return f
+}
+
+// ── Build unitLevels[] = ทุกระดับจาก CM พร้อม factorToUse ──
+//   factorToUse: 1 ของ level นี้ = N ของ unitUse (ใช้แปลงตอนปรับยอด)
+function buildUnitLevels(levels, useIdx) {
+  if (!Array.isArray(levels) || levels.length === 0) return []
+  const cumUse = cumulativeFactor(levels, useIdx) || 1
+  // cumulativeFactor(idx) = จำนวน level[idx] ใน 1 level[0]
+  //   → 1 level[i] = cum(useIdx) / cum(i) ของ level[useIdx]
+  return levels.map((lv, i) => {
+    const cumI = cumulativeFactor(levels, i) || 1
+    return {
+      name: lv?.name || '',
+      factorToUse: cumUse / cumI,
+    }
+  }).filter(l => l.name)
+}
+
+// ── Build unitConversion string ──
+//   ใช้ cumulative factor ตาม useLevel ที่เลือก
+function buildUnitConversion(levels, useIdx) {
+  if (!Array.isArray(levels) || levels.length < 2) return ''
+  const base = levels[0]
+  const use  = levels[useIdx]
+  if (!base?.name || !use?.name) return ''
+  const factor = cumulativeFactor(levels, useIdx)
+  return `1 ${base.name} = ${factor} ${use.name}`
 }
 
 // ── คำนวณ diff ระหว่าง CM library กับ Inventory items ──
@@ -27,42 +78,130 @@ async function diffFromCostManager() {
   const existingMap = {}
   existingSnap.docs.forEach(d => { existingMap[d.data().name] = { id: d.id, ...d.data() } })
 
-  const toAdd = []    // ใหม่จาก CM ที่ยังไม่มีใน Inventory
-  const toUpdate = [] // มีอยู่แล้วแต่ข้อมูล CM เปลี่ยน (หน่วย/ราคา)
+  const toAdd = []
+  const toUpdate = []
 
   library.forEach(item => {
     const cat = item.cat || 'อื่นๆ'
     const levels = item.levels || []
-    const unitBuy      = levels[0]?.name || item.unit || ''
-    const unitUse      = levels[1]?.name || item.unit || unitBuy
-    const unitSub      = levels[2]?.name || ''
-    const convBuyToUse = levels[1]?.qty  || ''
-    const convUseToSub = levels[2]?.qty  || ''
+    const inv0 = existingMap[item.name]   // เพื่อตรวจ local cutLevel
+
+    // ── เลือก level ที่ใช้ — เคารพ local cutLevel ของ Inventory ถ้ามี ──
+    //   ถ้า user ตั้ง cutLevel ไว้แล้ว → ใช้ตัวนั้น
+    //   ถ้าไม่มี แต่ inv.unitUse match level เดิม → infer cutLevel จาก unitUse
+    //   ถ้าไม่มีอะไรเลย → ใช้ CM's dropdown (item.unit)
+    const cmUseIdx = findUseLevelIdx(levels, item.unit)
+    const cmCutLevel = cmUseIdx === 0 ? 'buy' : cmUseIdx === 1 ? 'use' : 'sub'
+
+    let effectiveCutLevel
+    if (inv0?.cutLevel) {
+      effectiveCutLevel = inv0.cutLevel
+    } else if (inv0?.unitUse) {
+      // Legacy item — infer cutLevel จาก unitUse ที่ตรงกับ level name
+      const inferredIdx = levels.findIndex(l => l.name === inv0.unitUse)
+      if (inferredIdx === 0)      effectiveCutLevel = 'buy'
+      else if (inferredIdx === 1) effectiveCutLevel = 'use'
+      else if (inferredIdx >= 2)  effectiveCutLevel = 'sub'
+      else                         effectiveCutLevel = cmCutLevel
+    } else {
+      effectiveCutLevel = cmCutLevel
+    }
+
+    const useIdx =
+      effectiveCutLevel === 'buy' ? 0 :
+      effectiveCutLevel === 'sub' ? Math.min(2, levels.length - 1) :
+      Math.min(1, levels.length - 1)
+
+    const unitBase = levels[0]?.name || item.unit || ''
+    const unitUse  = levels[useIdx]?.name || levels[0]?.name || ''
+    // Raw 3-level (เก็บไว้สำหรับ Master Data form — ไม่ขึ้นกับ cutLevel)
+    const unitUseRaw = levels[1]?.name || ''       // middle (raw)
+    const unitSubRawCm = levels[2]?.name || ''     // smallest (raw)
+
+    // unitConversion = "1 unitBase = cumulative unitUse"
+    const unitConversion = buildUnitConversion(levels, useIdx)
+
+    // ── unitSub = level ที่เล็กกว่า unitUse (ถ้ามี) — ใช้สำหรับ Waste Logs ──
+    let unitSub = ''
+    let convSub = 0
+    if (useIdx < levels.length - 1) {
+      const subIdx = levels.length - 1   // เอา level เล็กสุด
+      unitSub = levels[subIdx]?.name || ''
+      // convSub (per-parent semantics): 1 unitUse = convSub unitSub
+      //   = cumulative(base→subIdx) / cumulative(base→useIdx)
+      const fSub = cumulativeFactor(levels, subIdx)
+      const fUse = cumulativeFactor(levels, useIdx)
+      convSub = fUse > 0 ? fSub / fUse : 0
+    }
+
+    // ── unitPrice = ฿/unitUse ──
+    //   CM.unitPrice = ฿/smallest level (level สุดท้าย)
+    //   ต้องแปลงเป็น ฿/unitUse ถ้า useIdx != smallest
+    const cmPrice = Number(item.unitPrice) || 0
+    const lastIdx = levels.length - 1
+    const fUse    = cumulativeFactor(levels, useIdx)
+    const fLast   = cumulativeFactor(levels, lastIdx)
+    // ราคา/unitUse = CM.unitPrice × (fLast / fUse)
+    const unitPrice = (fUse > 0 && fLast > 0)
+      ? cmPrice * (fLast / fUse)
+      : cmPrice
+    // rawBasePrice = ฿/หน่วยที่ 1 (ฐาน) — invariant สำหรับเปลี่ยน cutLevel ในอนาคต
+    //   = CM.unitPrice × fLast  (เพราะ smallest_count_per_base = fLast)
+    const rawBasePrice = fLast > 0 ? cmPrice * fLast : 0
+
+    // cmCutLevel แล้วถูกคำนวณไว้ด้านบน (อิงจาก CM.unit)
+    // effectiveCutLevel = อะไรที่ใช้จริง (เคารพ local override)
+
+    const unitLevels = buildUnitLevels(levels, useIdx)
 
     if (!existingMap[item.name]) {
-      toAdd.push({ cmItem: item, cat, unitBuy, unitUse, unitSub, convBuyToUse, convUseToSub })
+      toAdd.push({ cmItem: item, cat, unitBase, unitUse, unitConversion, unitSub, convSub,
+        unitPrice, rawBasePrice, cmCutLevel, unitUseRaw, unitSubRawCm, unitLevels })
     } else {
-      // เช็ค diff หน่วย
       const inv = existingMap[item.name]
-      const invUnitBuy      = inv.unitBuy || inv.unitBase || ''
-      const invUnitUse      = inv.unitUse || ''
-      const invUnitSub      = inv.unitSub || ''
-      const invConv         = String(inv.convBuyToUse || '')
-      const invConvSub      = String(inv.convUseToSub || '')
       const changes = []
-      if (invUnitBuy  !== unitBuy)            changes.push({ field: 'หน่วยซื้อ',    from: invUnitBuy,  to: unitBuy })
-      if (invUnitUse  !== unitUse)            changes.push({ field: 'หน่วยใช้',     from: invUnitUse,  to: unitUse })
-      if (invUnitSub  !== unitSub)            changes.push({ field: 'หน่วยย่อย',    from: invUnitSub,  to: unitSub })
-      if (invConv     !== String(convBuyToUse)) changes.push({ field: 'อัตราแปลง',  from: invConv,     to: String(convBuyToUse) })
-      if (invConvSub  !== String(convUseToSub)) changes.push({ field: 'อัตราย่อย', from: invConvSub,  to: String(convUseToSub) })
-      if (changes.length > 0) toUpdate.push({ inv, cmItem: item, changes, cat, unitBuy, unitUse, unitSub, convBuyToUse, convUseToSub })
+      if ((inv.unitBase || '')       !== unitBase)       changes.push({ field: 'หน่วยฐาน',  from: inv.unitBase || '', to: unitBase })
+      if ((inv.unitUse  || '')       !== unitUse)        changes.push({ field: 'หน่วยใช้',  from: inv.unitUse  || '', to: unitUse })
+      if ((inv.unitConversion || '') !== unitConversion) changes.push({ field: 'อัตราแปลง', from: inv.unitConversion || '', to: unitConversion })
+      if ((inv.unitSub || '')        !== unitSub)        changes.push({ field: 'หน่วยชั่ง (Waste)', from: inv.unitSub || '', to: unitSub })
+      if (Number(inv.convSub) || 0) {} // compare
+      if ((Number(inv.convSub) || 0) !== convSub)        changes.push({ field: 'อัตราชั่ง',  from: String(inv.convSub || 0), to: String(convSub) })
+      if (Math.abs((Number(inv.unitPrice) || 0) - unitPrice) > 0.001) {
+        changes.push({
+          field: 'ราคา/หน่วย',
+          from: `฿${Number(inv.unitPrice || 0).toFixed(2)}`,
+          to:   `฿${Number(unitPrice).toFixed(2)}`,
+        })
+      }
+      // ── Force update ถ้า raw fields หาย หรือ unitLevels factor ผิด ──
+      const invLv = Array.isArray(inv.unitLevels) ? inv.unitLevels : []
+      const factorMismatch = invLv.length !== unitLevels.length ||
+        unitLevels.some((lv, i) => {
+          const a = invLv[i]
+          if (!a || a.name !== lv.name) return true
+          const ratio = Number(a.factorToUse) || 0
+          return Math.abs(ratio - lv.factorToUse) > 0.0001
+        })
+      const needMigration =
+        (inv.unitUseRaw == null && unitUseRaw) ||
+        (inv.unitSubRaw == null && unitSubRawCm) ||
+        (inv.cutLevel == null) ||
+        (inv.rawBasePrice == null && rawBasePrice > 0) ||
+        factorMismatch
+      if (needMigration && changes.length === 0) {
+        changes.push({ field: 'ระบบ', from: factorMismatch ? 'unitLevels เก่า/ผิด' : 'รุ่นเก่า', to: 'อัพเดท unitLevels + raw 3-level + cutLevel' })
+      }
+      if (changes.length > 0) {
+        toUpdate.push({ inv, cmItem: item, changes, cat, unitBase, unitUse, unitConversion, unitSub, convSub,
+          unitPrice, rawBasePrice, cmCutLevel, effectiveCutLevel, unitUseRaw, unitSubRawCm, unitLevels })
+      }
     }
   })
 
   return { toAdd, toUpdate, total: library.length, lastSync: snap.data().updatedAt || '' }
 }
 
-// ── apply update: batch write ──
+// ── apply update: batch write (V2 schema + unitSub สำหรับ Waste Logs) ──
 async function applyUpdateFromCM(toAdd, toUpdate, onProgress) {
   const BATCH_SIZE = 400
   let done = 0
@@ -71,15 +210,30 @@ async function applyUpdateFromCM(toAdd, toUpdate, onProgress) {
   // เพิ่มรายการใหม่
   for (let i = 0; i < toAdd.length; i += BATCH_SIZE) {
     const batch = writeBatch(db)
-    toAdd.slice(i, i + BATCH_SIZE).forEach(({ cmItem, cat, unitBuy, unitUse, unitSub, convBuyToUse, convUseToSub }) => {
+    toAdd.slice(i, i + BATCH_SIZE).forEach(({ cmItem, cat, unitBase, unitUse, unitConversion, unitSub, convSub,
+      unitPrice, rawBasePrice, cmCutLevel, unitUseRaw, unitSubRawCm, unitLevels }) => {
       const ref = doc(collection(db, COL.ITEMS))
+      // หน่วย 3 ระดับจาก CM levels[] (raw)
+      const cmLevels = cmItem.levels || []
+      const c1 = Number(cmLevels[1]?.qty) || 1
+      const c2 = Number(cmLevels[2]?.qty) || 0
       batch.set(ref, {
-        name: cmItem.name, category: cat, img: CAT_EMOJI[cat] || '📦',
-        unitBase: unitUse, unitBuy, unitUse,
-        unitSub: unitSub || '',
-        convBuyToUse: convBuyToUse ? Number(convBuyToUse) : 0,
-        convUseToSub: convUseToSub ? Number(convUseToSub) : 0,
-        minQty: 0, maxQty: 0,
+        name: cmItem.name,
+        category: cat,
+        img: CAT_EMOJI[cat] || '📦',
+        // Effective (computed for current cutLevel)
+        unitBase, unitUse, unitConversion,
+        unitSub, convSub,
+        // Raw 3-level (preserved สำหรับ Master Data form)
+        unitBuy:    cmLevels[0]?.name || unitBase,
+        unitUseRaw: unitUseRaw,
+        unitSubRaw: unitSubRawCm,
+        convBuyToUse: c1,
+        convUseToSub: c2,
+        cutLevel:   cmCutLevel,           // ตาม CM dropdown
+        wasteLevel: unitSubRawCm ? 'sub' : 'use',
+        unitLevels: unitLevels || [],     // ทุก level จาก CM + factorToUse
+        unitPrice, rawBasePrice,
         wasteMode: cat === 'ผลไม้',
         sourceId: cmItem.id,
         createdAt: serverTimestamp(),
@@ -93,12 +247,23 @@ async function applyUpdateFromCM(toAdd, toUpdate, onProgress) {
   // อัพเดทรายการเดิม
   for (let i = 0; i < toUpdate.length; i += BATCH_SIZE) {
     const batch = writeBatch(db)
-    toUpdate.slice(i, i + BATCH_SIZE).forEach(({ inv, unitBuy, unitUse, unitSub, convBuyToUse, convUseToSub }) => {
+    toUpdate.slice(i, i + BATCH_SIZE).forEach(({ inv, cmItem, unitBase, unitUse, unitConversion, unitSub, convSub,
+      unitPrice, rawBasePrice, cmCutLevel, effectiveCutLevel, unitUseRaw, unitSubRawCm, unitLevels }) => {
+      const cmLevels = cmItem.levels || []
+      const c1 = Number(cmLevels[1]?.qty) || 1
+      const c2 = Number(cmLevels[2]?.qty) || 0
       batch.update(doc(db, COL.ITEMS, inv.id), {
-        unitBase: unitUse, unitBuy, unitUse,
-        unitSub: unitSub || '',
-        convBuyToUse: convBuyToUse ? Number(convBuyToUse) : 0,
-        convUseToSub: convUseToSub ? Number(convUseToSub) : 0,
+        unitBase, unitUse, unitConversion,
+        unitSub, convSub,
+        unitBuy:    cmLevels[0]?.name || unitBase,
+        unitUseRaw,
+        unitSubRaw: unitSubRawCm,
+        convBuyToUse: c1,
+        convUseToSub: c2,
+        // เก็บ cutLevel (inferred/local/cm) เพื่อให้ future sync stable
+        cutLevel:   effectiveCutLevel || cmCutLevel,
+        unitLevels: unitLevels || [],
+        unitPrice, rawBasePrice,
       })
     })
     await batch.commit()
@@ -150,6 +315,103 @@ function UnitChips({ opts, selected, onChange }) {
       })}
     </div>
   )
+}
+
+/* ══════════════════════════════════════════════════════════
+   MultiLevelStepper — [−] qty [+] ชื่อหน่วย  สำหรับทุก level
+   ══════════════════════════════════════════════════════════ */
+function MultiLevelStepper({ levels, values, onChange }) {
+  // levels  : [{ name, factor, qty }, ...]   — index 0 = base unit (smallest)
+  // values  : number[]                        — qty per level
+  // onChange: (newValues: number[]) => void
+  const [editIdx, setEditIdx] = useState(null)
+  const [editVal, setEditVal] = useState('')
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (editIdx !== null && inputRef.current) inputRef.current.select()
+  }, [editIdx])
+
+  function setLvl(i, v) {
+    const next = (values && values.length === levels.length)
+      ? [...values]
+      : levels.map(() => 0)
+    next[i] = Math.max(0, Math.floor(v))
+    onChange(next)
+  }
+
+  return (
+    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+      {levels.map((lv, i) => {
+        // levels มาจาก Cost Manager เรียงใหญ่→เล็กอยู่แล้ว ไม่ต้อง reverse
+        const qty = values?.[i] ?? 0
+        const isEditing = editIdx === i
+        return (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 0,
+            borderRadius: 10, border: '1.5px solid #F59E0B', overflow: 'hidden',
+            background: '#FFF9EF', flexShrink: 0 }}>
+            {/* − */}
+            <button
+              onClick={() => { beepRemove(); setLvl(i, qty - 1) }}
+              style={{ width: 34, height: 38, border: 'none', background: 'transparent',
+                fontSize: 20, fontWeight: 700, color: '#F59E0B', cursor: 'pointer', lineHeight: 1 }}>
+              −
+            </button>
+            {/* qty display / tap-to-edit */}
+            {isEditing ? (
+              <input
+                ref={inputRef}
+                type="number" min="0" step="1"
+                value={editVal}
+                onChange={e => setEditVal(e.target.value)}
+                onBlur={() => { setLvl(i, parseFloat(editVal) || 0); setEditIdx(null) }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') { setLvl(i, parseFloat(editVal) || 0); setEditIdx(null) }
+                  if (e.key === 'Escape') setEditIdx(null)
+                }}
+                style={{ width: 44, textAlign: 'center', border: 'none', outline: 'none',
+                  background: 'transparent', fontFamily: 'Prompt', fontWeight: 700,
+                  fontSize: 15, color: '#1C1C1E', padding: 0 }}
+              />
+            ) : (
+              <span
+                onClick={() => { setEditIdx(i); setEditVal(String(qty)) }}
+                title="แตะเพื่อพิมพ์ตัวเลข"
+                style={{ minWidth: 38, textAlign: 'center', fontFamily: 'Prompt',
+                  fontWeight: 700, fontSize: 15, color: qty > 0 ? '#1C1C1E' : '#C4B5A0',
+                  cursor: 'text', padding: '0 2px', lineHeight: '38px' }}>
+                {qty}
+              </span>
+            )}
+            {/* + */}
+            <button
+              onClick={() => { beepAdd(); setLvl(i, qty + 1) }}
+              style={{ width: 34, height: 38, border: 'none', background: '#F59E0B',
+                fontSize: 20, fontWeight: 700, color: '#fff', cursor: 'pointer', lineHeight: 1 }}>
+              +
+            </button>
+            {/* unit name label */}
+            <span style={{ fontSize: 11.5, fontWeight: 700, color: '#92400E',
+              padding: '0 8px', background: '#FEF3C7', lineHeight: '38px', whiteSpace: 'nowrap' }}>
+              {lv.name}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/* helper — ตรวจว่าหน่วยเป็นหน่วยชั่ง/ตวง (ซ่อนอัตโนมัติจาก Inventory) */
+const WEIGHT_VOL_UNITS = ['กรัม','กก.','กิโลกรัม','มล.','มิลลิลิตร','ลิตร','ซีซี','cc','ml','g','kg','l','oz','ออนซ์']
+function isWeightVolUnit(name) {
+  return WEIGHT_VOL_UNITS.some(u => (name||'').toLowerCase().trim() === u.toLowerCase())
+}
+
+/* helper — คำนวณ qty รวมในหน่วยฐาน (level 0) */
+function calcBaseQty(lqArr, levels) {
+  if (!lqArr || !levels || levels.length === 0) return 0
+  return levels.reduce((sum, lv, i) => sum + ((lqArr[i] || 0) * lv.factor), 0)
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -396,64 +658,67 @@ function ExpColorModal({ open, onClose, thresholds, onSave }) {
 }
 
 function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
-  const [whIdx, setWhIdx]         = useState(0)
-  const [qtys, setQtys]           = useState({})   // { wh_item: qty }
-  const [units, setUnits]         = useState({})   // { wh_item: unitName }
-  const [search, setSearch]       = useState('')
-  const [saving, setSaving]       = useState(false)
-  const [catFilter, setCatFilter] = useState('all')
-  const [sortMode, setSortMode]   = useState('az')  // 'az' | 'za' | 'qty-desc' | 'qty-asc'
+  const [whIdx, setWhIdx]           = useState(0)
+  const [levelQtys, setLevelQtys]   = useState({})  // { key: number[] } — qty ต่อ level
+  const [search, setSearch]         = useState('')
+  const [saving, setSaving]         = useState(false)
+  const [catFilter, setCatFilter]   = useState('all')
+  const [sortMode, setSortMode]     = useState('az')
   const [existingBal, setExistingBal] = useState({})
-  const [cmUnits, setCmUnits]     = useState({})   // { itemName: [{ name, factor }] } จาก Cost Manager
+  // ── Phase 1: LOT Step ──────────────────────────────────────────────────────
+  const [step, setStep]             = useState('qty')  // 'qty' | 'lot'
+  const [savedItems, setSavedItems] = useState([])     // items ที่ save ไปแล้วมี qty > 0
+  const [savedLotMap, setSavedLotMap] = useState({})   // { itemId: lotDocId }
+  const [lotDrafts, setLotDrafts]   = useState({})     // { itemId: { lotNo, mfgDate, expDate, supplier, batchNo } }
+  const [savingLots, setSavingLots] = useState(false)
 
-  // โหลด Cost Manager levels + existing balances เมื่อ modal เปิด
+  // getLevels: สร้าง levels จากฟิลด์ที่ sync มาจาก Cost Manager บน item โดยตรง
+  //   unitBuy  = หน่วยซื้อ (ใหญ่สุด)   convBuyToUse = จำนวน unitUse ต่อ 1 unitBuy
+  //   unitUse  = หน่วยใช้ (กลาง/base)  convUseToSub = จำนวน unitSub ต่อ 1 unitUse
+  //   unitSub  = หน่วยย่อย (เล็กสุด)   isWeightVolUnit = module-level helper
+  //   เรียงผลลัพธ์ ใหญ่ → เล็ก  factor = จำนวน unitSub (base) ต่อ 1 หน่วยนี้
+  function getLevels(item) {
+    const convBTU = Number(item.convBuyToUse) || 0
+    const convUTS = Number(item.convUseToSub) || 0
+    const hasBuy  = item.unitBuy && item.unitBuy !== item.unitUse && convBTU > 0
+    // Hybrid: ซ่อน unitSub อัตโนมัติถ้าเป็นหน่วยชั่ง/ตวง — เว้นแต่ Owner เปิด showSubInInventory
+    const autoHide = isWeightVolUnit(item.unitSub)
+    const showSub  = item.showSubInInventory === true ? true : !autoHide
+    const hasSub   = item.unitSub && item.unitSub !== item.unitUse && convUTS > 0 && showSub
+    const baseUnit = item.unitUse || item.unitBase || 'หน่วย'
+    const lvs = []
+    if (hasBuy) lvs.push({ name: item.unitBuy, factor: convBTU * (hasSub ? convUTS : 1), qty: convBTU })
+    lvs.push({ name: baseUnit, factor: hasSub ? convUTS : 1, qty: hasSub ? convUTS : 1 })
+    if (hasSub) lvs.push({ name: item.unitSub, factor: 1, qty: 1 })
+    return lvs
+  }
+
+  // โหลด existing balances เมื่อ modal เปิด (ข้อมูลหน่วยอ่านจาก item โดยตรง ไม่ต้อง fetch เพิ่ม)
   useEffect(() => {
     if (!open) return
     ;(async () => {
-      // 1) โหลด Cost Manager units
-      const cmSnap = await getDoc(doc(db, 'mixue_data', 'mixue-cost-manager'))
-      if (cmSnap.exists()) {
-        const lib = cmSnap.data().library || []
-        const uMap = {}
-        lib.forEach(it => {
-          // levels: [{ name, qty }] — qty = กี่หน่วยย่อยต่อ 1 หน่วยนี้
-          // factor เทียบกับ unitBase (level[0].qty = 1 เสมอ)
-          if (it.levels && it.levels.length > 0) {
-            uMap[it.name] = it.levels.map((lv, i) => ({
-              name:   lv.name,
-              factor: i === 0 ? 1 : (it.levels[i - 1]?.qty || 1),
-              qty:    lv.qty || 1,
-            }))
-          }
-        })
-        setCmUnits(uMap)
-      }
-
-      // 2) โหลด existing balances
       const snap = await getDocs(collection(db, COL.STOCK_BALANCES))
-      const map = {}; const pre = {}; const uPre = {}
+      const existMap = {}; const lvMap = {}
       snap.docs.forEach(d => {
         const dat = d.data()
         const k = `${dat.warehouseId}_${dat.itemId}`
-        map[k] = true
-        pre[k] = dat.qty ?? 0
-        if (dat.unit) uPre[k] = dat.unit
+        existMap[k] = true
+        if ((dat.qty ?? 0) > 0) {
+          // หา item เพื่อดู levels แล้วใส่ qty ตรง level ที่ unit ตรงกัน
+          const invItem = items.find(it => it.id === dat.itemId)
+          const lvs = invItem ? getLevels(invItem) : []
+          const n = Math.max(lvs.length, 1)
+          const arr = new Array(n).fill(0)
+          const storedUnit = dat.unit || dat.unitBase || ''
+          const matchIdx  = lvs.findIndex(lv => lv.name === storedUnit)
+          arr[matchIdx >= 0 ? matchIdx : n - 1] = dat.qty
+          lvMap[k] = arr
+        }
       })
-      setExistingBal(map)
-      setQtys(pre)
-      setUnits(uPre)
+      setExistingBal(existMap)
+      setLevelQtys(lvMap)
     })()
   }, [open])
-
-  // สร้าง unit options สำหรับแต่ละ item
-  function getUnitOptions(item) {
-    const fromCM = cmUnits[item.name]
-    if (fromCM && fromCM.length > 0) return fromCM.map(u => u.name)
-    // fallback: unitBase + unitUse ถ้าต่างกัน
-    const opts = [item.unitBase]
-    if (item.unitUse && item.unitUse !== item.unitBase) opts.push(item.unitUse)
-    return [...new Set(opts.filter(Boolean))]
-  }
 
   const activeWH = warehouses[whIdx]
   const CATS_FILTER = [
@@ -468,8 +733,9 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
   ]
 
   function key(whId, itemId) { return `${whId}_${itemId}` }
-  function setQty(whId, itemId, val) { setQtys(p => ({ ...p, [key(whId, itemId)]: val })) }
-  function setUnit(whId, itemId, u)  { setUnits(p => ({ ...p, [key(whId, itemId)]: u  })) }
+  function setLvQty(whId, itemId, vals) {
+    setLevelQtys(p => ({ ...p, [key(whId, itemId)]: vals }))
+  }
 
   // กรอง + เรียง
   const filteredItems = items.filter(i => {
@@ -483,13 +749,13 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
     if (sortMode === 'az')       return a.name.localeCompare(b.name, 'th')
     if (sortMode === 'za')       return b.name.localeCompare(a.name, 'th')
     if (sortMode === 'qty-desc') {
-      const qa = parseFloat(qtys[key(activeWH?.id, a.id)] || 0)
-      const qb = parseFloat(qtys[key(activeWH?.id, b.id)] || 0)
+      const qa = calcBaseQty(levelQtys[key(activeWH?.id, a.id)], getLevels(a))
+      const qb = calcBaseQty(levelQtys[key(activeWH?.id, b.id)], getLevels(b))
       return qb - qa
     }
     if (sortMode === 'qty-asc') {
-      const qa = parseFloat(qtys[key(activeWH?.id, a.id)] || 0)
-      const qb = parseFloat(qtys[key(activeWH?.id, b.id)] || 0)
+      const qa = calcBaseQty(levelQtys[key(activeWH?.id, a.id)], getLevels(a))
+      const qb = calcBaseQty(levelQtys[key(activeWH?.id, b.id)], getLevels(b))
       return qa - qb
     }
     return 0
@@ -508,6 +774,8 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
     try {
       const batch = writeBatch(db)
       let count = 0
+      const newLotMap = {}      // { itemId: lotDocId }
+      const newSavedItems = []  // items ที่มี qty > 0
 
       const lotSnap = await getDocs(
         query(collection(db, COL.LOT_TRACKING),
@@ -517,11 +785,14 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
       const existingLotItems = new Set(lotSnap.docs.map(d => d.data().itemId))
 
       for (const item of items) {
-        const k   = key(activeWH.id, item.id)
-        const raw = qtys[k]
-        if (raw === '' || raw === undefined || raw === null) continue
-        const qty      = parseFloat(raw) || 0
-        const unitName = units[k] || item.unitBase
+        const k      = key(activeWH.id, item.id)
+        const levels = getLevels(item)
+        const lqArr  = levelQtys[k] || []
+        const qty    = calcBaseQty(lqArr, levels)        // รวมเป็น base unit
+        const baseUnit = levels[levels.length - 1]?.name || item.unitBase  // index สุดท้าย = หน่วยเล็กสุด
+
+        // ข้ามรายการที่ qty = 0 และยังไม่มีใน Firestore
+        if (qty === 0 && !existingBal[k]) continue
 
         const balRef = doc(db, COL.STOCK_BALANCES, k)
         batch.set(balRef, {
@@ -531,32 +802,42 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
           itemName:      item.name,
           category:      item.category,
           unitBase:      item.unitBase,
-          unit:          unitName,
+          unit:          baseUnit,
           qty,
           minQty:        item.minQty || 0,
           maxQty:        item.maxQty || 0,
           updatedAt:     serverTimestamp(),
         }, { merge: true })
 
+        // track lot ref id เพื่อใช้ใน step 2
+        let lotDocId = null
         if (!existingLotItems.has(item.id) && qty > 0) {
           const lotRef = doc(collection(db, COL.LOT_TRACKING))
+          lotDocId = lotRef.id
           batch.set(lotRef, {
             warehouseId: activeWH.id, warehouseName: activeWH.name,
             itemId: item.id, itemName: item.name,
-            unitBase: item.unitBase, unit: unitName,
+            unitBase: item.unitBase, unit: baseUnit,
             qty, qtyRemaining: qty,
+            lotNo: 'Start', isStartLot: true,
             receivedDate: new Date().toISOString().slice(0, 10),
             mfgDate: null, expDate: null,
+            supplier: '', batchNo: '',
             source: 'Opening Stock', isOpening: true, status: 'active',
             createdAt: serverTimestamp(),
           })
         } else if (existingLotItems.has(item.id) && qty > 0) {
           const existLot = lotSnap.docs.find(d => d.data().itemId === item.id)
           if (existLot) {
+            lotDocId = existLot.id
             batch.update(doc(db, COL.LOT_TRACKING, existLot.id), {
-              qty, qtyRemaining: qty, unit: unitName, updatedAt: serverTimestamp()
+              qty, qtyRemaining: qty, unit: baseUnit, updatedAt: serverTimestamp()
             })
           }
+        }
+        if (qty > 0) {
+          newLotMap[item.id] = lotDocId
+          newSavedItems.push(item)
         }
         count++
       }
@@ -568,8 +849,11 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
         by: window._bizSession?.name || 'system', createdAt: serverTimestamp(),
       })
 
-      onSaved(`✅ บันทึก Opening Stock คลัง "${activeWH.name}" แล้ว ${count} รายการ`)
-      onClose()
+      // เปลี่ยนไป Step 2: LOT info (ไม่ปิด modal)
+      setSavedItems(newSavedItems)
+      setSavedLotMap(newLotMap)
+      setLotDrafts({})
+      setStep('lot')
     } catch (e) {
       console.error(e)
       onSaved(`❌ เกิดข้อผิดพลาด: ${e.message}`)
@@ -578,24 +862,177 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
     }
   }
 
+  // ── handleSaveLots: บันทึก LOT info จาก step 2 ─────────────────────────────
+  async function handleSaveLots() {
+    setSavingLots(true)
+    try {
+      const updates = Object.entries(lotDrafts).filter(([, d]) =>
+        d.lotNo || d.mfgDate || d.expDate || d.supplier || d.batchNo
+      )
+      if (updates.length > 0) {
+        const batch = writeBatch(db)
+        updates.forEach(([itemId, draft]) => {
+          const lotId = savedLotMap[itemId]
+          if (!lotId) return
+          const isStillStart = !draft.lotNo || draft.lotNo === 'Start'
+          batch.update(doc(db, COL.LOT_TRACKING, lotId), {
+            lotNo:     draft.lotNo    || 'Start',
+            mfgDate:   draft.mfgDate  || null,
+            expDate:   draft.expDate  || null,
+            supplier:  draft.supplier || '',
+            batchNo:   draft.batchNo  || '',
+            isStartLot: isStillStart,
+            updatedAt: serverTimestamp(),
+          })
+        })
+        await batch.commit()
+      }
+      onSaved(`✅ บันทึก Opening Stock + LOT สำเร็จ (${savedItems.length} รายการ)`)
+      resetAndClose()
+    } catch (e) {
+      console.error(e)
+      onSaved(`❌ บันทึก LOT ไม่สำเร็จ: ${e.message}`)
+    } finally {
+      setSavingLots(false)
+    }
+  }
+
+  function handleSkipLots() {
+    onSaved(`✅ บันทึก Opening Stock สำเร็จ (${savedItems.length} รายการ) — LOT ใช้ค่าเริ่มต้น "Start"`)
+    resetAndClose()
+  }
+
+  function resetAndClose() {
+    setLevelQtys({}); setExistingBal({}); setSearch('')
+    setCatFilter('all'); setStep('qty')
+    setSavedItems([]); setSavedLotMap({}); setLotDrafts({})
+    onClose()
+  }
+
   const filledCount = activeWH
     ? items.filter(i => {
-        const v = qtys[key(activeWH.id, i.id)]
-        return v !== '' && v !== undefined && v !== null && parseFloat(v) > 0
+        const levels = getLevels(i)
+        return calcBaseQty(levelQtys[key(activeWH.id, i.id)], levels) > 0
       }).length
     : 0
 
   return (
-    <Modal open={open} onClose={onClose} title="📊 Opening Stock"
+    <Modal open={open} onClose={step === 'qty' ? onClose : handleSkipLots}
+      title={step === 'qty' ? '📊 Opening Stock' : '📦 ระบุข้อมูล LOT'}
       footer={
-        <div style={{ display: 'flex', gap: 10, width: '100%' }}>
-          <button className="btn-secondary" style={{ flex: 1 }} onClick={onClose} disabled={saving}>ยกเลิก</button>
-          <button className="btn-primary" style={{ flex: 2 }} onClick={handleSave} disabled={saving || !activeWH}>
-            {saving ? 'กำลังบันทึก...' : `✓ บันทึก${filledCount > 0 ? ` (${filledCount} รายการ)` : ''}`}
-          </button>
-        </div>
+        step === 'qty' ? (
+          <div style={{ display: 'flex', gap: 10, width: '100%' }}>
+            <button className="btn-secondary" style={{ flex: 1 }} onClick={onClose} disabled={saving}>ยกเลิก</button>
+            <button className="btn-primary" style={{ flex: 2 }} onClick={handleSave} disabled={saving || !activeWH}>
+              {saving ? 'กำลังบันทึก...' : `✓ บันทึก${filledCount > 0 ? ` (${filledCount} รายการ)` : ''}`}
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: 10, width: '100%' }}>
+            <button className="btn-secondary" style={{ flex: 1 }} onClick={handleSkipLots} disabled={savingLots}>
+              ข้ามขั้นตอนนี้
+            </button>
+            <button className="btn-primary" style={{ flex: 2 }} onClick={handleSaveLots} disabled={savingLots}>
+              {savingLots ? 'กำลังบันทึก...' : '✅ บันทึก LOT'}
+            </button>
+          </div>
+        )
       }>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+        {/* ── STEP 2: LOT Info ─────────────────────────────────────────────── */}
+        {step === 'lot' && (
+          <>
+            {/* Banner */}
+            <div style={{ background: '#F0FDF4', borderRadius: 10, padding: '10px 14px', fontSize: 12.5, color: '#166534', lineHeight: 1.6 }}>
+              <strong>✅ บันทึก qty สำเร็จแล้ว!</strong><br />
+              ระบุข้อมูล LOT เพิ่มเติมได้เลย (หรือ <strong>ข้ามขั้นตอนนี้</strong> — ระบบจะใช้ <strong>"LOT: Start"</strong> อัตโนมัติ)
+            </div>
+
+            {/* LOT cards */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {savedItems.length === 0 && (
+                <div style={{ textAlign: 'center', color: 'var(--txt3)', fontSize: 13, padding: 20 }}>
+                  ไม่มีรายการที่มีสต็อก
+                </div>
+              )}
+              {savedItems.map(item => {
+                const draft = lotDrafts[item.id] || {}
+                const setDraft = (field, val) => setLotDrafts(f => ({
+                  ...f, [item.id]: { ...(f[item.id] || {}), [field]: val }
+                }))
+                const hasInfo = draft.expDate || draft.mfgDate || draft.supplier || draft.batchNo
+                return (
+                  <div key={item.id} style={{ borderRadius: 12, border: `1.5px solid ${hasInfo ? '#16A34A' : 'var(--border)'}`,
+                    overflow: 'hidden', transition: 'border-color .2s' }}>
+                    {/* Item header */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px',
+                      background: hasInfo ? '#F0FDF4' : 'var(--bg)' }}>
+                      <span style={{ fontSize: 20 }}>{item.img || '📦'}</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 700, fontSize: 13 }}>{item.name}</div>
+                        <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                          LOT: <strong style={{ color: draft.lotNo && draft.lotNo !== 'Start' ? '#16A34A' : '#D97706' }}>
+                            {draft.lotNo || 'Start'}
+                          </strong>
+                          {draft.expDate && <span style={{ marginLeft: 8, color: '#DC2626' }}>· EXP {draft.expDate}</span>}
+                        </div>
+                      </div>
+                      {hasInfo && <span style={{ fontSize: 16 }}>✅</span>}
+                    </div>
+
+                    {/* LOT form */}
+                    <div style={{ padding: '12px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8,
+                      background: '#fff' }}>
+                      {/* Lot No */}
+                      <div style={{ gridColumn: '1/-1' }}>
+                        <label style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--txt2)', display: 'block', marginBottom: 4 }}>
+                          🏷️ Lot No. (ปล่อยว่าง = Start)
+                        </label>
+                        <input className="fi" value={draft.lotNo || ''}
+                          onChange={e => setDraft('lotNo', e.target.value)}
+                          placeholder="Start"
+                          style={{ padding: '7px 10px', fontSize: 13, fontWeight: 600 }} />
+                      </div>
+                      {/* MFG Date */}
+                      <div>
+                        <label style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--txt2)', display: 'block', marginBottom: 4 }}>
+                          🏭 วันผลิต (MFG)
+                        </label>
+                        <input type="date" className="fi" value={draft.mfgDate || ''}
+                          onChange={e => setDraft('mfgDate', e.target.value)}
+                          style={{ padding: '7px 8px', fontSize: 12 }} />
+                      </div>
+                      {/* EXP Date */}
+                      <div>
+                        <label style={{ fontSize: 10.5, fontWeight: 700, color: '#DC2626', display: 'block', marginBottom: 4 }}>
+                          ⚠️ วันหมดอายุ (EXP)
+                        </label>
+                        <input type="date" className="fi" value={draft.expDate || ''}
+                          onChange={e => setDraft('expDate', e.target.value)}
+                          style={{ padding: '7px 8px', fontSize: 12,
+                            borderColor: draft.expDate ? '#DC2626' : undefined }} />
+                      </div>
+                      {/* Supplier */}
+                      <div style={{ gridColumn: '1/-1' }}>
+                        <label style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--txt2)', display: 'block', marginBottom: 4 }}>
+                          🚚 แหล่งที่มา
+                        </label>
+                        <input className="fi" value={draft.supplier || ''}
+                          onChange={e => setDraft('supplier', e.target.value)}
+                          placeholder="ผู้จำหน่าย"
+                          style={{ padding: '7px 8px', fontSize: 12 }} />
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </>
+        )}
+
+        {/* ── STEP 1: qty input ────────────────────────────────────────────── */}
+        {step === 'qty' && <>
 
         {/* Info banner */}
         <div style={{ background: '#EFF6FF', borderRadius: 10, padding: '10px 14px', fontSize: 12.5, color: '#1e40af', lineHeight: 1.6 }}>
@@ -608,8 +1045,8 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
             {warehouses.map((wh, idx) => {
               const filled = items.filter(i => {
-                const v = qtys[key(wh.id, i.id)]
-                return v !== '' && v !== undefined && parseFloat(v) > 0
+                const levels = getLevels(i)
+                return calcBaseQty(levelQtys[key(wh.id, i.id)], levels) > 0
               }).length
               return (
                 <button key={wh.id} onClick={() => setWhIdx(idx)}
@@ -699,20 +1136,20 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
                 {visibleItems.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: 24, fontSize: 13, color: 'var(--txt3)' }}>ไม่พบรายการ</div>
                 ) : visibleItems.map((item, idx) => {
-                  const k        = key(activeWH.id, item.id)
-                  const val      = qtys[k] ?? ''
-                  const filled   = parseFloat(val) > 0
-                  const isExist  = existingBal[k]
-                  const unitOpts = getUnitOptions(item)
-                  const selUnit  = units[k] || unitOpts[0] || item.unitBase
+                  const k         = key(activeWH.id, item.id)
+                  const levels    = getLevels(item)
+                  const lqArr     = levelQtys[k] || levels.map(() => 0)
+                  const totalBase = calcBaseQty(lqArr, levels)
+                  const filled    = totalBase > 0
+                  const isExist   = existingBal[k]
 
                   return (
                     <div key={item.id} style={{ padding: '10px 12px',
                       borderBottom: idx < visibleItems.length - 1 ? '1px solid #F2F2F7' : 'none',
                       borderLeft: filled ? '3px solid #F59E0B' : '3px solid transparent',
                       background: filled ? '#FFFBEB' : 'transparent' }}>
-                      {/* Line 1: name */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: filled ? 10 : 6 }}>
+                      {/* Line 1: name + badge */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                         <span style={{ fontSize: 18 }}>{item.img || '📦'}</span>
                         <div style={{ flex: 1 }}>
                           <div style={{ fontSize: 12, fontWeight: 600 }}>{item.name}</div>
@@ -720,18 +1157,18 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
                         </div>
                         {isExist && <span style={{ fontSize: 9, background: '#F0FDF4', color: '#15803D', borderRadius: 20, padding: '0 6px', fontWeight: 600 }}>✓ มีแล้ว</span>}
                       </div>
-                      {/* Line 2: unit chips + stepper */}
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                        <UnitChips
-                          opts={unitOpts.map(u => ({ value: u, label: u, sub: '' }))}
-                          selected={selUnit}
-                          onChange={u => setUnit(activeWH.id, item.id, u)}
-                        />
-                        <PosQty
-                          value={parseFloat(val) || 0}
-                          onChange={v => setQty(activeWH.id, item.id, String(v))}
-                        />
-                      </div>
+                      {/* Line 2: multi-level steppers — [−] n [+] ลัง  [−] m [+] กระป๋อง */}
+                      <MultiLevelStepper
+                        levels={levels}
+                        values={lqArr}
+                        onChange={vals => setLvQty(activeWH.id, item.id, vals)}
+                      />
+                      {/* Line 3: preview รวม base unit (levels[last] = หน่วยเล็กสุด) */}
+                      {levels.length > 1 && totalBase > 0 && (
+                        <div style={{ fontSize: 11, color: '#6B7280', marginTop: 5, paddingLeft: 2 }}>
+                          รวม ≈ <strong style={{ color: '#D97706' }}>{totalBase}</strong> {levels[levels.length - 1].name}
+                        </div>
+                      )}
                     </div>
                   )
                 })}
@@ -750,6 +1187,8 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
             )}
           </>
         )}
+        </>}
+        {/* end step === 'qty' */}
       </div>
     </Modal>
   )
@@ -768,16 +1207,20 @@ const DEFAULT_CATS = [
 ]
 const WH_COLORS = ['#E31E24', '#1D4ED8', '#16A34A', '#D97706', '#7C3AED', '#0284C7']
 const EMOJI_GROUPS = [
-  { label: '🍎 ผลไม้', emojis: ['🍎','🍐','🍊','🍋','🍌','🍉','🍇','🍓','🫐','🍈','🍑','🥭','🍍','🥝','🍅','🫒','🥑','🍆','🥦','🥬','🥒','🌽','🥕','🧅','🧄','🫛','🥑','🫑','🍄','🌰'] },
-  { label: '🍯 ของหวาน', emojis: ['🍯','🍫','🍬','🍭','🍮','🍰','🎂','🧁','🥧','🍩','🍪','🍡','🧆','🥐','🍞','🥨','🥯','🫓','🥞','🧇','🧈'] },
-  { label: '🧃 เครื่องดื่ม', emojis: ['🧃','🥤','🧋','☕','🍵','🫖','🍺','🍻','🥂','🍷','🍸','🍹','🧉','🍶','🥛','💧','🫗','🧊','🍾'] },
-  { label: '🍱 อาหาร', emojis: ['🍱','🍛','🍜','🍝','🍲','🥘','🫕','🍣','🍤','🥚','🍳','🥓','🌮','🌯','🥙','🫔','🥗','🍔','🍟','🌭','🍕','🥪','🧆','🍗','🍖','🥩','🥦','🥕','🫘'] },
-  { label: '🧂 เครื่องปรุง', emojis: ['🧂','🫙','🥫','🧴','🧪','🫧','🧬','⚗️','🔬','💊','🩺','🧫'] },
-  { label: '📦 บรรจุภัณฑ์', emojis: ['📦','🧴','🪣','🛢️','🧹','🧺','🛍️','👜','🎁','📫','🗃️','📂','📁','🪤','🔒','🔑','🗝️','🪪'] },
-  { label: '🌿 ธรรมชาติ', emojis: ['🌿','🍃','🌱','🪴','🌾','🎋','🎍','☘️','🍀','🌺','🌸','🌼','🌻','🌹','💐','🌷','🪷','🍁','🍂','🍄','🌴','🌵','🪸','🪨','🌊'] },
-  { label: '⭐ สัญลักษณ์', emojis: ['⭐','🌟','💫','✨','🔥','💥','🎯','🏆','🥇','🎖️','🏅','🎗️','🎀','🎊','🎉','🪅','🎈','❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','❤️‍🔥'] },
-  { label: '🔵 วงกลม', emojis: ['🔴','🟠','🟡','🟢','🔵','🟣','🟤','⚫','⚪','🔶','🔷','🔸','🔹','🔺','🔻','💠','🔘','🔲','🔳','▪️','▫️'] },
-  { label: '🥄 อุปกรณ์', emojis: ['🥄','🍴','🔪','🫙','🥢','🧂','⚖️','🪣','🧲','🔧','🪛','⚙️','🛒','🧺','🪤','💡','🔦','🕯️','🧯'] },
+  { label: '🍎 ผลไม้', emojis: ['🍎','🍏','🍐','🍊','🍋','🍌','🍉','🍇','🍓','🫐','🍈','🍑','🥭','🍍','🥥','🥝','🍅','🫒','🥑','🍆','🥦','🥬','🥒','🌽','🥕','🧅','🧄','🫛','🫑','🍄','🌰','🥔','🫚','🫜','🍒','🌶️'] },
+  { label: '🍦 ไอศกรีม/นม', emojis: ['🍦','🍨','🍧','🥛','🧈','🧀','🍮','🍯','🫙','🥞','🧇','🍰','🎂','🧁','🥧','🍪','🍩','🍡','🍢'] },
+  { label: '🍯 ของหวาน', emojis: ['🍯','🍫','🍬','🍭','🍮','🍰','🎂','🧁','🥧','🍩','🍪','🍡','🧆','🥐','🍞','🥨','🥯','🫓','🥞','🧇','🧈','🍿','🍘','🥮','🍥','🥠'] },
+  { label: '🧃 เครื่องดื่ม', emojis: ['🧃','🥤','🧋','☕','🍵','🫖','🍺','🍻','🥂','🍷','🍸','🍹','🧉','🍶','🥛','💧','🫗','🧊','🍾','🫙','🥃'] },
+  { label: '🍱 อาหาร', emojis: ['🍱','🍛','🍜','🍝','🍲','🥘','🫕','🍣','🍤','🥚','🍳','🥓','🌮','🌯','🥙','🫔','🥗','🍔','🍟','🌭','🍕','🥪','🧆','🍗','🍖','🥩','🫘','🍙','🍚','🍘','🥟','🥠','🥮','🍢','🍡','🍧','🍨','🍦'] },
+  { label: '🧂 เครื่องปรุง', emojis: ['🧂','🫙','🥫','🧴','🧪','🫧','🧬','⚗️','🔬','💊','🩺','🧫','🌶️','🧄','🧅','🍋','🫚'] },
+  { label: '📦 บรรจุภัณฑ์', emojis: ['📦','📫','📬','📭','📮','🧴','🪣','🛢️','🧹','🧺','🛍️','👜','🎁','🗃️','📂','📁','🪤','🔒','🔑','🗝️','🪪','📦','🧊','🥡','🥢','📦','🛒','🪦','💼'] },
+  { label: '🌿 ธรรมชาติ', emojis: ['🌿','🍃','🌱','🪴','🌾','🎋','🎍','☘️','🍀','🌺','🌸','🌼','🌻','🌹','💐','🌷','🪷','🍁','🍂','🍄','🌴','🌵','🪸','🪨','🌊','🌳','🌲','🎄','🪵','🌽','🌶️','🫧','🫧'] },
+  { label: '🐮 สัตว์', emojis: ['🐮','🐄','🐷','🐖','🐔','🐓','🐤','🦃','🐟','🐠','🦐','🦀','🦞','🦑','🐙','🦪','🥚','🐝','🦋','🐌','🐛','🐞'] },
+  { label: '⭐ สัญลักษณ์', emojis: ['⭐','🌟','💫','✨','🔥','💥','🎯','🏆','🥇','🎖️','🏅','🎗️','🎀','🎊','🎉','🪅','🎈','❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','❤️‍🔥','💝','💖','💗','💓','💞','💕','💟','♥️','💯','✅','❌','⚠️','🆕','🆙','🔝','💎'] },
+  { label: '🔵 สี/รูปทรง', emojis: ['🔴','🟠','🟡','🟢','🔵','🟣','🟤','⚫','⚪','🟥','🟧','🟨','🟩','🟦','🟪','🟫','⬛','⬜','🔶','🔷','🔸','🔹','🔺','🔻','💠','🔘','🔲','🔳','▪️','▫️','◼️','◻️','◾','◽'] },
+  { label: '🥄 อุปกรณ์', emojis: ['🥄','🍴','🔪','🫙','🥢','🧂','⚖️','🪣','🧲','🔧','🪛','⚙️','🛒','🧺','🪤','💡','🔦','🕯️','🧯','🪒','🧽','🧼','🪥','🧻','🪞','🪟','🛏️','🪑','🚿','🛁','🚽'] },
+  { label: '🏪 ร้านค้า', emojis: ['🏪','🏬','🏭','🏢','🏠','🏡','🏘️','🏚️','🏗️','🏛️','⛪','🕌','🛕','🕍','⛩️','💰','💵','💴','💶','💷','💸','💳','🧾','💹','💲','🏷️','📊','📈','📉'] },
+  { label: '⏰ เวลา/วันที่', emojis: ['⏰','⏱️','⏲️','🕐','🕑','🕒','🕓','🕔','🕕','🕖','🕗','🕘','🕙','🕚','🕛','📅','📆','🗓️','📇','📌','📍','🗺️','🧭'] },
 ]
 const EMOJIS = EMOJI_GROUPS.flatMap(g => g.emojis)
 const TPL_ICONS = ['☀️', '🎉', '⚡', '🌙', '🏖️', '🔥']
@@ -1051,10 +1494,21 @@ function CategoryModal({ open, onClose, cats, setCats, items, cmCompounds = [] }
 
 export default function Settings() {
   const { name, phone, role, isOwner } = useSession()
+  const [loading, setLoading] = useState(true)
   const [lastSync, setLastSync] = useState('')
   const [settings, setSettings] = useState({})
+  const [hubStaff, setHubStaff] = useState(null)   // live profile จาก Hub staff/{phone}
+  useEffect(() => {
+    const p = window._bizSession?.phone || phone
+    if (!p) return
+    const unsub = onSnapshot(doc(db, 'staff', p),
+      snap => setHubStaff(snap.exists() ? { id: snap.id, ...snap.data() } : null),
+      () => {})
+    return unsub
+  }, [phone])
   const [warehouses, setWarehouses] = useState([])
   const [items, setItems] = useState([])
+  const [balanceMap, setBalanceMap] = useState({})  // { `${wh}_${item}`: balance doc }
   const [templates, setTemplates] = useState([])
   const [toast, setToast] = useState('')
 
@@ -1065,6 +1519,13 @@ export default function Settings() {
   const [tplModal, setTplModal] = useState(false)
   const [intModal, setIntModal] = useState(false)
   const [openingModal, setOpeningModal] = useState(false)
+  // V2 additions
+  const [integrationOpen, setIntegrationOpen] = useState(false)
+  const [quickTplModalV2, setQuickTplModalV2] = useState(false)
+  const [clearDataOpen, setClearDataOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
+  const [seedOpen, setSeedOpen] = useState(false)
+  const [dataSheetOpen, setDataSheetOpen] = useState(false)
   const [pinModal, setPinModal] = useState(false)
   const [editItem, setEditItem] = useState(null)
   const [editWH, setEditWH] = useState(null)
@@ -1073,15 +1534,20 @@ export default function Settings() {
   // Forms
   const [whForm, setWhForm] = useState({ name: '', type: 'branch', color: WH_COLORS[0] })
   const [itemForm, setItemForm] = useState({
-    name: '', category: DEFAULT_CATS[0]?.name || 'แยม', img: '🍓',
-    unitBuy: '',   // หน่วยซื้อ (เช่น ลัง)
-    unitUse: '',   // หน่วยใช้ (เช่น กระปุก)
-    unitSub: '',   // หน่วยย่อย (เช่น กรัม)
-    convBuyToUse: '', // 1 หน่วยซื้อ = ? หน่วยใช้
-    convUseToSub: '', // 1 หน่วยใช้ = ? หน่วยย่อย
-    minQty: '', minUnit: 'buy',
-    maxQty: '', maxUnit: 'buy',
+    name: '', displayName: '', category: DEFAULT_CATS[0]?.name || 'แยม', img: '🍓',
+    // หน่วยที่ 1 (ใหญ่สุด) / 2 (กลาง) / 3 (เล็กสุด) — generic slots
+    unitBuy: '',   // = หน่วยที่ 1
+    unitUse: '',   // = หน่วยที่ 2
+    unitSub: '',   // = หน่วยที่ 3
+    convBuyToUse: '', // 1 หน่วยที่ 1 = ? หน่วยที่ 2
+    convUseToSub: '', // 1 หน่วยที่ 2 = ? หน่วยที่ 3
+    cutLevel: 'use',   // 'buy' | 'use' | 'sub' — ใช้ตัดสต็อก (default = หน่วยที่ 2)
+    wasteLevel: 'sub', // 'buy' | 'use' | 'sub' — ใช้คำนวณของเสีย (default = หน่วยที่ 3)
+    stockLimits: {}, // { [warehouseId]: { minQty, minUnit, maxQty, maxUnit } }
+    alertEnabled: true,   // false = ปิดแจ้งเตือนของหมด/ใกล้หมด + lock Min/Max
     wasteMode: false, wasteUnit: 'use',
+    showSubInInventory: false,
+    visibleIn: {}, // { [warehouseId]: false } = ซ่อนเฉพาะคลังนั้น; ค่าเริ่มต้น = แสดงทุกที่
   })
   const [tplForm, setTplForm] = useState({ name: '', icon: '☀️', items: [] })
   const [pinForm, setPinForm] = useState({ old: '', newPin: '', confirm: '' })
@@ -1091,12 +1557,15 @@ export default function Settings() {
   const [importResult, setImportResult] = useState(null)
   const [importDiff, setImportDiff] = useState(null)    // { toAdd, toUpdate, total, lastSync }
   const [importPhase, setImportPhase] = useState('idle') // idle | checking | preview | applying | done
+  const [selectedAdd, setSelectedAdd] = useState(new Set())
+  const [selectedUpdate, setSelectedUpdate] = useState(new Set())
   const [itemSearch, setItemSearch] = useState('')
   const [itemCatFilter, setItemCatFilter] = useState('all')
   const [viewItem, setViewItem] = useState(null)
   const [viewCutUnit, setViewCutUnit] = useState(null) // หน่วยตัดที่เลือกใน view panel
   const [showAddForm, setShowAddForm] = useState(false)
   const [emojiGroup, setEmojiGroup] = useState(null) // null = ซ่อน picker
+  const [activeWhLimitTab, setActiveWhLimitTab] = useState(null) // tab ที่เปิดใน Min/Max section
   const [cmLibrary, setCmLibrary] = useState([])
   const [cmCompounds, setCmCompounds] = useState([])
   const [cats, setCats] = useState(DEFAULT_CATS)
@@ -1118,6 +1587,11 @@ export default function Settings() {
     const u2 = onSnapshot(collection(db, COL.ITEMS), snap => {
       setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })))
     })
+    const u2b = onSnapshot(collection(db, COL.STOCK_BALANCES), snap => {
+      const map = {}
+      snap.docs.forEach(d => { map[d.id] = d.data() })
+      setBalanceMap(map)
+    })
     const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => {
       setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0)))
     })
@@ -1131,6 +1605,7 @@ export default function Settings() {
         setExpDays(d.expWarningDays || 7)
         setLastSync(new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }))
       }
+      setLoading(false)
     })
     getDoc(doc(db, 'mixue_data', 'mixue-cost-manager')).then(snap => {
       if (snap.exists()) {
@@ -1150,7 +1625,7 @@ export default function Settings() {
     getDoc(doc(db, COL.APP_SETTINGS, 'exp_thresholds')).then(snap => {
       if (snap.exists()) setExpThresholds(snap.data())
     })
-    return () => { u1(); u2(); u3(); u4() }
+    return () => { u1(); u2(); u2b(); u3(); u4() }
   }, [])
 
   async function saveWH() {
@@ -1164,27 +1639,153 @@ export default function Settings() {
 
   async function saveItem() {
     if (!itemForm.name) return
+    // ── คำนวณ V2 schema จาก cutLevel ──
+    //   cutLevel === 'buy' → tracking ที่ unitBuy (1 unit = 1 base)
+    //   cutLevel === 'use' → tracking ที่ unitUse (default)
+    //   cutLevel === 'sub' → tracking ที่ unitSub (smallest)
+    const c1 = parseFloat(itemForm.convBuyToUse) || 1
+    const c2 = parseFloat(itemForm.convUseToSub) || 0
+    const cutLevel = itemForm.cutLevel || 'use'
+    let effUnitUse, effUnitConversion, effUnitSub, effConvSub
+    // cumulative factor จาก base ถึง level ที่เลือก (สำหรับแปลงราคา)
+    let cumFromBase = 1
+    if (cutLevel === 'buy') {
+      effUnitUse        = itemForm.unitBuy || ''
+      effUnitConversion = ''
+      effUnitSub        = itemForm.unitUse || ''
+      effConvSub        = c1     // 1 unitBuy = c1 unitUse (using "Use" as sub when tracking by Buy)
+      cumFromBase       = 1      // base = 1 unit
+    } else if (cutLevel === 'sub' && itemForm.unitSub && c2 > 0) {
+      effUnitUse        = itemForm.unitSub || ''
+      effUnitConversion = `1 ${itemForm.unitBuy} = ${c1 * c2} ${itemForm.unitSub}`
+      effUnitSub        = ''      // smallest already — no sub level
+      effConvSub        = 0
+      cumFromBase       = c1 * c2  // 1 ลัง = c1×c2 หน่วย smallest
+    } else {
+      // default 'use'
+      effUnitUse        = itemForm.unitUse || ''
+      effUnitConversion = `1 ${itemForm.unitBuy} = ${c1} ${itemForm.unitUse}`
+      effUnitSub        = itemForm.unitSub || ''
+      effConvSub        = c2 || 0
+      cumFromBase       = c1
+    }
+
+    // ── คำนวณ unitPrice ใหม่ ตาม cutLevel ใหม่ ──
+    //   เก็บ "rawBasePrice" (฿/หน่วยที่ 1) เป็น invariant — ราคาฐานที่ไม่ขึ้นกับ level
+    //   ถ้ามี rawBasePrice อยู่แล้ว ใช้ตัวนั้น; ไม่งั้น derive จาก unitPrice เก่า × oldCumFromBase
+    const prevCutLevel = editItem?.cutLevel || 'use'
+    const prevC1 = Number(editItem?.convBuyToUse) || 1
+    const prevC2 = Number(editItem?.convUseToSub) || 0
+    let prevCum = 1
+    if (prevCutLevel === 'sub' && prevC2 > 0) prevCum = prevC1 * prevC2
+    else if (prevCutLevel === 'use') prevCum = prevC1
+
+    const prevUnitPrice = Number(editItem?.unitPrice) || Number(itemForm.unitPrice) || 0
+    // rawBasePrice = ฿/หน่วยที่ 1 (ลัง) — เก็บไว้เป็น invariant
+    const rawBasePrice = editItem?.rawBasePrice
+      ? Number(editItem.rawBasePrice)
+      : prevUnitPrice * prevCum
+    // unitPrice ใหม่ = rawBasePrice / cumFromBase (ฐาน ÷ จำนวนหน่วย-เล็ก-ต่อ-ฐาน)
+    const newUnitPrice = cumFromBase > 0 ? rawBasePrice / cumFromBase : prevUnitPrice
+
     // backward compat: keep unitBase = unitBuy
     const data = {
       ...itemForm,
-      unitBase: itemForm.unitBuy || '',
-      minQty: parseFloat(itemForm.minQty) || 0,
-      maxQty: parseFloat(itemForm.maxQty) || 0,
-      convBuyToUse: parseFloat(itemForm.convBuyToUse) || 0,
-      convUseToSub: parseFloat(itemForm.convUseToSub) || 0,
+      unitBase:      itemForm.unitBuy || '',
+      // Effective fields — ใช้ในระบบ (stock_balances, formatStockQty)
+      unitUse:       effUnitUse,
+      unitConversion: effUnitConversion,
+      convBuyToUse:  c1,
+      convUseToSub:  c2,
+      convSub:       effConvSub,
+      unitSub:       effUnitSub,
+      // Raw 3-level fields — preserved สำหรับ form edit reload
+      unitUseRaw:    itemForm.unitUse || '',      // ⭐ raw middle (ไม่เคยถูก overwrite)
+      unitSubRaw:    itemForm.unitSub || '',      // ⭐ raw smallest
+      cutLevel,
+      wasteLevel:    itemForm.wasteLevel || 'sub',
+      unitPrice:     newUnitPrice,
+      rawBasePrice,                 // เก็บ ฿/หน่วย-1 ไว้เป็น invariant
     }
-    if (editItem) await updateDoc(doc(db, COL.ITEMS, editItem.id), data)
-    else await addDoc(collection(db, COL.ITEMS), { ...data, createdAt: serverTimestamp() })
+    let itemId
+    if (editItem) {
+      await updateDoc(doc(db, COL.ITEMS, editItem.id), data)
+      itemId = editItem.id
+    } else {
+      const ref = await addDoc(collection(db, COL.ITEMS), { ...data, createdAt: serverTimestamp() })
+      itemId = ref.id
+    }
+
+    // ── V2: Mirror stockLimits → stock_balances.minQty (per warehouse, in effective unitUse) ──
+    try {
+      const factor  = parseFloat(itemForm.convBuyToUse) || 1   // Lv1 → Lv2 (ปกติ)
+      const subFact = parseFloat(itemForm.convUseToSub) || 0   // Lv2 → Lv3
+      const cutLevel = itemForm.cutLevel || 'use'              // 'buy' | 'use' | 'sub'
+      const limits  = itemForm.stockLimits || {}
+      const whIds   = Object.keys(limits).filter(whId => limits[whId])
+
+      // ── แปลง qty ในหน่วย dropdown (raw L1/L2/L3) → effective unitUse ตาม cutLevel ──
+      //   minUnit value: 'buy'=Lv1(unitBuy), 'use'=Lv2(unitUseRaw), 'sub'=Lv3(unitSub)
+      const rawToEffFactor = (minUnit) => {
+        // กรณี cutLevel === 'buy' (effective = Lv1)
+        if (cutLevel === 'buy') {
+          if (minUnit === 'buy') return 1
+          if (minUnit === 'use') return factor > 0 ? 1 / factor : 1
+          if (minUnit === 'sub') return (factor > 0 && subFact > 0) ? 1 / (factor * subFact) : 1
+        }
+        // กรณี cutLevel === 'use' (effective = Lv2)
+        if (cutLevel === 'use') {
+          if (minUnit === 'buy') return factor
+          if (minUnit === 'use') return 1
+          if (minUnit === 'sub') return subFact > 0 ? 1 / subFact : 1
+        }
+        // กรณี cutLevel === 'sub' (effective = Lv3)
+        if (cutLevel === 'sub') {
+          if (minUnit === 'buy') return factor * (subFact || 1)
+          if (minUnit === 'use') return subFact || 1
+          if (minUnit === 'sub') return 1
+        }
+        return 1
+      }
+
+      if (whIds.length > 0) {
+        const batch = writeBatch(db)
+        const now = serverTimestamp()
+        whIds.forEach(whId => {
+          const lim = limits[whId] || {}
+          const rawMin = parseFloat(lim.minQty) || 0
+          const minInUse = rawMin > 0 ? rawMin * rawToEffFactor(lim.minUnit) : 0
+          const balRef = doc(db, COL.STOCK_BALANCES, `${whId}_${itemId}`)
+          batch.set(balRef, {
+            warehouseId: whId,
+            itemId,
+            minQty:      minInUse,
+            minUnit:     lim.minUnit || 'use',     // จำหน่วยที่ user เลือก ('buy'|'use'|'sub')
+            minQtyRaw:   rawMin,                   // ค่าที่ user กรอกตามหน่วย minUnit
+            unit:        itemForm.unitUse || '',
+            lastUpdated: now,
+          }, { merge: true })
+        })
+        await batch.commit()
+      }
+    } catch (e) {
+      console.error('[saveItem] mirror min →stock_balances failed:', e)
+    }
+
     // ย้อนกลับแค่ขั้นเดียว — ปิด form แต่คงอยู่ใน modal
     setEditItem(null); setShowAddForm(false); setViewItem(null)
     setItemForm({
-      name: '', category: cats[0]?.name || 'แยม', img: '🍓',
+      name: '', displayName: '', category: cats[0]?.name || 'แยม', img: '🍓',
       unitBuy: '', unitUse: '', unitSub: '',
       convBuyToUse: '', convUseToSub: '',
-      minQty: '', minUnit: 'buy', maxQty: '', maxUnit: 'buy',
+      cutLevel: 'use', wasteLevel: 'sub',
+      stockLimits: {},
+      alertEnabled: true,
       wasteMode: false, wasteUnit: 'use',
+      showSubInInventory: false,
+      visibleIn: {},
     })
-    setToast('✅ บันทึกวัตถุดิบเรียบร้อย')
+    setToast('✅ บันทึกวัตถุดิบ + sync min stock ทุกคลังเรียบร้อย')
   }
 
   async function saveTpl() {
@@ -1210,29 +1811,52 @@ export default function Settings() {
     window.location.replace(HUB)
   }
 
-  let _homeFirstPress = false
-  let _homeTimer = null
   function goHome() {
-    if (!_homeFirstPress) {
-      _homeFirstPress = true
-      const t = document.createElement('div')
-      t.className = 'toast'
-      t.textContent = 'กดอีกครั้งเพื่อกลับหน้าหลัก'
-      t.style.cssText = 'background:#854D0E;color:#fff;'
-      document.body.appendChild(t)
-      setTimeout(() => { t.remove(); _homeFirstPress = false }, 2000)
-      return
-    }
-    clearTimeout(_homeTimer)
-    _homeFirstPress = false
-    if (window.parent !== window) {
-      window.parent.postMessage('closeApp', '*')
-    } else {
-      window.location.href = HUB
-    }
+    window.top.location.href = HUB
   }
 
   const initials = name ? name.trim().slice(-2) : '??'
+
+  // ── ซ่อมข้อมูล Stock ย้อนหลัง ──────────────────────────────────────────
+  async function retroFixStock() {
+    if (!window.confirm('ระบบจะลด stock_balances ตามรายการตัดสต็อกทั้งหมดที่ยังไม่ถูกยกเลิก\n\nดำเนินการต่อ?')) return
+    setToast('⏳ กำลังซ่อมข้อมูล...')
+    try {
+      // 1. ดึง cut_stock_logs ทั้งหมดที่ยังไม่ยกเลิก
+      const logsSnap = await getDocs(collection(db, COL.CUT_STOCK_LOGS))
+      const logs = logsSnap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter(l => !l.cancelled && !l.deletedAt)
+
+      let fixed = 0
+      // 2. สำหรับแต่ละ log ลด stock ตามรายการ
+      for (const log of logs) {
+        const items = log.items || []
+        for (const it of items) {
+          const qty = it.qtyUse ?? it.qty ?? 0
+          if (!qty || !it.itemId || !log.warehouseId) continue
+          const q = query(
+            collection(db, COL.STOCK_BALANCES),
+            where('itemId', '==', it.itemId),
+            where('warehouseId', '==', log.warehouseId)
+          )
+          const snap = await getDocs(q)
+          for (const balDoc of snap.docs) {
+            const current = balDoc.data().qty || 0
+            await updateDoc(balDoc.ref, {
+              qty: Math.max(0, current - qty),
+              lastUpdated: serverTimestamp()
+            })
+            fixed++
+          }
+        }
+      }
+      setToast(`✅ ซ่อมสำเร็จ ${fixed} รายการ`)
+    } catch (e) {
+      console.error(e)
+      setToast('❌ เกิดข้อผิดพลาด: ' + e.message)
+    }
+  }
 
   const SettingRow = ({ icon, title, desc, right, onClick, danger }) => (
     <div className="setting-row" onClick={onClick}
@@ -1252,6 +1876,14 @@ export default function Settings() {
     <div className="page-pad">
       {toast && <Toast message={toast} onDone={() => setToast('')} />}
 
+      {loading && (
+        <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'48px 0',gap:12}}>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+          <div style={{width:40,height:40,borderRadius:'50%',border:'3px solid #F3F4F6',borderTopColor:'#E31E24',animation:'spin .7s linear infinite'}}/>
+          <div style={{fontSize:13,fontWeight:700,color:'#9CA3AF'}}>กำลังโหลด...</div>
+        </div>
+      )}
+
       {/* Sub-header */}
       <div className="page-subbar" style={{ flexDirection: 'column', alignItems: 'stretch', height: 'auto', paddingBottom: 6 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1266,22 +1898,61 @@ export default function Settings() {
       <div style={{ padding: '0 1rem' }}>
         {(() => {
           const session = window._bizSession || {}
-          const _name = session.name || name || 'ผู้ใช้งาน'
+          // Live profile จาก Firestore staff/{phone} (ผ่าน hubStaff state)
           const _phone = session.phone || phone || ''
-          const _role = session.role || role || 'viewer'
+          const _name = hubStaff?.displayName || hubStaff?.name || session.name || name || 'ผู้ใช้งาน'
+          const _role = hubStaff?.role || session.role || role || 'viewer'
           const roleLabel = _role === 'owner' ? '👑 Owner' : _role === 'editor' ? '✏️ Editor' : '👁️ Viewer'
           const roleColor = _role === 'owner' ? '#B45309' : _role === 'editor' ? '#1D4ED8' : '#6B7280'
           const roleBg    = _role === 'owner' ? '#FEF3C7' : _role === 'editor' ? '#EFF6FF'  : '#F3F4F6'
-          const initial   = _name.charAt(0).toUpperCase()
+          // ตัด prefix "พี่/น้อง/คุณ" ออกก่อนเอาตัวแรก (ให้ได้ "จ" จาก "พี่จีโน่")
+          const cleanName = (_name || '').replace(/^(พี่|น้อง|คุณ)\s*/, '').trim()
+          const initial   = (cleanName || _name || '?').charAt(0).toUpperCase()
+          // ใช้ photo จาก Hub Firestore staff/{phone} เป็นหลัก (localStorage cache อาจเก่า)
+          const _photo = hubStaff?.photo || hubStaff?.photoURL || null
           return (
             <div style={{ background: '#fff', borderRadius: 16, padding: 18, boxShadow: 'var(--sh)',
               display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                <div style={{ width: 52, height: 52, borderRadius: '50%', background: 'var(--red)',
+                <label htmlFor="profile-photo-input"
+                  title="กดเพื่อเปลี่ยนรูปโปรไฟล์"
+                  style={{ width: 52, height: 52, borderRadius: '50%',
+                  background: _photo ? `center/cover url(${_photo})` : 'var(--red)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontFamily: 'Prompt', fontWeight: 700, fontSize: 22, color: '#fff', flexShrink: 0 }}>
-                  {initial}
-                </div>
+                  fontFamily: 'Prompt', fontWeight: 700, fontSize: 22, color: '#fff',
+                  flexShrink: 0, cursor: 'pointer', position: 'relative' }}>
+                  {_photo ? '' : initial}
+                  <span style={{ position: 'absolute', bottom: -2, right: -2,
+                    background: '#fff', borderRadius: '50%', width: 20, height: 20,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11, border: '2px solid #fff',
+                    boxShadow: '0 1px 3px rgba(0,0,0,.2)' }}>📷</span>
+                </label>
+                <input id="profile-photo-input" type="file" accept="image/*"
+                  style={{ display: 'none' }}
+                  onChange={async e => {
+                    const file = e.target.files?.[0]
+                    if (!file || !_phone) return
+                    if (file.size > 600 * 1024) {
+                      setToast('❌ รูปใหญ่เกิน 600KB กรุณาเลือกรูปขนาดเล็กกว่า')
+                      return
+                    }
+                    const reader = new FileReader()
+                    reader.onload = async ev => {
+                      const dataUrl = ev.target.result
+                      try {
+                        await setDoc(doc(db, 'staff', _phone),
+                          { photo: dataUrl, photoUpdatedAt: serverTimestamp() },
+                          { merge: true })
+                        try { localStorage.setItem('bizice_avatar_' + _phone, dataUrl) } catch {}
+                        setToast('✅ เปลี่ยนรูปโปรไฟล์แล้ว')
+                      } catch (err) {
+                        console.error(err)
+                        setToast('❌ บันทึกไม่สำเร็จ: ' + (err.message || ''))
+                      }
+                    }
+                    reader.readAsDataURL(file)
+                  }} />
                 <div style={{ flex: 1 }}>
                   <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 16 }}>{_name}</div>
                   <div style={{ marginTop: 4 }}>
@@ -1314,7 +1985,10 @@ export default function Settings() {
             setImportModal(true); setImportResult(null); setImportStatus(''); setImportDiff(null); setImportPhase('checking')
             try {
               const diff = await diffFromCostManager()
-              setImportDiff(diff); setImportPhase('preview')
+              setImportDiff(diff)
+              setSelectedAdd(new Set(diff.toAdd.map((_, i) => i)))
+              setSelectedUpdate(new Set(diff.toUpdate.map((_, i) => i)))
+              setImportPhase('preview')
             } catch(e) { setImportStatus(`❌ ${e.message}`); setImportPhase('idle') }
           }} />
         </div>
@@ -1393,10 +2067,19 @@ export default function Settings() {
               borderRadius: 20, padding: '1px 8px', fontWeight: 700 }}>👑 Owner</span>
           </div>
           <div className="card" style={{ margin: '0 1rem' }}>
-            <SettingRow icon="⚡" title="Quick Template" onClick={() => setTplModal(true)} />
-            <SettingRow icon="🔗" title="เชื่อมต่อระบบ" onClick={() => setIntModal(true)} />
-            <SettingRow icon="📊" title="Opening Stock" onClick={() => setOpeningModal(true)} />
-            <SettingRow icon="📤" title="Export ข้อมูล" onClick={() => setToast('🚧 Coming soon')} />
+            <SettingRow icon="⚡" title="Quick Template" onClick={() => setQuickTplModalV2(true)} />
+            <SettingRow icon="🔗" title="เชื่อมต่อระบบ"
+              desc="Cost Manager / Daily Income / น้องมี่"
+              onClick={() => setIntegrationOpen(true)} />
+            <SettingRow icon="📤" title="Export ข้อมูล"
+              desc="CSV — cut/waste/transfer/movements ตามช่วงวัน"
+              onClick={() => setExportOpen(true)} />
+            <SettingRow icon="🌱" title="Seed Stock"
+              desc="กรอกยอดสต็อกเริ่มต้น (paste จาก Excel)"
+              onClick={() => setSeedOpen(true)} />
+            <SettingRow icon="📊" title="Data Sheet"
+              desc="แก้ items + stock ทุกคลังในไฟล์ CSV เดียว"
+              onClick={() => setDataSheetOpen(true)} />
             <SettingRow icon="🔄" title="รีเฟรชข้อมูล" onClick={forceRefresh} />
           </div>
         </div>
@@ -1405,25 +2088,16 @@ export default function Settings() {
         <div>
           <div className="section-label" style={{ color: '#DC2626' }}>Danger Zone</div>
           <div className="card" style={{ margin: '0 1rem' }}>
-            <SettingRow icon="🗑️" title="Clear All Data" danger onClick={() => setToast('🚧 ต้องใส่ PIN เพื่อยืนยัน')} />
+            <SettingRow icon="🔧" title="ซ่อมข้อมูล Stock ย้อนหลัง"
+              desc="ลด stock_balances ตาม cut_stock_logs ที่มีอยู่ (ใช้ครั้งเดียว)"
+              onClick={retroFixStock} />
+            <SettingRow icon="🗑️" title="Clear All Data"
+              desc="ลบ stock + log + lot + transfer ทั้งหมด (ใส่ PIN ยืนยัน)"
+              danger onClick={() => setClearDataOpen(true)} />
           </div>
         </div>
 
       </>)}
-
-      {/* ══ บัญชีผู้ใช้ — อยู่ล่างสุดเสมอ ══ */}
-      <div>
-        <div className="section-label">บัญชีผู้ใช้</div>
-        <div className="card" style={{ margin: '0 1rem' }}>
-          {isOwner() && (
-            <SettingRow icon="🔐" title="เปลี่ยน PIN วิเคราะห์" onClick={() => setPinModal(true)} />
-          )}
-          <SettingRow icon="👥" title="จัดการ Staff"
-            right={<span style={{ fontSize: 11, background: 'var(--bg)', border: '1.5px solid var(--border2)',
-              borderRadius: 6, padding: '2px 7px', fontWeight: 700, color: 'var(--txt3)' }}>→ Hub</span>}
-            onClick={() => window.open(HUB, '_blank')} />
-        </div>
-      </div>
 
       {/* ── Version Footer ── */}
       <div style={{
@@ -1441,9 +2115,9 @@ export default function Settings() {
             background: 'var(--bg)', border: '1px solid var(--border2)',
             borderRadius: 20, padding: '1px 8px', fontWeight: 700, fontSize: 10.5,
             color: 'var(--txt2)'
-          }}>v1.4.0</span>
+          }}>v2.0.36</span>
           <span>·</span>
-          <span>อัพเดท 16 พ.ค. 2569</span>
+          <span>อัพเดท 2 มิ.ย. 2569</span>
         </div>
       </div>
 
@@ -1686,8 +2360,16 @@ export default function Settings() {
               items
                 .filter(i => {
                   if (itemCatFilter !== 'all' && i.category !== itemCatFilter) return false
-                  if (itemSearch && !i.name.toLowerCase().includes((itemSearch||'').toLowerCase())) return false
+                  if (itemSearch && !i.name.toLowerCase().includes((itemSearch||'').toLowerCase())
+                    && !(i.displayName||'').toLowerCase().includes((itemSearch||'').toLowerCase())) return false
                   return true
+                })
+                .sort((a, b) => {
+                  // เรียงตาม sortOrder ที่ตั้งใน "ลากเพื่อเรียงลำดับ"
+                  const oa = a.sortOrder ?? 999
+                  const ob = b.sortOrder ?? 999
+                  if (oa !== ob) return oa - ob
+                  return (a.name || '').localeCompare(b.name || '', 'th')
                 })
                 .map((i, idx, arr) => {
                   const isEditing = editItem?.id === i.id
@@ -1709,9 +2391,22 @@ export default function Settings() {
                         {i.img || '📦'}
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: isViewing ? 700 : 600,
-                          color: isViewing || isEditing ? 'var(--red)' : '#1C1C1E',
-                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{i.name}</div>
+                        {(() => {
+                          const hiddenCount = Object.values(i.visibleIn || {}).filter(v => v === false).length
+                          return (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                              <div style={{ fontSize: 13, fontWeight: isViewing ? 700 : 600,
+                                color: isViewing || isEditing ? 'var(--red)' : '#1C1C1E',
+                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{i.displayName || i.name}</div>
+                              {hiddenCount > 0 && (
+                                <span style={{ fontSize: 9, background: '#FEF2F2', color: '#DC2626',
+                                  borderRadius: 4, padding: '1px 5px', fontWeight: 700, flexShrink: 0 }}>
+                                  ซ่อน {hiddenCount} คลัง
+                                </span>
+                              )}
+                            </div>
+                          )
+                        })()}
                         <div style={{ fontSize: 10, color: '#8E8E93', marginTop: 1 }}>
                           {[i.unitBuy||i.unitBase, i.unitUse, i.unitSub].filter(Boolean).join(' › ')}
                         </div>
@@ -1721,17 +2416,37 @@ export default function Settings() {
                           onClick={e => {
                             e.stopPropagation()
                             setEditItem(i); setViewItem(null); setShowAddForm(false)
+                            // ── V2: merge minQty จาก stock_balances → stockLimits (per warehouse) ──
+                            const mergedLimits = { ...(i.stockLimits || {}) }
+                            warehouses.forEach(w => {
+                              const bal = balanceMap[`${w.id}_${i.id}`]
+                              if (bal?.minQty != null && bal.minQty > 0) {
+                                // ใช้ minUnit + minQtyRaw ที่ save ไว้ (ถ้ามี) — เพื่อแสดงในหน่วยที่ user เลือก
+                                // ถ้าเป็น item เก่าที่ไม่มี → fallback 'use' (กระป๋อง)
+                                mergedLimits[w.id] = {
+                                  ...(mergedLimits[w.id] || {}),
+                                  minQty:  bal.minQtyRaw != null ? bal.minQtyRaw : bal.minQty,
+                                  minUnit: bal.minUnit || 'use',
+                                }
+                              }
+                            })
                             setItemForm({
-                              name: i.name, category: i.category, img: i.img || '📦',
+                              name: i.name, displayName: i.displayName || '',
+                              category: i.category, img: i.img || '📦',
                               unitBuy: i.unitBuy || i.unitBase || '',
-                              unitUse: i.unitUse || '',
-                              unitSub: i.unitSub || '',
+                              // ใช้ raw fields ก่อน — preserve user input ผ่าน cutLevel change
+                              unitUse: i.unitUseRaw ?? i.unitUse ?? '',
+                              unitSub: i.unitSubRaw ?? i.unitSub ?? '',
                               convBuyToUse: i.convBuyToUse || '',
                               convUseToSub: i.convUseToSub || '',
-                              minQty: i.minQty || '', minUnit: i.minUnit || 'buy',
-                              maxQty: i.maxQty || '', maxUnit: i.maxUnit || 'buy',
+                              cutLevel: i.cutLevel || 'use',
+                              wasteLevel: i.wasteLevel || ((i.unitSubRaw || i.unitSub) ? 'sub' : 'use'),
+                              stockLimits: mergedLimits,
+                              alertEnabled: i.alertEnabled !== false,   // default true
                               wasteMode: i.wasteMode || false,
                               wasteUnit: i.wasteUnit || 'use',
+                              showSubInInventory: i.showSubInInventory || false,
+                              visibleIn: i.visibleIn || {},
                             })
                           }}
                           style={{ border: 'none', cursor: 'pointer', borderRadius: 7, flexShrink: 0,
@@ -1751,13 +2466,14 @@ export default function Settings() {
             // ── Inventory values ──
             const cmItem     = cmLibrary.find(ci => ci.name === viewItem.name)
             const invUnitBuy = viewItem.unitBuy || viewItem.unitBase || ''
-            const invUnitUse = viewItem.unitUse || ''
-            const invUnitSub = viewItem.unitSub || ''
+            // ใช้ RAW middle/sub ใน comparison (3-level definition) — ไม่ขึ้นกับ cutLevel
+            const invUnitUseDef = viewItem.unitUseRaw || viewItem.unitUse || ''
+            const invUnitSubDef = viewItem.unitSubRaw || viewItem.unitSub || ''
             const convBU     = parseFloat(viewItem.convBuyToUse) || 0
             const convUS     = parseFloat(viewItem.convUseToSub) || 0
-            // อัตราแปลงเต็มสาย: 1 ลัง = X กรัม
+            // อัตราแปลงเต็มสาย: 1 ลัง = X (เล็กสุด)
             const invTotalQty  = convUS > 0 ? convBU * convUS : convBU
-            const invSmallUnit = convUS > 0 ? invUnitSub : invUnitUse
+            const invSmallUnit = convUS > 0 ? invUnitSubDef : invUnitUseDef
             const invConvLabel = invTotalQty > 0
               ? `1 ${invUnitBuy} = ${invTotalQty.toLocaleString()} ${invSmallUnit}`
               : '—'
@@ -1765,13 +2481,22 @@ export default function Settings() {
             // ── CM values ──
             const lvs        = cmItem?.levels || []
             const cmUnitBuy  = lvs[0]?.name || ''
-            const cmUnitUse  = cmItem?.unit || lvs[lvs.length - 1]?.name || ''
+            const cmUnitUseDef = lvs[1]?.name || ''   // RAW middle
+            const cmUnitSubDef = lvs[2]?.name || ''   // RAW sub
+            const cmSmallUnit  = cmUnitSubDef || cmUnitUseDef
             // total qty = product ของทุก level ตั้งแต่ level[1]
             const cmTotalQty = cmItem?.qty ||
               (lvs.length > 1 ? lvs.slice(1).reduce((acc, l) => acc * (l.qty || 1), 1) : 0)
             const cmConvLabel = cmTotalQty > 0
-              ? `1 ${cmUnitBuy} = ${Number(cmTotalQty).toLocaleString()} ${cmUnitUse}`
+              ? `1 ${cmUnitBuy} = ${Number(cmTotalQty).toLocaleString()} ${cmSmallUnit}`
               : '—'
+
+            // ── cut-unit choices (ไม่ใช่ mismatch — เป็น user choice) ──
+            const invCutLevel = viewItem.cutLevel || 'use'
+            const invCutUnit =
+              invCutLevel === 'buy' ? invUnitBuy :
+              invCutLevel === 'sub' ? invUnitSubDef : invUnitUseDef
+            const cmCutUnit = cmItem?.unit || cmSmallUnit
 
             // ── badge helper ──
             function matchBadge(a, b) {
@@ -1800,7 +2525,12 @@ export default function Settings() {
                       {viewItem.img || '📦'}
                     </div>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, color: '#1C1C1E' }}>{viewItem.name}</div>
+                      <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, color: '#1C1C1E' }}>{viewItem.displayName || viewItem.name}</div>
+                      {viewItem.displayName && (
+                        <div style={{ fontSize: 10, color: '#8E8E93', marginBottom: 2 }}>
+                          🔗 CM: {viewItem.name}
+                        </div>
+                      )}
                       <span style={{ fontSize: 11, background: '#FFF1F2', color: '#FF3B30', borderRadius: 6,
                         padding: '1px 7px', fontWeight: 600, display: 'inline-block', marginTop: 2 }}>
                         {viewItem.category}
@@ -1813,11 +2543,11 @@ export default function Settings() {
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0 }}>
                     {[
                       ['หน่วยซื้อ', invUnitBuy || '—'],
-                      ['หน่วยใช้', invUnitUse || '—'],
-                      ['หน่วยย่อย', invUnitSub || '—'],
+                      ['หน่วยที่ 2', invUnitUseDef || '—'],
+                      ['หน่วยที่ 3', invUnitSubDef || '—'],
                       ['อัตราแปลง (เต็มสาย)', invConvLabel, 'full'],
-                      ['Min Stock', viewItem.minQty ? `${viewItem.minQty} ${viewItem.minUnit === 'use' ? invUnitUse : viewItem.minUnit === 'sub' ? invUnitSub : invUnitBuy}` : '0'],
-                      ['Max Stock', viewItem.maxQty ? `${viewItem.maxQty} ${viewItem.maxUnit === 'use' ? invUnitUse : viewItem.maxUnit === 'sub' ? invUnitSub : invUnitBuy}` : '0'],
+                      ['Min Stock', viewItem.minQty ? `${viewItem.minQty} ${viewItem.minUnit === 'use' ? invUnitUseDef : viewItem.minUnit === 'sub' ? invUnitSubDef : invUnitBuy}` : '0'],
+                      ['Max Stock', viewItem.maxQty ? `${viewItem.maxQty} ${viewItem.maxUnit === 'use' ? invUnitUseDef : viewItem.maxUnit === 'sub' ? invUnitSubDef : invUnitBuy}` : '0'],
                       ['ติดตามของเสีย', viewItem.wasteMode ? '✅ เปิด' : '❌ ปิด', 'full'],
                     ].map(([label, val, span], ri) => (
                       <div key={label} style={{
@@ -2043,17 +2773,32 @@ export default function Settings() {
                             <span></span>
                           </div>
                           {[
-                            ['หน่วยซื้อ',   invUnitBuy,   cmUnitBuy],
-                            ['หน่วยใช้',    invUnitUse,   cmUnitUse],
-                            ['อัตราแปลง',   invConvLabel, cmConvLabel],
-                          ].map(([label, inv, cm], ri) => (
-                            <div key={label} style={{ display: 'grid', gridTemplateColumns: '80px 1fr 1fr auto',
+                            { label: 'หน่วยที่ 1', inv: invUnitBuy,    cm: cmUnitBuy,    badge: true },
+                            { label: 'หน่วยที่ 2', inv: invUnitUseDef, cm: cmUnitUseDef, badge: true },
+                            { label: 'หน่วยที่ 3', inv: invUnitSubDef, cm: cmUnitSubDef, badge: true },
+                            { label: 'อัตราแปลง',  inv: invConvLabel,  cm: cmConvLabel,  badge: true },
+                            // ── cut unit (info — เลือกเองได้ ไม่ใช่ mismatch) ──
+                            { label: '🎯 ตัดสต็อก', inv: invCutUnit, cm: cmCutUnit, badge: false,
+                              info: 'เลือกได้ใน Inventory · CM = default' },
+                          ].map(({ label, inv, cm, badge, info }) => (
+                            <div key={label} style={{ display: 'grid', gridTemplateColumns: '90px 1fr 1fr auto',
                               alignItems: 'center', gap: 4,
                               padding: '10px 14px', borderTop: `1px solid ${IOS.sep}` }}>
                               <span style={{ fontSize: 11, color: IOS.label, fontWeight: 600 }}>{label}</span>
                               <span style={{ fontSize: 12, fontWeight: 600, color: '#1C1C1E', textAlign: 'center' }}>{inv || '—'}</span>
                               <span style={{ fontSize: 12, fontWeight: 600, color: IOS.accent, textAlign: 'center' }}>{cm || '—'}</span>
-                              <span style={{ textAlign: 'right' }}>{matchBadge(inv, cm)}</span>
+                              <span style={{ textAlign: 'right' }}>
+                                {badge
+                                  ? matchBadge(inv, cm)
+                                  : (
+                                    <span title={info || ''} style={{ fontSize: 10, background: '#EFF6FF',
+                                      color: '#1D4ED8', border: '1px solid #BFDBFE', borderRadius: 20,
+                                      padding: '2px 8px', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                                      ℹ เลือกได้
+                                    </span>
+                                  )
+                                }
+                              </span>
                             </div>
                           ))}
                         </div>
@@ -2071,37 +2816,16 @@ export default function Settings() {
             )
           })()}
 
-          {/* Add new / Import buttons (only when not editing) */}
-          {isOwner() && !editItem && (
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={() => { setShowAddForm(f => !f); setViewItem(null) }}
-                style={{ flex: 1, padding: '9px 12px', borderRadius: 10, border: '1.5px dashed var(--border2)',
-                  background: showAddForm ? '#fff8f8' : 'var(--bg)', color: showAddForm ? 'var(--red)' : 'var(--txt2)',
-                  fontFamily: 'Sarabun', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
-                {showAddForm ? '✕ ซ่อนฟอร์ม' : '+ เพิ่มวัตถุดิบใหม่'}
-              </button>
-              <button onClick={async () => {
-                // Import from Cost Manager: find matching item and pre-fill
-                const cmItem = cmLibrary.find(ci => ci.name === (itemSearch || ''))
-                if (!cmItem) { setToast('🔍 ค้นหาชื่อวัตถุดิบก่อน แล้วกด Import'); return }
-                const cat = cmItem.cat || 'อื่นๆ'
-                const unitBuy = cmItem.levels?.[0]?.name || cmItem.unit || ''
-                const unitUse = cmItem.levels?.[1]?.name || cmItem.unit || ''
-                const unitSub = cmItem.levels?.[2]?.name || ''
-                const convBuyToUse = cmItem.levels?.[1]?.qty || ''
-                const convUseToSub = cmItem.levels?.[2]?.qty || ''
-                setItemForm(f => ({ ...f, name: cmItem.name, category: cat,
-                  img: CAT_EMOJI[cat] || '📦', unitBuy, unitUse, unitSub,
-                  convBuyToUse: String(convBuyToUse), convUseToSub: String(convUseToSub) }))
-                setShowAddForm(true); setEditItem(null)
-                setToast('✅ ดึงข้อมูลจาก Cost Manager แล้ว ตรวจสอบก่อนบันทึก')
-              }}
-                style={{ padding: '9px 12px', borderRadius: 10, border: 'none',
-                  background: '#FFF1F2', color: '#FF3B30', fontFamily: 'Sarabun',
-                  fontWeight: 700, fontSize: 13, cursor: 'pointer', whiteSpace: 'nowrap',
-                  boxShadow: '0 1px 3px rgba(255,59,48,0.15)' }}>
-                🔄 Update จาก CM
-              </button>
+          {/* Info: เพิ่ม / แก้ items ทำที่ Cost Manager → Sync */}
+          {isOwner() && !editItem && !showAddForm && (
+            <div style={{ background: '#EFF6FF', border: '1px solid #BFDBFE',
+              borderRadius: 10, padding: '10px 14px', fontSize: 11, color: '#1D4ED8',
+              display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 14 }}>💡</span>
+              <span>
+                ต้องการเพิ่ม/แก้วัตถุดิบ → ไปที่ <strong>Cost Manager → คลังวัตถุดิบ</strong> แล้วกด
+                <strong> 🔄 Update จาก Cost Manager </strong>ในหน้านี้
+              </span>
             </div>
           )}
 
@@ -2120,13 +2844,35 @@ export default function Settings() {
                 display: 'flex', flexDirection: 'column', gap: 12 }}>
 
                 <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 14, color: editItem ? 'var(--red)' : 'var(--txt)' }}>
-                  {editItem ? `✏️ แก้ไข: ${editItem.name}` : '➕ เพิ่มวัตถุดิบใหม่'}
+                  {editItem ? `✏️ แก้ไข: ${editItem.displayName || editItem.name}` : '➕ เพิ่มวัตถุดิบใหม่'}
                 </div>
 
                 {/* Name */}
                 <div>
-                  <label className="fi-label">ชื่อวัตถุดิบ</label>
+                  <label className="fi-label">ชื่อ (ตรงกับ Cost Manager) <span style={{ color: '#8E8E93', fontWeight: 400 }}>— ใช้ link ข้อมูล</span></label>
                   <input className="fi" value={itemForm.name} onChange={e => setItemForm(f => ({ ...f, name: e.target.value }))} placeholder="เช่น แยมสตรอว์เบอร์รี" />
+                </div>
+
+                {/* Display Name */}
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <label className="fi-label" style={{ marginBottom: 0 }}>ชื่อที่แสดง (ชื่อเล่น) <span style={{ color: '#8E8E93', fontWeight: 400 }}>— ไม่บังคับ</span></label>
+                    {itemForm.displayName && (
+                      <button onClick={() => setItemForm(f => ({ ...f, displayName: '' }))}
+                        style={{ fontSize: 11, color: '#8E8E93', background: '#F2F2F7', border: 'none',
+                          borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontFamily: 'Sarabun' }}>
+                        ✕ ใช้ชื่อเดียวกับ CM
+                      </button>
+                    )}
+                  </div>
+                  <input className="fi" value={itemForm.displayName}
+                    onChange={e => setItemForm(f => ({ ...f, displayName: e.target.value }))}
+                    placeholder={`ค่าเริ่มต้น: ${itemForm.name || 'ชื่อ CM'} (เว้นว่างเพื่อใช้ชื่อ CM)`} />
+                  {itemForm.displayName && (
+                    <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 4 }}>
+                      แสดงเป็น: <strong style={{ color: '#1C1C1E' }}>{itemForm.displayName}</strong> · link ข้อมูลจาก: <strong>{itemForm.name || '—'}</strong>
+                    </div>
+                  )}
                 </div>
 
                 {/* Category + Emoji */}
@@ -2192,20 +2938,23 @@ export default function Settings() {
                     items.flatMap(i => [i.unitBuy||i.unitBase, i.unitUse, i.unitSub].filter(Boolean))
                   )].sort()
                   const unitFields = [
-                    { key: 'unitBuy', label: 'หน่วยซื้อ', ph: 'ลัง' },
-                    { key: 'unitUse', label: 'หน่วยใช้', ph: 'ใบ' },
-                    { key: 'unitSub', label: 'หน่วยย่อย', ph: 'กรัม (ถ้ามี)' },
+                    { key: 'unitBuy', label: 'หน่วยที่ 1', sub: 'ใหญ่สุด', ph: 'ลัง' },
+                    { key: 'unitUse', label: 'หน่วยที่ 2', sub: 'กลาง', ph: 'กระป๋อง / ใบ' },
+                    { key: 'unitSub', label: 'หน่วยที่ 3', sub: 'เล็กสุด · ของเสีย', ph: 'กรัม / มล. (ถ้ามี)' },
                   ]
                   return (
                     <div>
-                      <label className="fi-label">หน่วย (3 ระดับ)</label>
+                      <label className="fi-label">หน่วย (สูงสุด 3 ระดับ)</label>
                       <datalist id="unit-list">
                         {allUnits.map(u => <option key={u} value={u} />)}
                       </datalist>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-                        {unitFields.map(({ key, label, ph }) => (
+                        {unitFields.map(({ key, label, sub, ph }) => (
                           <div key={key}>
-                            <div style={{ fontSize: 10.5, color: 'var(--txt3)', fontWeight: 600, marginBottom: 3 }}>{label}</div>
+                            <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 3 }}>
+                              <span style={{ fontSize: 11, color: 'var(--txt2)', fontWeight: 700 }}>{label}</span>
+                              <span style={{ fontSize: 9, color: 'var(--txt3)' }}>{sub}</span>
+                            </div>
                             <input list="unit-list" className="fi"
                               value={itemForm[key]}
                               onChange={e => setItemForm(f => ({ ...f, [key]: e.target.value }))}
@@ -2249,29 +2998,239 @@ export default function Settings() {
                   </div>
                 </div>
 
-                {/* Min / Max Stock */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                  {[['minQty','minUnit','📉 Min Stock','#FFF7ED','#C2410C'], ['maxQty','maxUnit','📈 Max Stock','#F0FDF4','#15803D']].map(([qField, uField, label, bg, col]) => (
-                    <div key={qField} style={{ background: bg, borderRadius: 12, padding: '10px 12px' }}>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: col, marginBottom: 8 }}>{label}</div>
-                      <input type="number" value={itemForm[qField]}
-                        onChange={e => setItemForm(f => ({ ...f, [qField]: e.target.value }))}
-                        placeholder="0"
-                        style={{ width: '100%', border: '1.5px solid ' + col + '55', borderRadius: 8,
-                          padding: '8px 12px', fontSize: 18, fontFamily: 'Prompt', fontWeight: 700,
-                          color: col, background: '#fff', outline: 'none', marginBottom: 6,
-                          boxSizing: 'border-box', textAlign: 'center' }} />
-                      <select value={itemForm[uField]}
-                        onChange={e => setItemForm(f => ({ ...f, [uField]: e.target.value }))}
-                        style={{ width: '100%', border: '1.5px solid ' + col + '55', borderRadius: 8,
-                          padding: '6px 10px', fontSize: 12, fontFamily: 'Sarabun', fontWeight: 600,
-                          color: col, background: '#fff', outline: 'none' }}>
-                        {itemForm.unitBuy && <option value="buy">{itemForm.unitBuy}</option>}
-                        {itemForm.unitUse && <option value="use">{itemForm.unitUse}</option>}
-                        {itemForm.unitSub && <option value="sub">{itemForm.unitSub}</option>}
-                      </select>
+                {/* ── 🎯 Role Selector: ตัดสต็อก + ของเสีย ── */}
+                {(() => {
+                  const opts = [
+                    { val: 'buy', label: itemForm.unitBuy, slot: 'หน่วยที่ 1', disabled: !itemForm.unitBuy },
+                    { val: 'use', label: itemForm.unitUse, slot: 'หน่วยที่ 2', disabled: !itemForm.unitUse },
+                    { val: 'sub', label: itemForm.unitSub, slot: 'หน่วยที่ 3',
+                      disabled: !itemForm.unitSub || !itemForm.convUseToSub },
+                  ]
+                  const renderRow = (icon, label, field, defaultVal, themeColor) => (
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                        <span style={{ fontSize: 13 }}>{icon}</span>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt2)' }}>{label}</span>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+                        {opts.map(opt => {
+                          const active = (itemForm[field] || defaultVal) === opt.val
+                          return (
+                            <button key={opt.val} disabled={opt.disabled}
+                              onClick={() => !opt.disabled && setItemForm(f => ({ ...f, [field]: opt.val }))}
+                              style={{
+                                padding: '8px 4px', borderRadius: 9,
+                                border: `2px solid ${active ? themeColor : 'var(--border)'}`,
+                                background: active ? themeColor + '15' : (opt.disabled ? '#F9FAFB' : '#fff'),
+                                cursor: opt.disabled ? 'not-allowed' : 'pointer',
+                                opacity: opt.disabled ? 0.5 : 1,
+                                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1,
+                              }}>
+                              <span style={{ fontSize: 12, fontWeight: 700,
+                                color: active ? themeColor : 'var(--txt)' }}>
+                                {opt.label || '—'}
+                              </span>
+                              <span style={{ fontSize: 9, color: active ? themeColor : 'var(--txt3)' }}>
+                                {opt.slot}
+                              </span>
+                            </button>
+                          )
+                        })}
+                      </div>
                     </div>
-                  ))}
+                  )
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10,
+                      background: 'var(--bg)', borderRadius: 10, padding: 10 }}>
+                      {renderRow('✂️', 'ใช้ตัดสต็อก', 'cutLevel',   'use', '#E31E24')}
+                      {renderRow('🗑️', 'ใช้คำนวณของเสีย', 'wasteLevel', 'sub', '#D97706')}
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', lineHeight: 1.4, paddingTop: 4,
+                        borderTop: '1px dashed var(--border)' }}>
+                        💡 <strong>ตัดสต็อก</strong>: หน่วยที่เก็บ qty ใน stock_balances · <strong>ของเสีย</strong>: หน่วย default ในฟอร์มบันทึกของเสีย
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* 🔔 Alert toggle — ปิดได้กรณีของหมดซีซั่น/เลิกใช้ */}
+                <div style={{
+                  background: itemForm.alertEnabled ? '#F0FDF4' : '#F3F4F6',
+                  border: `1.5px solid ${itemForm.alertEnabled ? '#86EFAC' : '#D1D5DB'}`,
+                  borderRadius: 12, padding: '12px 14px',
+                  display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <button className={`toggle${itemForm.alertEnabled ? ' on' : ''}`}
+                    onClick={() => setItemForm(f => ({ ...f, alertEnabled: !f.alertEnabled }))} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700,
+                      color: itemForm.alertEnabled ? '#15803D' : '#6B7280' }}>
+                      🔔 แจ้งเตือนของหมด/เหลือน้อย
+                    </div>
+                    <div style={{ fontSize: 11, color: itemForm.alertEnabled ? '#15803D' : '#9CA3AF', marginTop: 2 }}>
+                      {itemForm.alertEnabled
+                        ? 'เปิดอยู่ — มีการตั้ง Min/Max'
+                        : '🔒 ปิดอยู่ — Min/Max ถูก lock (เช่น ของหมดซีซั่น)'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Min / Max Stock — Tab Sheet per warehouse */}
+                {(() => {
+                  const activeWhs = warehouses.filter(wh => wh.active !== false)
+                  if (activeWhs.length === 0) return null
+                  const tabId = activeWhLimitTab || activeWhs[0]?.id
+                  const activeWh = activeWhs.find(w => w.id === tabId) || activeWhs[0]
+                  const lim = itemForm.stockLimits?.[activeWh?.id] || {}
+                  const locked = !itemForm.alertEnabled
+                  const setLim = (field, val) => setItemForm(f => ({
+                    ...f,
+                    stockLimits: { ...f.stockLimits, [activeWh.id]: { ...(f.stockLimits?.[activeWh.id] || {}), [field]: val } }
+                  }))
+                  const unitOpts = [
+                    itemForm.unitBuy ? { val: 'buy', label: itemForm.unitBuy } : null,
+                    itemForm.unitUse && itemForm.unitUse !== itemForm.unitBuy ? { val: 'use', label: itemForm.unitUse } : null,
+                    itemForm.unitSub && !isWeightVolUnit(itemForm.unitSub) ? { val: 'sub', label: itemForm.unitSub } : null,
+                  ].filter(Boolean)
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 0,
+                      border: '1.5px solid var(--border)', borderRadius: 12, overflow: 'hidden',
+                      opacity: locked ? 0.55 : 1,
+                      pointerEvents: locked ? 'none' : 'auto',
+                      filter: locked ? 'grayscale(0.6)' : 'none',
+                      transition: 'opacity .15s, filter .15s' }}>
+                      {/* Tab bar */}
+                      <div style={{ display: 'flex', borderBottom: '1.5px solid var(--border)', background: 'var(--bg)' }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt2)', padding: '8px 10px', whiteSpace: 'nowrap', borderRight: '1.5px solid var(--border)', display: 'flex', alignItems: 'center' }}>
+                          {locked ? '🔒' : '📉📈'}
+                        </div>
+                        {activeWhs.map(wh => {
+                          const isActive = wh.id === (activeWhLimitTab || activeWhs[0]?.id)
+                          const hasVal = (itemForm.stockLimits?.[wh.id]?.minQty || itemForm.stockLimits?.[wh.id]?.maxQty)
+                          return (
+                            <button key={wh.id} onClick={() => setActiveWhLimitTab(wh.id)}
+                              style={{ flex: 1, border: 'none', cursor: 'pointer', padding: '8px 6px',
+                                background: isActive ? '#fff' : 'transparent',
+                                borderBottom: isActive ? '2px solid ' + (wh.color || 'var(--red)') : '2px solid transparent',
+                                marginBottom: -1,
+                                fontFamily: 'Sarabun', fontSize: 11, fontWeight: isActive ? 700 : 500,
+                                color: isActive ? (wh.color || 'var(--red)') : 'var(--txt3)',
+                                transition: 'all .15s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                              {wh.name}
+                              {hasVal ? <span style={{ width: 6, height: 6, borderRadius: '50%', background: wh.color || 'var(--red)', display: 'inline-block' }} /> : null}
+                            </button>
+                          )
+                        })}
+                      </div>
+                      {/* Tab content */}
+                      <div style={{ padding: '12px 12px', background: '#fff', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        {[['minQty','minUnit','📉 Min','#FFF7ED','#C2410C'], ['maxQty','maxUnit','📈 Max','#F0FDF4','#15803D']].map(([qf,uf,lab,bg,col]) => (
+                          <div key={qf} style={{ background: bg, borderRadius: 9, padding: '8px 10px' }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: col, marginBottom: 5 }}>{lab}</div>
+                            <input type="number" value={lim[qf] ?? ''}
+                              onChange={e => setLim(qf, e.target.value)}
+                              placeholder="0"
+                              style={{ width: '100%', border: '1.5px solid ' + col + '55', borderRadius: 7,
+                                padding: '6px 8px', fontSize: 16, fontFamily: 'Prompt', fontWeight: 700,
+                                color: col, background: '#fff', outline: 'none', marginBottom: 5,
+                                boxSizing: 'border-box', textAlign: 'center' }} />
+                            <select value={lim[uf] || (unitOpts[0]?.val || 'buy')}
+                              onChange={e => setLim(uf, e.target.value)}
+                              style={{ width: '100%', border: '1.5px solid ' + col + '55', borderRadius: 7,
+                                padding: '5px 8px', fontSize: 12, fontFamily: 'Sarabun', fontWeight: 600,
+                                color: col, background: '#fff', outline: 'none' }}>
+                              {unitOpts.map(o => <option key={o.val} value={o.val}>{o.label}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* Inventory Sub-Unit Toggle */}
+                {itemForm.unitSub && (
+                  <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+                    {isWeightVolUnit(itemForm.unitSub) ? (
+                      <div style={{ background: '#F0F9FF', borderRadius: 10, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{ fontSize: 16 }}>⚖️</span>
+                          <span style={{ fontSize: 12, color: '#0369A1', fontWeight: 600 }}>
+                            ระบบตรวจพบ "{itemForm.unitSub}" เป็นหน่วยชั่ง/ตวง
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 11.5, color: '#0284C7', lineHeight: 1.5 }}>
+                          Inventory จะใช้ <strong>{itemForm.unitUse || 'หน่วยใช้'}</strong> เป็นหน่วยฐาน (ซ่อน {itemForm.unitSub} อัตโนมัติ)
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 2 }}>
+                          <button className={`toggle${itemForm.showSubInInventory ? ' on' : ''}`}
+                            onClick={() => setItemForm(f => ({ ...f, showSubInInventory: !f.showSubInInventory }))} />
+                          <span style={{ fontSize: 12, color: '#0369A1' }}>
+                            {itemForm.showSubInInventory
+                              ? `✅ แสดง "${itemForm.unitSub}" ใน Inventory (override)`
+                              : `แสดง "${itemForm.unitSub}" ใน Inventory (ปิดอยู่)`}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <span style={{ fontSize: 16 }}>📦</span>
+                        <span style={{ fontSize: 12, color: 'var(--txt2)' }}>
+                          "{itemForm.unitSub}" เป็นหน่วยนับ — แสดงใน Inventory อัตโนมัติ
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Per-warehouse visibility */}
+                <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span>👁️ แสดงในคลัง/สาขา</span>
+                    <span style={{ fontSize: 10, color: '#8E8E93', fontWeight: 400 }}>เลือกว่าจะแสดงที่ไหนบ้าง</span>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 0, borderRadius: 10,
+                    border: '1px solid var(--border)', overflow: 'hidden' }}>
+                    {warehouses.filter(wh => wh.active !== false).map((wh, wi, arr) => {
+                      const isVisible = itemForm.visibleIn?.[wh.id] !== false
+                      return (
+                        <div key={wh.id} style={{
+                          display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px',
+                          borderBottom: wi < arr.length - 1 ? '1px solid var(--border)' : 'none',
+                          background: isVisible ? '#fff' : '#FAFAFA',
+                        }}>
+                          <div style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
+                            background: wh.color || '#8E8E93', opacity: isVisible ? 1 : 0.35 }} />
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600,
+                              color: isVisible ? '#1C1C1E' : '#9CA3AF' }}>{wh.name}</div>
+                            <div style={{ fontSize: 10, color: isVisible ? '#15803D' : '#DC2626' }}>
+                              {isVisible ? 'แสดงใน คลัง + ตัดสต็อก' : 'ซ่อน (ข้อมูลยังอยู่)'}
+                            </div>
+                          </div>
+                          <button className={`toggle${isVisible ? ' on' : ''}`}
+                            onClick={() => setItemForm(f => ({
+                              ...f,
+                              visibleIn: { ...(f.visibleIn || {}), [wh.id]: !isVisible }
+                            }))} />
+                        </div>
+                      )
+                    })}
+                    {warehouses.filter(wh => wh.active !== false).length === 0 && (
+                      <div style={{ padding: 12, fontSize: 12, color: '#9CA3AF', textAlign: 'center' }}>
+                        ไม่มีคลัง/สาขาที่เปิดใช้งาน
+                      </div>
+                    )}
+                  </div>
+                  {/* Summary badge */}
+                  {(() => {
+                    const activeWhs = warehouses.filter(wh => wh.active !== false)
+                    const hiddenCount = activeWhs.filter(wh => itemForm.visibleIn?.[wh.id] === false).length
+                    if (hiddenCount === 0) return null
+                    return (
+                      <div style={{ fontSize: 11, color: '#DC2626', marginTop: 6, paddingLeft: 2 }}>
+                        ⚠️ ซ่อนจาก {hiddenCount} คลัง/สาขา
+                      </div>
+                    )
+                  })()}
                 </div>
 
                 {/* Waste Mode */}
@@ -2513,14 +3472,25 @@ export default function Settings() {
                     <div style={{ padding: '9px 14px', background: '#F0FDF4', borderBottom: '1px solid #BBF7D0',
                       display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontSize: 16 }}>🆕</span>
-                      <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, color: '#15803D' }}>
-                        เพิ่มใหม่ {toAdd.length} รายการ
+                      <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, color: '#15803D', flex: 1 }}>
+                        เพิ่มใหม่ ({selectedAdd.size}/{toAdd.length})
                       </span>
+                      <button onClick={() => setSelectedAdd(selectedAdd.size === toAdd.length ? new Set() : new Set(toAdd.map((_, i) => i)))}
+                        style={{ fontSize: 11, color: '#15803D', border: 'none', cursor: 'pointer',
+                          fontFamily: 'Sarabun', fontWeight: 700, padding: '2px 6px', borderRadius: 6, background: '#D1FAE5' }}>
+                        {selectedAdd.size === toAdd.length ? 'ยกเลิกทั้งหมด' : 'เลือกทั้งหมด'}
+                      </button>
                     </div>
                     <div style={{ maxHeight: 160, overflowY: 'auto' }}>
                       {toAdd.map(({ cmItem, cat, unitBuy, unitUse }, ri) => (
-                        <div key={ri} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px',
-                          borderBottom: ri < toAdd.length - 1 ? '1px solid #F3F4F6' : 'none' }}>
+                        <div key={ri} onClick={() => setSelectedAdd(s => {
+                          const n = new Set(s); n.has(ri) ? n.delete(ri) : n.add(ri); return n
+                        })} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px',
+                          borderBottom: ri < toAdd.length - 1 ? '1px solid #F3F4F6' : 'none',
+                          cursor: 'pointer', opacity: selectedAdd.has(ri) ? 1 : 0.4,
+                          background: selectedAdd.has(ri) ? '#fff' : '#F9FAFB' }}>
+                          <input type="checkbox" readOnly checked={selectedAdd.has(ri)}
+                            style={{ width: 16, height: 16, accentColor: '#15803D', flexShrink: 0, cursor: 'pointer' }} />
                           <span style={{ fontSize: 16 }}>{CAT_EMOJI[cat] || '📦'}</span>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 13, fontWeight: 600, color: '#1C1C1E' }}>{cmItem.name}</div>
@@ -2538,17 +3508,30 @@ export default function Settings() {
                     <div style={{ padding: '9px 14px', background: '#FFFBEB', borderBottom: '1px solid #FDE68A',
                       display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontSize: 16 }}>📝</span>
-                      <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, color: '#92400E' }}>
-                        อัพเดทข้อมูล {toUpdate.length} รายการ
+                      <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, color: '#92400E', flex: 1 }}>
+                        อัพเดทข้อมูล ({selectedUpdate.size}/{toUpdate.length})
                       </span>
+                      <button onClick={() => setSelectedUpdate(selectedUpdate.size === toUpdate.length ? new Set() : new Set(toUpdate.map((_, i) => i)))}
+                        style={{ fontSize: 11, color: '#92400E', background: '#FDE68A', border: 'none', cursor: 'pointer',
+                          fontFamily: 'Sarabun', fontWeight: 700, padding: '2px 6px', borderRadius: 6 }}>
+                        {selectedUpdate.size === toUpdate.length ? 'ยกเลิกทั้งหมด' : 'เลือกทั้งหมด'}
+                      </button>
                     </div>
                     <div style={{ maxHeight: 180, overflowY: 'auto' }}>
                       {toUpdate.map(({ inv, changes }, ri) => (
-                        <div key={ri} style={{ padding: '8px 14px',
-                          borderBottom: ri < toUpdate.length - 1 ? '1px solid #F3F4F6' : 'none' }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: '#1C1C1E', marginBottom: 4 }}>{inv.name}</div>
+                        <div key={ri} onClick={() => setSelectedUpdate(s => {
+                          const n = new Set(s); n.has(ri) ? n.delete(ri) : n.add(ri); return n
+                        })} style={{ padding: '8px 14px',
+                          borderBottom: ri < toUpdate.length - 1 ? '1px solid #F3F4F6' : 'none',
+                          cursor: 'pointer', opacity: selectedUpdate.has(ri) ? 1 : 0.4,
+                          background: selectedUpdate.has(ri) ? '#fff' : '#F9FAFB' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                            <input type="checkbox" readOnly checked={selectedUpdate.has(ri)}
+                              style={{ width: 16, height: 16, accentColor: '#92400E', flexShrink: 0, cursor: 'pointer' }} />
+                            <div style={{ fontSize: 13, fontWeight: 600, color: '#1C1C1E' }}>{inv.name}</div>
+                          </div>
                           {changes.map(({ field, from, to }) => (
-                            <div key={field} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+                            <div key={field} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, paddingLeft: 24 }}>
                               <span style={{ color: '#8E8E93', width: 72, flexShrink: 0 }}>{field}</span>
                               <span style={{ color: '#DC2626', textDecoration: 'line-through' }}>{from || '—'}</span>
                               <span style={{ color: '#8E8E93' }}>→</span>
@@ -2575,7 +3558,9 @@ export default function Settings() {
                   <div style={{ background: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: 12 }}>
                     <div style={{ fontWeight: 700, color: '#15803D', marginBottom: 2 }}>✅ อัพเดทเรียบร้อย</div>
                     <div style={{ fontSize: 12, color: '#166534' }}>
-                      เพิ่มใหม่ {importResult.added} · อัพเดท {importResult.updated} รายการ
+                      {importResult.added > 0 && `เพิ่มใหม่ ${importResult.added} รายการ`}
+                      {importResult.added > 0 && importResult.updated > 0 && ' · '}
+                      {importResult.updated > 0 && `อัพเดท ${importResult.updated} รายการ`}
                     </div>
                   </div>
                 )}
@@ -2589,19 +3574,21 @@ export default function Settings() {
                   </button>
                   {hasChanges && importPhase !== 'done' && (
                     <button className="btn-primary" style={{ flex: 2 }}
-                      disabled={importPhase === 'applying'}
+                      disabled={importPhase === 'applying' || (selectedAdd.size + selectedUpdate.size === 0)}
                       onClick={async () => {
+                        const filteredAdd = toAdd.filter((_, i) => selectedAdd.has(i))
+                        const filteredUpdate = toUpdate.filter((_, i) => selectedUpdate.has(i))
                         setImportPhase('applying'); setImportLoading(true)
                         try {
-                          await applyUpdateFromCM(toAdd, toUpdate, setImportStatus)
-                          setImportResult({ added: toAdd.length, updated: toUpdate.length })
+                          await applyUpdateFromCM(filteredAdd, filteredUpdate, setImportStatus)
+                          setImportResult({ added: filteredAdd.length, updated: filteredUpdate.length })
                           setImportPhase('done'); setImportStatus('')
-                          setToast(`✅ อัพเดท ${toAdd.length + toUpdate.length} รายการเรียบร้อย`)
+                          setToast(`✅ อัพเดท ${filteredAdd.length + filteredUpdate.length} รายการเรียบร้อย`)
                         } catch(e) {
                           setImportStatus(`❌ ${e.message}`); setImportPhase('preview')
                         } finally { setImportLoading(false) }
                       }}>
-                      {importPhase === 'applying' ? 'กำลังอัพเดท...' : `✅ ยืนยันอัพเดท ${toAdd.length + toUpdate.length} รายการ`}
+                      {importPhase === 'applying' ? 'กำลังอัพเดท...' : `✅ ยืนยันอัพเดท ${selectedAdd.size + selectedUpdate.size} รายการ`}
                     </button>
                   )}
                   {!hasChanges && (
@@ -2646,7 +3633,7 @@ export default function Settings() {
         </div>
       </Modal>
 
-      {/* ── Modal: Opening Stock ── */}
+      {/* ── Modal: Opening Stock (legacy — กำลังจะลบ) ── */}
       <OpeningStockModal
         open={openingModal}
         onClose={() => setOpeningModal(false)}
@@ -2654,6 +3641,349 @@ export default function Settings() {
         items={items}
         onSaved={msg => setToast(msg)}
       />
+
+      {/* ── V2: Integration Modal ── */}
+      <IntegrationModal open={integrationOpen} onClose={() => setIntegrationOpen(false)} />
+
+      {/* ── V2: Quick Template Modal (Owner only) ── */}
+      {isOwner() && (
+        <QuickTemplateModal
+          open={quickTplModalV2}
+          onClose={() => setQuickTplModalV2(false)}
+          items={items}
+          staffPhone={phone}
+          onSuccess={msg => setToast(msg)}
+        />
+      )}
+
+      {/* ── V2: Clear All Data (PIN-protected) ── */}
+      <ClearDataModalV2
+        open={clearDataOpen}
+        onClose={() => setClearDataOpen(false)}
+        pin={settings.analyzePin || '1234'}
+        onSuccess={msg => setToast(msg)}
+      />
+
+      {/* ── V2: Export CSV ── */}
+      <ExportModalV2
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        onSuccess={msg => setToast(msg)}
+      />
+
+      {/* ── V2: Seed Stock (Owner) ── */}
+      {isOwner() && (
+        <SeedStockModal
+          open={seedOpen}
+          onClose={() => setSeedOpen(false)}
+          items={items}
+          warehouses={warehouses}
+          staffPhone={phone}
+          staffName={name}
+          onSuccess={msg => setToast(msg)}
+        />
+      )}
+
+      {/* ── V2: Data Sheet (Owner) ── */}
+      {isOwner() && (
+        <DataSheetModal
+          open={dataSheetOpen}
+          onClose={() => setDataSheetOpen(false)}
+          items={items}
+          warehouses={warehouses}
+          staffPhone={phone}
+          staffName={name}
+          onSuccess={msg => setToast(msg)}
+        />
+      )}
     </div>
+  )
+}
+
+/* ────────────────────────────────────────────────────────────
+   ClearDataModalV2 — ลบข้อมูลทั้งหมด (PIN ยืนยัน)
+──────────────────────────────────────────────────────────── */
+function ClearDataModalV2({ open, onClose, pin, onSuccess }) {
+  const [enteredPin, setEnteredPin] = useState('')
+  const [confirming, setConfirming] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [progress, setProgress] = useState('')
+
+  function reset() {
+    setEnteredPin(''); setConfirming(false); setErr(''); setProgress('')
+  }
+
+  async function handleClear() {
+    if (enteredPin !== pin) { setErr('PIN ไม่ถูกต้อง'); return }
+    if (!confirming) { setConfirming(true); return }
+    setLoading(true); setErr('')
+    try {
+      const TARGETS = [
+        COL.STOCK_BALANCES,
+        COL.CUT_STOCK_LOGS,
+        COL.STOCK_MOVEMENTS,
+        COL.LOT_TRACKING,
+        COL.TRANSFER_ORDERS,
+        COL.LOW_STOCK_ALERTS,
+        COL.WASTE_LOGS,
+      ]
+      for (const col of TARGETS) {
+        setProgress(`กำลังลบ ${col}...`)
+        const snap = await getDocs(collection(db, col))
+        const docs = snap.docs
+        for (let i = 0; i < docs.length; i += 400) {
+          const batch = writeBatch(db)
+          docs.slice(i, i + 400).forEach(d => batch.delete(d.ref))
+          await batch.commit()
+        }
+      }
+      setProgress('')
+      onSuccess?.('✅ ลบข้อมูลเรียบร้อย')
+      reset()
+      onClose?.()
+    } catch (e) {
+      setErr(e.message || 'เกิดข้อผิดพลาด')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={() => { if (!loading) { reset(); onClose?.() } }}
+      title="🗑️ Clear All Data">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: '0 16px 16px' }}>
+        <div style={{ background: '#FEE2E2', border: '1px solid #FECACA',
+          borderRadius: 10, padding: '12px 14px', fontSize: 12, color: '#991B1B' }}>
+          ⚠️ <strong>ระวัง!</strong> การลบจะรวม:
+          <ul style={{ margin: '6px 0 0 16px', padding: 0 }}>
+            <li>ยอด stock ทุกคลัง (stock_balances)</li>
+            <li>ประวัติตัดสต็อก (cut_stock_logs)</li>
+            <li>ประวัติเคลื่อนไหวสต็อก (stock_movements)</li>
+            <li>LOT ทั้งหมด</li>
+            <li>ใบโอนทั้งหมด</li>
+            <li>ของเสีย / แจ้งเตือนทั้งหมด</li>
+          </ul>
+          <div style={{ marginTop: 8 }}>
+            <strong>คงเหลือ:</strong> items / warehouses / app_settings / quick_templates
+          </div>
+        </div>
+
+        <div>
+          <label style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>
+            ใส่ PIN วิเคราะห์ 4 หลักเพื่อยืนยัน
+          </label>
+          <input type="password" value={enteredPin}
+            onChange={e => { setEnteredPin(e.target.value); setErr('') }}
+            maxLength={4} inputMode="numeric"
+            placeholder="• • • •"
+            style={{ width: '100%', padding: '12px 14px', borderRadius: 10,
+              border: '1.5px solid var(--border2)', fontSize: 22, fontWeight: 700,
+              textAlign: 'center', letterSpacing: 8, marginTop: 4 }}/>
+        </div>
+
+        {err && (
+          <div style={{ background: '#FEE2E2', color: '#DC2626', padding: '8px 12px',
+            borderRadius: 8, fontSize: 12, fontWeight: 600 }}>{err}</div>
+        )}
+
+        {progress && (
+          <div style={{ background: '#EFF6FF', color: '#1D4ED8', padding: '8px 12px',
+            borderRadius: 8, fontSize: 12, fontWeight: 600 }}>{progress}</div>
+        )}
+
+        <button onClick={handleClear} disabled={loading || enteredPin.length !== 4}
+          style={{ padding: '12px 16px', border: 'none', borderRadius: 12,
+            background: loading ? 'var(--border2)' : (confirming ? '#DC2626' : 'var(--orange)'),
+            color: '#fff', fontSize: 14, fontWeight: 700,
+            cursor: loading ? 'wait' : (enteredPin.length === 4 ? 'pointer' : 'not-allowed'),
+            opacity: enteredPin.length === 4 ? 1 : 0.5 }}>
+          {loading ? 'กำลังลบ...' : confirming ? '⚠️ กดอีกครั้งเพื่อลบจริง' : '🗑️ ลบข้อมูล'}
+        </button>
+      </div>
+    </Modal>
+  )
+}
+
+/* ────────────────────────────────────────────────────────────
+   ExportModalV2 — Export CSV ตามช่วงวัน
+──────────────────────────────────────────────────────────── */
+function ExportModalV2({ open, onClose, onSuccess }) {
+  const today = new Date().toISOString().slice(0, 10)
+  const [start, setStart] = useState(today)
+  const [end, setEnd] = useState(today)
+  const [types, setTypes] = useState({
+    cut: true, waste: true, transfer: true, movement: false,
+  })
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+
+  function toggle(k) {
+    setTypes(t => ({ ...t, [k]: !t[k] }))
+  }
+
+  function downloadCSV(filename, rows) {
+    if (!rows.length) return
+    const headers = Object.keys(rows[0])
+    const csv = [
+      headers.join(','),
+      ...rows.map(r => headers.map(h => {
+        const v = r[h]
+        const s = v == null ? '' : String(v)
+        return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g,'""')}"` : s
+      }).join(',')),
+    ].join('\n')
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  async function handleExport() {
+    setErr(''); setLoading(true)
+    try {
+      const exports = []
+      if (types.cut) {
+        const q = query(collection(db, COL.CUT_STOCK_LOGS),
+          where('date', '>=', start), where('date', '<=', end))
+        const snap = await getDocs(q)
+        const rows = []
+        snap.docs.forEach(d => {
+          const log = d.data()
+          ;(log.items || []).forEach(it => {
+            rows.push({
+              date: log.date, shop: log.shopName || '', staff: log.staffName || '',
+              item: it.itemName || '', qty: it.qtyUse || it.qty || 0, unit: it.unitUse || it.unit || '',
+              cost: it.costTotal || 0,
+            })
+          })
+        })
+        exports.push({ name: 'cut_stock', rows })
+      }
+      if (types.waste) {
+        const q = query(collection(db, COL.WASTE_LOGS),
+          where('date', '>=', start), where('date', '<=', end))
+        const snap = await getDocs(q)
+        const rows = snap.docs.map(d => {
+          const w = d.data()
+          return {
+            date: w.date, type: w.type || '', item: w.itemName || '',
+            qty: w.qty || 0, unit: w.unit || '', cost: w.totalCost || 0,
+            staff: w.staffName || '',
+          }
+        })
+        exports.push({ name: 'waste', rows })
+      }
+      if (types.transfer) {
+        const snap = await getDocs(collection(db, COL.TRANSFER_ORDERS))
+        const rows = []
+        snap.docs.forEach(d => {
+          const t = d.data()
+          const ts = t.createdAt?.seconds
+            ? new Date(t.createdAt.seconds * 1000).toISOString().slice(0,10) : ''
+          if (ts < start || ts > end) return
+          ;(t.items || []).forEach(it => {
+            rows.push({
+              date: ts, from: t.fromWarehouseName || '', to: t.toWarehouseName || '',
+              status: t.status || '', driver: t.driver || '',
+              item: it.itemName || '', qty: it.qty || 0, unit: it.unit || '',
+            })
+          })
+        })
+        exports.push({ name: 'transfer', rows })
+      }
+      if (types.movement) {
+        const q = query(collection(db, COL.STOCK_MOVEMENTS))
+        const snap = await getDocs(q)
+        const rows = []
+        snap.docs.forEach(d => {
+          const m = d.data()
+          const ts = m.timestamp?.seconds
+            ? new Date(m.timestamp.seconds * 1000).toISOString().slice(0,10) : ''
+          if (ts < start || ts > end) return
+          rows.push({
+            date: ts, type: m.type || '', item: m.itemName || '',
+            warehouse: m.warehouseId || '', qty: m.qty || 0, unit: m.unit || '',
+            qtyUse: m.qtyUse || 0, unitUse: m.unitUse || '',
+            staff: m.staffName || '', reason: m.adjustReason || '',
+          })
+        })
+        exports.push({ name: 'movement', rows })
+      }
+
+      let total = 0
+      exports.forEach(({ name, rows }) => {
+        if (rows.length) {
+          downloadCSV(`inventory_${name}_${start}_${end}.csv`, rows)
+          total += rows.length
+        }
+      })
+
+      if (total === 0) setErr('ไม่มีข้อมูลในช่วงวันที่เลือก')
+      else {
+        onSuccess?.(`✅ Export ${total} แถวเรียบร้อย`)
+        onClose?.()
+      }
+    } catch (e) {
+      setErr(e.message || 'เกิดข้อผิดพลาด')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={() => { if (!loading) onClose?.() }} title="📤 Export ข้อมูล (CSV)">
+      <div style={{ padding: '0 16px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>วันที่เริ่ม</label>
+            <input type="date" value={start} onChange={e => setStart(e.target.value)}
+              style={{ width: '100%', padding: '8px 10px', borderRadius: 10,
+                border: '1.5px solid var(--border2)', fontSize: 13, marginTop: 4 }}/>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>วันที่สิ้นสุด</label>
+            <input type="date" value={end} onChange={e => setEnd(e.target.value)}
+              style={{ width: '100%', padding: '8px 10px', borderRadius: 10,
+                border: '1.5px solid var(--border2)', fontSize: 13, marginTop: 4 }}/>
+          </div>
+        </div>
+
+        <div>
+          <label style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600, marginBottom: 6, display: 'block' }}>
+            ประเภทข้อมูล (1 ไฟล์ต่อประเภท)
+          </label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {[
+              { k: 'cut', label: '✂️ ตัดสต็อก (cut_stock_logs)' },
+              { k: 'waste', label: '🗑️ ของเสีย (waste_logs)' },
+              { k: 'transfer', label: '🚚 ใบโอน (transfer_orders)' },
+              { k: 'movement', label: '📊 เคลื่อนไหวสต็อก (stock_movements)' },
+            ].map(o => (
+              <label key={o.k} style={{ display: 'flex', alignItems: 'center', gap: 10,
+                padding: '8px 10px', background: 'var(--bg)', borderRadius: 8, cursor: 'pointer' }}>
+                <input type="checkbox" checked={types[o.k]} onChange={() => toggle(o.k)}/>
+                <span style={{ fontSize: 13, color: 'var(--txt)' }}>{o.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {err && (
+          <div style={{ background: '#FEE2E2', color: '#DC2626', padding: '8px 12px',
+            borderRadius: 8, fontSize: 12, fontWeight: 600 }}>{err}</div>
+        )}
+
+        <button onClick={handleExport} disabled={loading || !Object.values(types).some(v => v)}
+          style={{ padding: '12px 16px', border: 'none', borderRadius: 12,
+            background: loading ? 'var(--border2)' : 'var(--red)', color: '#fff',
+            fontSize: 14, fontWeight: 700, cursor: loading ? 'wait' : 'pointer' }}>
+          {loading ? 'กำลัง export...' : '📤 ดาวน์โหลด CSV'}
+        </button>
+      </div>
+    </Modal>
   )
 }

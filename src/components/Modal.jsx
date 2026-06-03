@@ -14,10 +14,7 @@ import { useEffect, useRef, useState } from 'react'
  *   footer
  */
 export function Modal({ open, onClose, title, children, footer, lockClose = false }) {
-  const [xBounce,     setXBounce]     = useState(false)
-  const [confirmExit, setConfirmExit] = useState(false)
-  const [barShake,    setBarShake]    = useState(false)
-  const xBtnRef = useRef(null)
+  const [xBounce, setXBounce] = useState(false)
 
   useEffect(() => {
     if (open) document.body.style.overflow = 'hidden'
@@ -25,79 +22,42 @@ export function Modal({ open, onClose, title, children, footer, lockClose = fals
     return () => { document.body.style.overflow = '' }
   }, [open])
 
-  useEffect(() => { if (!open) { setConfirmExit(false); setBarShake(false) } }, [open])
-
   if (!open) return null
 
-  function shake() {
-    setXBounce(true)
-    setBarShake(false)
-    // double-rAF to restart animation even if already animating
-    requestAnimationFrame(() => requestAnimationFrame(() => setBarShake(true)))
-  }
-
-  function handleBackdrop(e) {
-    if (e.target !== e.currentTarget) return
-    if (!lockClose) { onClose(); return }
-    if (confirmExit) { shake(); return }   // bar แสดงอยู่ → shake ห้ามออก
-    setConfirmExit(true)
-    setXBounce(true)
-  }
-
-  function handleX() {
-    if (!lockClose) { onClose(); return }
-    if (confirmExit) { shake(); return }   // bar แสดงอยู่ → shake ห้ามออก
-    setConfirmExit(true)
-    setXBounce(true)
+  function blockEvent(e) {
+    // ป้องกัน backdrop ปิด modal + bounce ✕ เรียกความสนใจ
+    e.stopPropagation()
+    e.preventDefault()
+    setXBounce(false)
+    requestAnimationFrame(() => requestAnimationFrame(() => setXBounce(true)))
   }
 
   return (
-    <div className="modal-backdrop" onClick={handleBackdrop}>
-      <div className="bottom-sheet">
+    <div
+      className="modal-backdrop"
+      onClick={blockEvent}
+      onTouchStart={blockEvent}
+      onTouchEnd={blockEvent}
+      onPointerDown={blockEvent}
+    >
+      <div className="bottom-sheet"
+        onClick={e => e.stopPropagation()}
+        onTouchStart={e => e.stopPropagation()}
+        onTouchEnd={e => e.stopPropagation()}
+        onPointerDown={e => e.stopPropagation()}>
+
         <div className="sheet-handle" />
         <div className="sheet-header">
           <span className="sheet-title">{title}</span>
           <button
-            ref={xBtnRef}
-            className="sheet-close"
-            onClick={handleX}
-            style={xBounce ? { animation: 'xBounce 0.45s ease' } : {}}
+            className="sheet-close popup-x-btn"
+            onClick={onClose}
             onAnimationEnd={() => setXBounce(false)}
+            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}
           >
             ✕
           </button>
         </div>
-
-        {/* Confirm-exit bar */}
-        {confirmExit && (
-          <div
-            style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              background: '#FFF7ED', borderBottom: '1px solid #FED7AA',
-              padding: '8px 16px', gap: 10, flexShrink: 0,
-              animation: barShake ? 'guardBarShake 0.4s ease' : 'none',
-            }}
-            onAnimationEnd={() => setBarShake(false)}
-          >
-            <span style={{ fontSize: 13, color: '#92400E', fontWeight: 600 }}>
-              ⚠️ ออกโดยไม่บันทึก?
-            </span>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                onClick={() => setConfirmExit(false)}
-                style={{ padding: '4px 14px', borderRadius: 8, border: '1.5px solid #D97706',
-                  background: '#fff', color: '#D97706', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>
-                ยกเลิก
-              </button>
-              <button
-                onClick={onClose}
-                style={{ padding: '4px 14px', borderRadius: 8, border: 'none',
-                  background: '#EF4444', color: '#fff', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>
-                ออก
-              </button>
-            </div>
-          </div>
-        )}
 
         <div className="sheet-body">{children}</div>
         {footer && (

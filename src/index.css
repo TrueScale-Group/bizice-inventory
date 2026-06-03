@@ -322,31 +322,61 @@ html, body, #root {
   color: #fff;
 }
 
-/* ── Search bar ── */
+/* ── Search bar (iOS pill) ── */
 .search-wrap {
   position: relative;
   margin: 0 1rem;
+  display: flex;
+  align-items: center;
+  background: #F2F2F7;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  padding: 0 8px 0 36px;
+  transition: all .15s;
+}
+.search-wrap:focus-within {
+  background: #fff;
+  border-color: rgba(227,30,36,.4);
+  box-shadow: 0 0 0 4px rgba(227,30,36,.08);
 }
 .search-input {
-  width: 100%;
-  border: 1.5px solid var(--border2);
-  border-radius: 10px;
-  padding: 9px 12px 9px 36px;
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 10px 0;
   font-size: 14px;
   font-family: 'Sarabun', sans-serif;
-  background: var(--surf);
   outline: none;
   color: var(--txt);
+  min-width: 0;
 }
-.search-input:focus { border-color: var(--red); }
+.search-input::placeholder { color: #9CA3AF; }
 .search-icon {
   position: absolute;
-  left: 11px;
+  left: 12px;
   top: 50%;
   transform: translateY(-50%);
-  color: var(--txt3);
+  color: #9CA3AF;
   font-size: 15px;
+  pointer-events: none;
 }
+.search-clear {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: #C7C7CC;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  line-height: 1;
+}
+.search-clear:hover { background: #8E8E93; }
 
 /* ── Badge / Status ── */
 .badge {
@@ -413,21 +443,27 @@ html, body, #root {
   background: rgba(0,0,0,0.45);
   z-index: 50;
   display: flex;
-  align-items: flex-end;
-  touch-action: none;        /* ป้องกัน touch events ทะลุ backdrop */
-  user-select: none;
+  align-items: center;      /* กึ่งกลางแนวตั้ง */
+  justify-content: center;  /* กึ่งกลางแนวนอน */
+  padding: 16px 12px calc(58px + env(safe-area-inset-bottom));
+}
+.modal-backdrop input,
+.modal-backdrop textarea,
+.modal-backdrop select {
+  user-select: text;   /* iOS: อนุญาตให้พิมพ์/เลือกข้อความใน form elements */
+  -webkit-user-select: text;
 }
 .bottom-sheet {
   background: var(--surf);
-  border-radius: 20px 20px 0 0;
+  border-radius: 20px;
   width: 100%;
-  max-height: 92dvh;
+  max-width: 480px;   /* ไม่กว้างเกินบน tablet/desktop */
+  max-height: 80svh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding-bottom: env(safe-area-inset-bottom);
-  overscroll-behavior: contain;  /* ป้องกัน swipe-to-dismiss บน iOS */
-  touch-action: pan-y;
+  overscroll-behavior: contain;
+  touch-action: auto;
 }
 .sheet-handle {
   width: 36px;
@@ -449,20 +485,30 @@ html, body, #root {
   font-size: 16px;
   font-weight: 700;
 }
-.sheet-close {
-  width: 30px; height: 30px;
+/* ── Unified popup close (✕) — สีแดงทุกที่ ── */
+.sheet-close,
+.popup-x-btn {
+  width: 32px; height: 32px;
   border-radius: 50%;
-  background: #F0F0F3;
-  border: none;
+  background: #FEE2E2;
+  border: 1px solid rgba(220,38,38,.22);
   cursor: pointer;
-  font-size: 15px;
+  font-size: 16px;
+  font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--txt2);
+  color: #DC2626;
+  flex-shrink: 0;
+  transition: transform .12s, background .15s;
 }
+.sheet-close:hover,
+.popup-x-btn:hover { background: #FECACA; }
+.sheet-close:active,
+.popup-x-btn:active { transform: scale(0.92); }
 .sheet-body {
   flex: 1;
+  min-height: 0;          /* iOS flexbox fix: ให้ item หดได้ต่ำกว่า content size */
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   padding: 0 16px 16px;
@@ -493,6 +539,8 @@ html, body, #root {
   grid-template-columns: 1fr 1fr;
   gap: 10px;
   padding: 0 1rem;
+  flex: 1;        /* เต็มพื้นที่ที่เหลือใน parent flex */
+  min-width: 0;   /* iOS flexbox fix — ให้ shrink ได้ */
 }
 .pos-card {
   background: var(--surf);
@@ -508,6 +556,8 @@ html, body, #root {
   flex-direction: column;
   gap: 4px;
   user-select: none;
+  min-height: 168px;            /* คงความสูงเท่ากันทุกการ์ด */
+  justify-content: space-between;
 }
 .pos-card.selected { border-color: var(--red); }
 .pos-card.out-of-stock { opacity: 0.4; pointer-events: none; }
@@ -536,8 +586,22 @@ html, body, #root {
   -webkit-tap-highlight-color: transparent;
 }
 .pos-emoji { font-size: 28px; line-height: 1; text-align: center; margin-top: 4px; }
-.pos-name { font-family: 'Prompt', sans-serif; font-size: 12px; font-weight: 600; text-align: center; line-height: 1.3; }
-.pos-stock { font-size: 10px; color: var(--txt3); text-align: center; }
+.pos-name {
+  font-family: 'Prompt', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  line-height: 1.25;
+  /* ตัดยาวเป็น 2 บรรทัด ป้องกัน card สูงไม่เท่ากัน */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 30px;
+  padding: 0 2px;
+  word-break: break-word;
+}
+.pos-stock { font-size: 10px; color: var(--txt3); text-align: center; min-height: 14px; }
 .pos-counter {
   display: flex;
   align-items: center;
@@ -602,6 +666,25 @@ html, body, #root {
 .conn-dot.offline { background: #DC2626; }
 .conn-dot.syncing { background: #D97706; animation: blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* Scissors animations */
+@keyframes scissorsSnip {
+  0%,100% { transform: rotate(-20deg) scale(1); }
+  25%     { transform: rotate(15deg)  scale(1.15); }
+  50%     { transform: rotate(-10deg) scale(1.05); }
+  75%     { transform: rotate(10deg)  scale(1.1); }
+}
+@keyframes scissorsSpin {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes sheetSlideUp {
+  from { transform: translateY(40px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.scissors-spin { animation: scissorsSnip 1.4s ease-in-out infinite; display: inline-block; }
+.snowking-spin { animation: scissorsSpin 0.7s linear infinite; display: inline-block; }
+.confirm-sheet { animation: sheetSlideUp 0.28s cubic-bezier(0.34,1.56,0.64,1); }
 /* X button bounce — เมื่อกด backdrop บน lockClose modal */
 @keyframes xBounce {
   0%   { transform: scale(1)    rotate(0deg); }
@@ -973,29 +1056,40 @@ html, body, #root {
   .page-content {
     padding: 1.5rem 2rem;
     padding-bottom: 2rem;
-    max-width: 1100px;
-    margin: 0 auto;
+    max-width: none;        /* เต็มจอ (ลบ cap) */
+    width: 100%;
+    margin: 0;
   }
 
-  /* Wider cards / grids */
-  .stock-grid   { grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .pos-grid     { grid-template-columns: repeat(4, 1fr); }
+  /* Wider cards / grids — เต็มความกว้าง */
+  .stock-grid   { grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .pos-grid     { grid-template-columns: repeat(5, 1fr); }
   .kpi-grid     { grid-template-columns: repeat(4, 1fr); }
   .action-grid  { grid-template-columns: repeat(4, 1fr); }
   .pos-sidebar  { width: 96px; }
   .pos-sidebar button { padding: 14px 8px !important; }
   .pos-sidebar button span:first-child { font-size: 24px !important; }
   .pos-sidebar button span:last-child  { font-size: 11px !important; max-width: 80px !important; }
+}
+
+/* Desktop large (≥1280px) — มากกว่านี้ให้เพิ่มคอลัมน์ */
+@media (min-width: 1280px) {
+  .stock-grid   { grid-template-columns: repeat(5, 1fr); }
+  .pos-grid     { grid-template-columns: repeat(6, 1fr); }
+}
+
+/* Desktop xl (≥1600px) */
+@media (min-width: 1600px) {
+  .stock-grid   { grid-template-columns: repeat(6, 1fr); }
+  .pos-grid     { grid-template-columns: repeat(7, 1fr); }
 
   /* Bottom sheet → centered dialog on desktop */
   .modal-backdrop {
-    align-items: center;
-    justify-content: center;
+    padding: 24px; /* tablet: ไม่มี bottom nav ใช้ padding รอบด้าน */
   }
   .bottom-sheet {
-    border-radius: 20px;
     max-width: 520px;
-    max-height: 88dvh;
+    max-height: 85dvh;
   }
 
   /* Toast offset (no topbar) */
@@ -1024,54 +1118,69 @@ html, body, #root {
   .hide-on-desktop { display: none !important; }
 }
 
-/* Tablet — small (480–639px) */
-@media (min-width: 480px) and (max-width: 639px) {
+/* ═══════════════════════════════════════════════
+   TABLET (480–899px) — fluid bars + centered content
+   topbar/bottom-nav ยืดเต็มจอ, content ตรงกลางคง mobile-like
+   ═══════════════════════════════════════════════ */
+@media (min-width: 480px) and (max-width: 899px) {
+  body { background: var(--bg); }
+  .app-shell {
+    max-width: none;
+    width: 100%;
+    margin: 0;
+    background: var(--bg);
+    box-shadow: none;
+    border-left: none;
+    border-right: none;
+  }
+  /* Bars ยืดเต็มจอ */
+  .app-topbar {
+    max-width: none; margin: 0; transform: none; left: auto; right: auto;
+    border-radius: 0; padding: 0 1.5rem;
+  }
+  .bottom-nav {
+    max-width: none; margin: 0; transform: none; left: auto; right: auto;
+    border-radius: 0;
+  }
+  /* Content ตรงกลาง — มี max-width ขยายตามจอ */
   .page-content {
-    max-width: 680px;
+    max-width: clamp(520px, 70vw, 760px);
     margin: 0 auto;
     padding: 1rem 1.25rem;
-    padding-bottom: calc(62px + env(safe-area-inset-bottom) + 1rem);
+    padding-bottom: calc(80px + env(safe-area-inset-bottom) + 1rem);
   }
-  .stock-grid  { grid-template-columns: repeat(3, 1fr); }
-  .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
+  /* Topbar/Bottom-nav inner — ให้เนื้อหา (ปุ่ม Home, brand, right) ตรงกลางเหมือน content */
+  .app-topbar > * { /* fallback ปกติเอามาจัด flex */ }
+  /* Grids — ขยายเล็กน้อยถ้าจอกว้าง */
+  .stock-grid  { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .kpi-grid    { grid-template-columns: repeat(2, 1fr); }
   .action-grid { grid-template-columns: repeat(4, 1fr); }
+  .pos-grid    { grid-template-columns: repeat(2, 1fr); }
+  .bottom-sheet { max-width: 560px; }
+  .card { padding: 0.9rem 1rem; }
+  .lot-popup { max-width: 560px; }
 }
-/* Tablet — iPad (640–899px) */
+
+/* iPad ใหญ่ (≥640px tablet) — content max ขยายอีกหน่อย */
 @media (min-width: 640px) and (max-width: 899px) {
-  .page-content {
-    max-width: 780px;
-    margin: 0 auto;
-    padding: 1.25rem 1.75rem;
-    padding-bottom: calc(68px + env(safe-area-inset-bottom) + 1rem);
-  }
-  /* Grids */
-  .stock-grid  { grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .kpi-grid    { grid-template-columns: repeat(4, 1fr); }
+  .stock-grid  { grid-template-columns: repeat(3, 1fr); }
   .action-grid { grid-template-columns: repeat(4, 1fr); }
-  .pos-grid    { grid-template-columns: repeat(3, 1fr); }
-  .pos-sidebar { width: 88px; }
-  .pos-sidebar button { padding: 12px 6px !important; }
-  .pos-sidebar button span:first-child { font-size: 22px !important; }
-  .pos-sidebar button span:last-child  { font-size: 10.5px !important; max-width: 76px !important; }
-  /* Bottom nav — centered floating */
-  .bottom-nav {
-    max-width: 600px;
-    left: 50%;
-    transform: translateX(-50%);
-    border-radius: 16px 16px 0 0;
-  }
-  /* Modal wider on tablet */
-  .bottom-sheet {
-    max-width: 620px;
-    border-radius: 20px 20px 0 0;
-  }
-  /* Topbar wider */
-  .app-topbar {
-    max-width: 780px;
-    margin: 0 auto;
-  }
-  /* Card padding */
-  .card { padding: 1rem 1.1rem; }
-  /* Lot popup wider */
-  .lot-popup { max-width: 620px; }
 }
+
+/* ── NotifBell (กระดิ่งแจ้งเตือน Level 3) ── */
+.notif-bell-wrap { position: relative; flex-shrink: 0; }
+.notif-bell-btn { width: 36px; height: 36px; border-radius: 10px; position: relative; display: flex; align-items: center; justify-content: center; background: var(--bg); border: 1px solid var(--border); font-size: 18px; cursor: pointer; }
+.notif-bell-badge { position: absolute; top: -5px; right: -5px; min-width: 17px; height: 17px; background: var(--red); color: #fff; font-size: 10px; font-weight: 800; border-radius: 9px; border: 2px solid #fff; padding: 0 3px; display: flex; align-items: center; justify-content: center; line-height: 1; }
+.notif-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 200; width: 320px; max-width: calc(100vw - 24px); background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.18); overflow: hidden; }
+.notif-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px; }
+.notif-readall { background: none; border: none; color: var(--red); font-weight: 600; font-size: 12px; cursor: pointer; }
+.notif-panel-list { max-height: 360px; overflow-y: auto; }
+.notif-empty { padding: 28px 14px; text-align: center; color: #999; font-size: 13px; }
+.notif-item { display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left; padding: 11px 14px; background: #fff; border: none; border-bottom: 1px solid var(--bg); cursor: pointer; }
+.notif-item.unread { background: #fff6f6; }
+.notif-item-icon { font-size: 20px; flex-shrink: 0; }
+.notif-item-body { flex: 1; min-width: 0; }
+.notif-item-title { font-weight: 600; font-size: 13.5px; color: #1c1c1e; }
+.notif-item-text { font-size: 12.5px; color: #444; margin-top: 1px; line-height: 1.4; }
+.notif-item-time { font-size: 11px; color: #999; margin-top: 3px; }
+.notif-item-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; margin-top: 5px; }

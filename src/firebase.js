@@ -1,5 +1,9 @@
 import { initializeApp } from 'firebase/app'
-import { getFirestore } from 'firebase/firestore'
+import {
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from 'firebase/firestore'
 
 const firebaseConfig = {
   apiKey: 'AIzaSyDRs60WURPcNArQXl5RRuwqJcLjtN3CMe4',
@@ -11,4 +15,12 @@ const firebaseConfig = {
 }
 
 const app = initializeApp(firebaseConfig)
-export const db = getFirestore(app)
+
+// 📱 Offline persistence — แคชข้อมูล Firestore ลง IndexedDB
+//    เปิด multi-tab support → หลายแท็บใช้แคชเดียวกันได้
+//    → เปิด PWA ออฟไลน์ก็ยัง query ข้อมูลล่าสุดที่เคยโหลดได้
+export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager(),
+  }),
+})
