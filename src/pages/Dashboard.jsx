@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { db } from '../firebase'
+import { db, sendHubPush } from '../firebase'
 import { collection, query, where, onSnapshot, orderBy, limit,
          doc, getDoc, addDoc, updateDoc, serverTimestamp, Timestamp, writeBatch, increment } from 'firebase/firestore'
 import { ConnectionStatus } from '../components/ConnectionStatus'
@@ -44,8 +44,13 @@ function ItemPickerGrid({ items, balances, warehouseId, selectedId, selectedIds,
   const filtered = items
     .filter(i => !filterFn || filterFn(i, getStock(i.id)))
     .filter(i => cat === 'all' || i.category === cat)
-    .filter(i => !search || i.name.toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => (a.sortOrder ?? 999) - (b.sortOrder ?? 999) || (a.name || '').localeCompare(b.name || '', 'th'))
+    .filter(i => {
+      if (!search) return true
+      const q = search.toLowerCase()
+      return (i.name || '').toLowerCase().includes(q) || (i.displayName || '').toLowerCase().includes(q)
+    })
+    .sort((a, b) => (a.sortOrder ?? 999) - (b.sortOrder ?? 999) ||
+      (a.displayName || a.name || '').localeCompare(b.displayName || b.name || '', 'th'))
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -112,7 +117,7 @@ function ItemPickerGrid({ items, balances, warehouseId, selectedId, selectedIds,
                       </span>
                     )}
                     <div style={{ fontSize: 24, marginTop: hideStock ? 0 : 14 }}>{item.img || '📦'}</div>
-                    <div style={{ fontSize: 11, fontWeight: 700, marginTop: 4, lineHeight: 1.3 }}>{item.name}</div>
+                    <div style={{ fontSize: 11, fontWeight: 700, marginTop: 4, lineHeight: 1.3 }}>{item.displayName || item.name}</div>
                     {metaText ? (
                       <div style={{ fontSize: 9.5, color: '#92600A', marginTop: 3,
                         fontWeight: 600, lineHeight: 1.3 }}>
@@ -205,6 +210,7 @@ export default function Dashboard() {
   const [refillOpen, setRefillOpen]   = useState(false)
   const [refillStep, setRefillStep]   = useState('branch') // 'branch' | 'item'
   const [refillBranch, setRefillBranch] = useState('')
+  const [refillEditId, setRefillEditId] = useState(null)   // RF doc id ที่กำลังแก้ไข (null = สร้างใหม่)
   const [wasteOpen, setWasteOpen] = useState(false)
   const [bellOpen, setBellOpen] = useState(false)
 
@@ -631,10 +637,10 @@ export default function Dashboard() {
     return () => { unsub(); unsubCats() }
   }, [])
 
-  // Load active transfers (pending + in_transit)
+  // Load active transfers (pending + preparing + in_transit)
   useEffect(() => {
     const q = query(collection(db, COL.TRANSFER_ORDERS),
-      where('status', 'in', ['pending', 'in_transit']), limit(10))
+      where('status', 'in', ['pending', 'preparing', 'in_transit']), limit(10))
     const unsub = onSnapshot(q, snap => {
       setTransfers(snap.docs.map(d => ({ id: d.id, ...d.data() })))
     })
@@ -815,35 +821,108 @@ export default function Dashboard() {
       const rfItems = [...refillSelected].map(id => {
         const item = items.find(i => i.id === id)
         if (!item) return null
+        // หน่วย default ที่แสดงบนจอ = u1 (unitBuy/unitBase = "ลัง")
+        // ต้องตรงกับ selectedUnit ใน renderItem มิฉะนั้น fallback จะเพี้ยนเป็น unitUse
+        const u1 = item.unitBuy || item.unitBase || ''
+        const u2 = item.unitUseRaw || item.unitUse || ''
+        const u3 = item.unitSubRaw || item.unitSub || ''
+        const dispDefault = u1 || u2 || u3 || ''
         return {
           itemId: id, itemName: item.name, img: item.img || '📦',
           category: item.category || 'อื่นๆ',
-          unit: refillUnits[id] || item.unitUse || item.unitBase || '',
+          unit: refillUnits[id] || dispDefault,
           qty: refillQtys[id] || 0,
         }
       }).filter(Boolean)
-      await addDoc(collection(db, COL.REFILL_REQUESTS), {
-        rfRef: rfId, status: 'pending',
-        items: rfItems,
-        requestedBy: name || window._bizSession?.name || '',
-        requestedAt: serverTimestamp(),
-      })
-      await addDoc(collection(db, COL.AUDIT_LOGS), {
-        action: 'refill_request', staffName: name,
-        detail: `แจ้งเติมของ ${rfId} — ${rfItems.length} รายการ`,
-        timestamp: serverTimestamp()
-      })
+      const branchName = warehouses.find(w => w.id === refillBranch)?.name || ''
+
+      if (refillEditId) {
+        // ── โหมดแก้ไข: อัปเดตใบเดิม (ไม่สร้างใบใหม่ / ไม่ push ซ้ำ) ──
+        const editRf = refillRequests.find(r => r.id === refillEditId)
+        await updateDoc(doc(db, COL.REFILL_REQUESTS, refillEditId), {
+          items: rfItems,
+          branchId: refillBranch || editRf?.branchId || '',
+          branchName: branchName || editRf?.branchName || '',
+          editedBy: name || window._bizSession?.name || '',
+          editedAt: serverTimestamp(),
+        })
+        await addDoc(collection(db, COL.AUDIT_LOGS), {
+          action: 'refill_edit', staffName: name,
+          detail: `แก้ไขใบแจ้งเติม ${editRf?.rfRef || refillEditId.slice(-8)} — ${rfItems.length} รายการ`,
+          timestamp: serverTimestamp()
+        })
+        setToast(`✏️ แก้ไขใบแจ้งเติม ${editRf?.rfRef || ''} เรียบร้อย`)
+      } else {
+        // ── โหมดสร้างใหม่ ──
+        await addDoc(collection(db, COL.REFILL_REQUESTS), {
+          rfRef: rfId, status: 'pending',
+          items: rfItems,
+          branchId: refillBranch || '',
+          branchName,
+          requestedBy: name || window._bizSession?.name || '',
+          requestedAt: serverTimestamp(),
+        })
+        await addDoc(collection(db, COL.AUDIT_LOGS), {
+          action: 'refill_request', staffName: name,
+          detail: `แจ้งเติมของ ${rfId} — ${rfItems.length} รายการ`,
+          timestamp: serverTimestamp()
+        })
+        // 🔔 Push → Hub bell + FCM (Owner/Admin จะเห็นแม้ Hub ปิด)
+        try {
+          const nref = await addDoc(collection(db, 'hub_notifications'), {
+            app: 'inventory', type: 'refill-request', tag: 'stock',
+            title: `🧾 แจ้งเติมของใหม่ ${rfId}`,
+            body: `${name || 'สาขา'} แจ้งเติม ${rfItems.length} รายการ — รอคลังดำเนินการ`,
+            rfRef: rfId, itemCount: rfItems.length,
+            createdAt: serverTimestamp(),
+            read: false, read_by: [],
+          })
+          sendHubPush(nref.id)
+        } catch {}
+        setToast(`✅ แจ้งเติมของ ${rfId} เรียบร้อย — รอคลังดำเนินการ`)
+      }
       setRefillOpen(false)
       setRefillSelected(new Set())
       setRefillQtys({})
       setRefillUnits({})
       setRefillCat('low')
-      setToast(`✅ แจ้งเติมของ ${rfId} เรียบร้อย — รอคลังดำเนินการ`)
+      setRefillEditId(null)
     } catch(e) {
       setToast('❌ เกิดข้อผิดพลาด')
     } finally {
       setRefillSaving(false)
     }
+  }
+
+  /** เปิด modal แจ้งเติมของในโหมดแก้ไข — เติมข้อมูลจากใบเดิมกลับมา (editor ทุกคนแก้ได้) */
+  function openEditRF(rf) {
+    const sel = new Set()
+    const qtys = {}
+    const units = {}
+    ;(rf.items || []).forEach(it => {
+      if (!it.itemId) return
+      sel.add(it.itemId)
+      qtys[it.itemId]  = Number(it.qty) || 0
+      if (it.unit) units[it.itemId] = it.unit
+    })
+    setRefillSelected(sel)
+    setRefillQtys(qtys)
+    setRefillUnits(units)
+    setRefillEditId(rf.id)
+    setRefillCat('low')
+    // แก้ไข = ระบุสาขาตั้งแต่ตอนแจ้งแล้ว → ไม่ต้องเลือกซ้ำ ข้ามไปหน้ารายการเลย
+    const branches = warehouses.filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
+    // หา branch: ใบใหม่มี branchId · ใบเก่า fallback = match ชื่อ/สาขาเดียวที่มี/สาขาแรก
+    const resolvedBranch =
+      rf.branchId
+      || branches.find(w => w.id === rf.branchId)?.id
+      || (branches.length === 1 ? branches[0].id : '')
+      || branches.find(w => w.name === rf.branchName)?.id
+      || branches[0]?.id
+      || ''
+    setRefillBranch(resolvedBranch)
+    setRefillStep('item')   // ข้ามขั้นเลือกสาขาเสมอในโหมดแก้ไข
+    setRefillOpen(true)
   }
 
   /** เปิด transfer modal พร้อม pre-fill จาก RF doc */
@@ -865,19 +944,26 @@ export default function Dashboard() {
         addUnit(itemMaster?.unitSubRaw || itemMaster?.unitSub)
         addUnit(it.unit)   // หน่วยที่ staff เลือกตอนสร้าง RF — ใส่เผื่อ master ไม่มี
 
+        // ยอดที่ต้องโอน = ยอดค้าง (ถ้าใบเคยส่งบางส่วน) ไม่งั้น = ยอดเต็มที่ขอ
+        const _factor   = parseConvFactor(itemMaster?.unitConversion) || 1
+        const _isBase   = it.unit && itemMaster?.unitBase && it.unit === itemMaster.unitBase
+        const _reqUse   = _isBase ? (parseFloat(it.qty)||0)*_factor : (parseFloat(it.qty)||0)
+        const _fulfilled = Number(it.fulfilledQtyUse) || 0
+        const _remainUse = Math.max(0, _reqUse - _fulfilled)
+        const effQty = _fulfilled > 0
+          ? (_isBase ? _remainUse / _factor : _remainUse)
+          : (parseFloat(it.qty) || 0)
+        if (effQty <= 0) return   // รายการนี้ส่งครบแล้ว — ข้าม
+
         if (merged[it.itemId]) {
-          // ถ้าหน่วยเดียวกัน → รวม qty; ถ้าต่างหน่วย → ใช้ unit ของ RF ใหม่ + รวม qty (ไม่เป๊ะ)
-          if (merged[it.itemId].unit === (it.unit || merged[it.itemId].unit)) {
-            merged[it.itemId].qty = String(parseFloat(merged[it.itemId].qty || 0) + parseFloat(it.qty || 0))
-          } else {
-            merged[it.itemId].qty = String(parseFloat(merged[it.itemId].qty || 0) + parseFloat(it.qty || 0))
+          merged[it.itemId].qty = String(parseFloat(merged[it.itemId].qty || 0) + effQty)
+          if (merged[it.itemId].unit !== (it.unit || merged[it.itemId].unit))
             console.warn(`[transfer] หน่วยต่างกัน รวม qty อาจไม่เป๊ะ:`, it.itemName)
-          }
         } else {
           merged[it.itemId] = {
             itemId: it.itemId, itemName: it.itemName, img: it.img || '📦',
             category: it.category || 'อื่นๆ',
-            qty: it.qty ? String(it.qty) : '',
+            qty: effQty ? String(effQty) : '',
             unit: it.unit || unitOpts[0] || '',   // ⚠️ ใช้หน่วยที่ staff เลือก (it.unit) เป็นหลัก
             unitOpts,
           }
@@ -887,10 +973,18 @@ export default function Dashboard() {
     setTransferItems(Object.values(merged))
   }
 
+  /** หา id คลังกลาง (ต้นทางโอนเสมอ) + สาขาเดียวที่มี (ปลายทาง default) */
+  function transferDefaults() {
+    const mainId = warehouses.find(w => w.type === 'main' || w.isMain)?.id || ''
+    const branches = warehouses.filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
+    return { mainId, defaultTo: branches.length === 1 ? branches[0].id : '' }
+  }
+
   /** เปิด modal สร้างใบโอน (เปล่า — ให้ user เลือก RF เอง) */
   function openTransferFromRFs(rfs) {
+    const { mainId, defaultTo } = transferDefaults()
     setTransferItems([])
-    setTfr({ fromWH: '', toWH: '', driver: '', _rfIds: [], _rfRefs: [] })
+    setTfr({ fromWH: mainId, toWH: defaultTo, driver: '', _rfIds: [], _rfRefs: [] })
     setTfAddMode(false); setTfStep('pick')
     setTfrRFExpand(true)  // เปิด RF picker อัตโนมัติ
     // pre-select ถ้า user กดมาจาก sticky bar
@@ -904,10 +998,11 @@ export default function Dashboard() {
 
   /** เปิด modal เปล่า (จากปุ่ม "โอนสินค้า") */
   function openTransferBlank() {
+    const { mainId, defaultTo } = transferDefaults()
     setTransferItems([])
-    setTfr({ fromWH: '', toWH: '', driver: '', _rfIds: [], _rfRefs: [] })
+    setTfr({ fromWH: mainId, toWH: defaultTo, driver: '', _rfIds: [], _rfRefs: [] })
     setTfAddMode(false); setTfStep('pick')
-    setTfrRFExpand(refillRequests.filter(r => r.status === 'pending').length > 0)
+    setTfrRFExpand(false)  // ยุบไว้ก่อน (กดขยายเอง) — ประหยัดที่
     setTfrRFImport(new Set())
     setTransferOpen(true)
   }
@@ -967,7 +1062,7 @@ export default function Dashboard() {
       const allRfIds  = tfr._rfIds?.length ? tfr._rfIds : (tfr._rfId ? [tfr._rfId] : [])
       const allRfRefs = tfr._rfRefs?.length ? tfr._rfRefs : (tfr._rfRef ? [tfr._rfRef] : [])
       const tfDoc = await addDoc(collection(db, COL.TRANSFER_ORDERS), {
-        tfRef: tfId, status: 'in_transit',
+        tfRef: tfId, status: 'preparing',   // เฟส 1: เตรียมสินค้า (ยังไม่ส่ง) — กด "ส่งสินค้า" จึงจะ in_transit
         fromWarehouseId: tfr.fromWH, fromWarehouseName: fromName,
         toWarehouseId:   tfr.toWH,   toWarehouseName:   toName,
         driver: tfr.driver,
@@ -975,7 +1070,6 @@ export default function Dashboard() {
         refillRequestId: allRfIds[0] || null, refillRef: allRfRefs[0] || null,   // legacy single
         refillRequestIds: allRfIds, refillRefs: allRfRefs,                       // ใหม่: array รองรับ multi-RF
         createdBy: name, createdAt: serverTimestamp(),
-        departedBy: name, departedAt: serverTimestamp(),
       })
       // อัปเดต RF status → processing (รองรับทั้ง _rfIds array และ _rfId เดี่ยว legacy)
       const rfIds = tfr._rfIds?.length ? tfr._rfIds : (tfr._rfId ? [tfr._rfId] : [])
@@ -985,19 +1079,63 @@ export default function Dashboard() {
         })
       }
       const rfRefs = tfr._rfRefs?.join(', ') || tfr._rfRef || ''
+      // 🔔 Push → Hub bell + FCM
+      try {
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'transfer-prepare', tag: 'stock',
+          title: `📦 ใบโอนใหม่ ${tfId} — เตรียมสินค้า`,
+          body: `${fromName} → ${toName} — ${itemsPayload.length} รายการ · รอจัดส่ง`,
+          tfRef: tfId, itemCount: itemsPayload.length,
+          fromWarehouseId: tfr.fromWH, toWarehouseId: tfr.toWH,
+          createdAt: serverTimestamp(),
+          read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
       await addDoc(collection(db, COL.AUDIT_LOGS), {
-        action: 'transfer_dispatch', staffName: name,
-        detail: `สร้าง+นำส่ง ${tfId} จาก ${fromName} → ${toName} (${itemsPayload.length} รายการ) | คนนำส่ง: ${tfr.driver || '-'}${rfRefs ? ' | RF: ' + rfRefs : ''}`,
+        action: 'transfer_create', staffName: name,
+        detail: `สร้างใบโอน ${tfId} (เตรียมสินค้า) จาก ${fromName} → ${toName} (${itemsPayload.length} รายการ)${rfRefs ? ' | RF: ' + rfRefs : ''}`,
         timestamp: serverTimestamp()
       })
       setTransferOpen(false)
       setTransferItems([])
       setTfr({ fromWH: '', toWH: '', driver: '' })
-      setToast(`✅ นำส่งใบโอน ${tfId} แล้ว — รอหน้าร้านยืนยันรับ`)
+      setToast(`✅ สร้างใบโอน ${tfId} แล้ว — กด "ส่งสินค้า" เมื่อพร้อมจัดส่ง`)
     } catch(e) {
       console.error(e); setToast('❌ เกิดข้อผิดพลาด')
     } finally {
       setTransferSaving(false)
+    }
+  }
+
+  /** เฟส 2: กด "ส่งสินค้า" → preparing → in_transit (เริ่มนำส่ง + แจ้งสาขา) */
+  async function dispatchTransfer(tf) {
+    if (!tf || tf.status !== 'preparing') return
+    try {
+      const fromName = tf.fromWarehouseName || tf.fromWarehouseId
+      const toName   = tf.toWarehouseName   || tf.toWarehouseId
+      await updateDoc(doc(db, COL.TRANSFER_ORDERS, tf.id), {
+        status: 'in_transit', departedBy: name, departedAt: serverTimestamp(),
+      })
+      try {
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'transfer-dispatch', tag: 'stock',
+          title: `🚚 กำลังนำส่ง ${tf.tfRef || tf.id.slice(-6)}`,
+          body: `${fromName} → ${toName} — ${tf.items?.length || 0} รายการ · รอ${toName}ตรวจรับ`,
+          tfRef: tf.tfRef || '', itemCount: tf.items?.length || 0,
+          fromWarehouseId: tf.fromWarehouseId, toWarehouseId: tf.toWarehouseId,
+          createdAt: serverTimestamp(), read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
+      await addDoc(collection(db, COL.AUDIT_LOGS), {
+        action: 'transfer_dispatch', staffName: name,
+        detail: `ส่งสินค้า ${tf.tfRef || tf.id} จาก ${fromName} → ${toName} · คนนำส่ง: ${tf.driver || '-'}`,
+        timestamp: serverTimestamp()
+      })
+      setToast(`🚚 ส่งสินค้า ${tf.tfRef || ''} แล้ว — รอสาขาตรวจรับ`)
+    } catch (e) {
+      console.error(e); setToast('❌ ส่งสินค้าไม่สำเร็จ')
     }
   }
 
@@ -1153,8 +1291,40 @@ export default function Dashboard() {
       const rfIdsToFinish = Array.isArray(tf.refillRequestIds) && tf.refillRequestIds.length
         ? tf.refillRequestIds
         : (tf.refillRequestId ? [tf.refillRequestId] : [])
+
+      // ── Per-item fulfillment: กระจาย "ยอดรับจริง" ลงรายการในใบ RF ──
+      // helper: แปลงจำนวน (ตามหน่วยที่บันทึก) → unitUse
+      const toUse = (qty, unit, itemId) => {
+        const master = items.find(i => i.id === itemId)
+        const factor = parseConvFactor(master?.unitConversion) || 1
+        const q = parseFloat(qty) || 0
+        return (unit && master?.unitBase && unit === master.unitBase) ? q * factor : q
+      }
+      // 1. ยอดรับจริงต่อ itemId (unitUse) จากใบโอนนี้
+      const receivedPool = {}
+      for (const it of (tf.items || [])) {
+        receivedPool[it.itemId] = (receivedPool[it.itemId] || 0) + toUse(it.qty, it.unit, it.itemId)
+      }
+      // 2. กระจายให้รายการในแต่ละ RF ตามลำดับ — เติมยอดที่ยังค้างก่อน
       rfIdsToFinish.forEach(rfId => {
-        if (rfId) batch.update(doc(db, COL.REFILL_REQUESTS, rfId), { status: 'done', completedAt: serverTimestamp() })
+        if (!rfId) return
+        const rf = refillRequests.find(r => r.id === rfId)
+        if (!rf) { batch.update(doc(db, COL.REFILL_REQUESTS, rfId), { status: 'done', completedAt: serverTimestamp() }); return }
+        const newItems = (rf.items || []).map(ri => {
+          const reqUse   = toUse(ri.qty, ri.unit, ri.itemId)
+          const already  = Number(ri.fulfilledQtyUse) || 0
+          const need     = Math.max(0, reqUse - already)
+          const pool     = receivedPool[ri.itemId] || 0
+          const give     = Math.min(need, pool)
+          receivedPool[ri.itemId] = pool - give
+          return { ...ri, fulfilledQtyUse: already + give }
+        })
+        const allDone = newItems.every(ri => (Number(ri.fulfilledQtyUse) || 0) + 1e-6 >= toUse(ri.qty, ri.unit, ri.itemId))
+        batch.update(doc(db, COL.REFILL_REQUESTS, rfId), {
+          items: newItems,
+          status: allDone ? 'done' : 'partial',
+          ...(allDone ? { completedAt: serverTimestamp() } : { partialAt: serverTimestamp() }),
+        })
       })
       await batch.commit()
       const lotSummary = lotTransfers.length
@@ -1165,6 +1335,19 @@ export default function Dashboard() {
         detail: `รับสินค้า ${tf.tfRef || tf.id} จาก ${fromName} · คนนำส่ง: ${tf.driver || '-'} · รับโดย: ${name}${lotSummary}`,
         timestamp: serverTimestamp()
       })
+      // 🔔 Push → Hub bell + FCM
+      try {
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'transfer-received', tag: 'stock',
+          title: `📦 รับสินค้า ${tf.tfRef || tf.id?.slice(-6)} แล้ว`,
+          body: `${toName} ยืนยันรับครบ · จาก ${fromName} · โดย ${name}`,
+          tfRef: tf.tfRef || tf.id, itemCount: tf.items?.length || 0,
+          fromWarehouseId: tf.fromWarehouseId, toWarehouseId: tf.toWarehouseId,
+          createdAt: serverTimestamp(),
+          read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
       setReceiveTransferOpen(false)
       setReceivingTF(null)
       setToast(`✅ รับสินค้า ${tf.tfRef || ''} ครบถ้วน — stock + LOT อัปเดตทั้ง 2 คลัง`)
@@ -1235,7 +1418,8 @@ export default function Dashboard() {
               <span className="action-icon">📥</span>
               <span className="action-label">รับสินค้า</span>
             </button>
-            <button className="action-btn" onClick={() => isEditor() && openTransferBlank()}>
+            <button className="action-btn"
+              onClick={() => isOwner() ? openTransferBlank() : setToast('⚠️ เฉพาะ Owner / Admin สร้างใบโอนได้')}>
               <span className="action-icon">🚚</span>
               <span className="action-label">โอนสินค้า</span>
             </button>
@@ -1510,61 +1694,41 @@ export default function Dashboard() {
                   ยังไม่มีการตัดสต็อกวันนี้
                 </div>
               ) : (
-                <>
-                  {/* Staff chips — bounce-in stagger */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', padding: '10px 14px 8px' }}>
-                    <span style={{ fontSize: 10, color: 'var(--txt3)', fontWeight: 700 }}>โดย</span>
+                <div style={{ padding: '11px 14px', display: 'flex', flexDirection: 'column', gap: 9 }}>
+                  {/* แถว 1: คนตัด + รวมรายการ */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                     {staffSet.map((s, i) => (
                       <div key={s} style={{
-                        background: '#F3F4F6', borderRadius: 20, padding: '3px 10px',
+                        background: '#F3F4F6', borderRadius: 20, padding: '3px 9px',
                         fontSize: 11, color: '#374151', fontWeight: 600,
-                        display: 'flex', alignItems: 'center', gap: 4,
-                        animation: 'chipIn .35s cubic-bezier(.22,1,.36,1) both',
-                        animationDelay: `${i * 60}ms`
-                      }}>
-                        <div style={{
-                          width: 16, height: 16, borderRadius: '50%',
-                          background: AV_COLORS[i % AV_COLORS.length],
-                          color: '#fff', fontSize: 9, display: 'flex', alignItems: 'center',
-                          justifyContent: 'center', fontWeight: 800
-                        }}>{s.charAt(0)}</div>
+                        display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <div style={{ width: 16, height: 16, borderRadius: '50%',
+                          background: AV_COLORS[i % AV_COLORS.length], color: '#fff', fontSize: 9,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800 }}>
+                          {s.charAt(0)}</div>
                         {s}
                       </div>
                     ))}
-                  </div>
-
-                  {/* Category rows — stagger slide-up */}
-                  {sortedCats.map((cat, idx) => (
-                    <div key={cat} style={{
-                      display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px',
-                      borderTop: '1px solid var(--bg)',
-                      animation: 'rowIn .35s ease both',
-                      animationDelay: `${idx * 55}ms`
-                    }}>
-                      <span style={{ fontSize: 19, width: 26, textAlign: 'center', flexShrink: 0 }}>{CAT_EMOJI[cat] || '📦'}</span>
-                      <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: 'var(--txt1)' }}>{cat}</span>
-                      {/* Count badge — tick-up when value changes */}
-                      <span key={bycat[cat].length} style={{
-                        fontSize: 12, fontWeight: 700, color: '#6366F1',
-                        background: '#EEF2FF', borderRadius: 20, padding: '2px 9px', flexShrink: 0,
-                        animation: 'tickUp .25s ease both'
-                      }}>
-                        {bycat[cat].length} รายการ
-                      </span>
-                    </div>
-                  ))}
-
-                  {/* Footer */}
-                  <div style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                    padding: '9px 14px', background: 'var(--bg)', borderTop: '1px solid var(--border)'
-                  }}>
-                    <span style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>
-                      รวม {allItems.length} รายการ · {kpi.cuts} ครั้ง
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--txt3)', fontWeight: 700 }}>
+                      รวม {allItems.length} รายการ
                     </span>
-                    <span style={{ fontSize: 11, color: '#6366F1', fontWeight: 700 }}>กดดูรายละเอียด ›</span>
                   </div>
-                </>
+                  {/* แถว 2: หมวด chips (emoji + จำนวน) แบบกระชับ + กดดู */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    {sortedCats.map(cat => (
+                      <span key={cat} title={cat} style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        background: '#EEF2FF', borderRadius: 20, padding: '3px 9px',
+                        fontSize: 12, fontWeight: 700, color: '#4338CA' }}>
+                        <span style={{ fontSize: 14 }}>{CAT_EMOJI[cat] || '📦'}</span>
+                        {bycat[cat].length}
+                      </span>
+                    ))}
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: '#6366F1', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                      กดดู ›
+                    </span>
+                  </div>
+                </div>
               )}
             </div>
 
@@ -1700,10 +1864,9 @@ export default function Dashboard() {
       {/* ── Flow Status Cards ── */}
       {(() => {
         const rfPending    = refillRequests.filter(r => r.status === 'pending')
-        const rfProcessing = refillRequests.filter(r => r.status === 'processing')
-        const tfInTransit  = transfers.filter(t => t.status === 'in_transit')
         const lowAlerts    = alerts.filter(a => a.resolved !== true)
-        const hasAny = rfPending.length || rfProcessing.length || tfInTransit.length || lowAlerts.length || expAlerts.length
+        // หมายเหตุ: สถานะใบโอน (เตรียม/นำส่ง) ย้ายไปแสดงเป็น section เต็มด้านล่างแล้ว (ไม่ซ้ำ)
+        const hasAny = rfPending.length || lowAlerts.length || expAlerts.length
 
         const FlowCard = ({ icon, title, sub, badge, badgeColor, badgeBg, borderColor, bg, onClick }) => (
           <div onClick={onClick}
@@ -1738,29 +1901,6 @@ export default function Dashboard() {
                   title="คำร้องแจ้งเติมของ"
                   sub={`มี ${rfPending.length} คำร้องรอดำเนินการ — เลื่อนลงเพื่อดูรายละเอียด`}
                   badge={rfPending.length} badgeBg="#FEF3C7" badgeColor="#D97706"
-                />
-              )}
-
-              {/* RF processing — มีใบโอนแล้ว กำลังเตรียม */}
-              {rfProcessing.length > 0 && (
-                <FlowCard
-                  icon="📦" bg="#EFF6FF" borderColor="#BFDBFE"
-                  title="กำลังเตรียมสินค้า"
-                  sub={rfProcessing.map(r => `${r.rfRef||''} → ${r.tfRef||'มีใบโอนแล้ว'}`).join(' · ')}
-                  badge={rfProcessing.length} badgeBg="#DBEAFE" badgeColor="#1D4ED8"
-                />
-              )}
-
-              {/* TF in_transit — กำลังนำส่ง รอตรวจรับ */}
-              {tfInTransit.length > 0 && (
-                <FlowCard
-                  icon="🚚" bg="#F0FDF4" borderColor="#86EFAC"
-                  title="สินค้ากำลังนำส่ง — รอตรวจรับ"
-                  sub={tfInTransit.map(t =>
-                    `${t.tfRef || t.id.slice(-6)} · ${t.fromWarehouseName||'คลัง'} → ${t.toWarehouseName||'ร้าน'}`
-                  ).join('\n')}
-                  badge={tfInTransit.length} badgeBg="#DCFCE7" badgeColor="#16A34A"
-                  onClick={() => tfInTransit.length === 1 ? openReceiveTransfer(tfInTransit[0]) : undefined}
                 />
               )}
 
@@ -1815,9 +1955,10 @@ export default function Dashboard() {
         )
       })()}
 
-      {/* ── Section: ใบแจ้งเติมของรอดำเนินการ (Owner เท่านั้น) ── */}
-      {isOwner() && refillRequests.filter(r => r.status === 'pending').length > 0 && (() => {
-        const pendingRFs = refillRequests.filter(r => r.status === 'pending')
+      {/* ── Section: ใบแจ้งเติมของรอดำเนินการ ──
+           editor เห็นทุกใบ + ลบได้ · สร้างใบโอนรวม (กระทบ stock) = Owner เท่านั้น */}
+      {isEditor() && refillRequests.filter(r => r.status === 'pending' || r.status === 'partial').length > 0 && (() => {
+        const pendingRFs = refillRequests.filter(r => r.status === 'pending' || r.status === 'partial')
           .sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0)) // เก่าสุดขึ้นก่อน
         const allSelected  = pendingRFs.every(r => rfSelectedIds.has(r.id))
         const someSelected = rfSelectedIds.size > 0
@@ -1845,12 +1986,32 @@ export default function Dashboard() {
                 borderRadius: 10, padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
                 {pendingRFs.length} ใบ
               </span>
-              {/* เลือกทั้งหมด */}
-              <button onClick={toggleAll}
-                style={{ fontSize: 11, fontWeight: 600, color: allSelected ? '#DC2626' : '#6B7280',
-                  background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>
-                {allSelected ? '✗ ยกเลิกทั้งหมด' : '☑ เลือกทั้งหมด'}
-              </button>
+              {/* เลือกทั้งหมด — Owner เท่านั้น (ใช้เลือกไปสร้างใบโอนรวม) */}
+              {isOwner() && !someSelected && (
+                <button onClick={toggleAll}
+                  style={{ fontSize: 11, fontWeight: 600, color: '#6B7280',
+                    background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>
+                  ☑ เลือกทั้งหมด
+                </button>
+              )}
+              {/* ปุ่มสร้างใบโอนรวม — เล็ก อยู่ที่ header (แทนแถบแดงใหญ่) */}
+              {isOwner() && someSelected && (
+                <button onClick={() => setRfSelectedIds(new Set())}
+                  style={{ fontSize: 11, fontWeight: 600, color: '#9CA3AF',
+                    background: 'none', border: 'none', cursor: 'pointer', padding: '2px 2px', flexShrink: 0 }}>
+                  ✗
+                </button>
+              )}
+              {isOwner() && someSelected && (
+                <button onClick={e => { e.stopPropagation(); openTransferFromRFs(selectedRFs) }}
+                  style={{ fontSize: 11, fontWeight: 700, color: '#fff',
+                    background: 'linear-gradient(135deg,#DC2626,#B91C1C)', border: 'none',
+                    borderRadius: 9, padding: '6px 11px', cursor: 'pointer', flexShrink: 0,
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    boxShadow: '0 2px 6px rgba(220,38,38,0.3)' }}>
+                  🚚 โอนรวม {rfSelectedIds.size} ใบ →
+                </button>
+              )}
             </div>
 
             {/* RF Cards */}
@@ -1864,29 +2025,49 @@ export default function Dashboard() {
                 const timeStr = ts
                   ? `${ts.getDate()}/${ts.getMonth()+1} เวลา ${String(ts.getHours()).padStart(2,'0')}:${String(ts.getMinutes()).padStart(2,'0')} น.`
                   : ''
+                const canSelect = isOwner()  // เลือกเพื่อสร้างใบโอนรวม = Owner เท่านั้น
                 return (
                   <div key={rf.id}
-                    onClick={() => toggleRF(rf.id)}
+                    onClick={() => canSelect && toggleRF(rf.id)}
                     style={{ background: sel ? '#FFFBEB' : '#fff', borderRadius: 14,
                       border: `2px solid ${sel ? '#F59E0B' : '#FDE68A'}`,
                       boxShadow: sel ? '0 0 0 3px rgba(245,158,11,0.15)' : '0 1px 4px rgba(0,0,0,0.05)',
-                      padding: 14, cursor: 'pointer', transition: 'all 0.15s' }}>
+                      padding: 14, cursor: canSelect ? 'pointer' : 'default', transition: 'all 0.15s' }}>
 
                     {/* Row 1: Checkbox + Ref + Badge + 🗑️ */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-                      {/* Checkbox custom */}
-                      <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${sel ? '#F59E0B' : '#D1D5DB'}`,
-                        background: sel ? '#F59E0B' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        flexShrink: 0, transition: 'all 0.15s' }}>
-                        {sel && <span style={{ color: '#fff', fontSize: 13, fontWeight: 900 }}>✓</span>}
-                      </div>
+                      {/* Checkbox custom — Owner เท่านั้น (ใช้เลือกไปสร้างใบโอน) */}
+                      {canSelect && (
+                        <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${sel ? '#F59E0B' : '#D1D5DB'}`,
+                          background: sel ? '#F59E0B' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          flexShrink: 0, transition: 'all 0.15s' }}>
+                          {sel && <span style={{ color: '#fff', fontSize: 13, fontWeight: 900 }}>✓</span>}
+                        </div>
+                      )}
                       <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, flex: 1 }}>
                         {rf.rfRef || rf.id.slice(-8)}
                       </span>
-                      <span style={{ fontSize: 10, background: '#FFF7ED', color: '#D97706',
-                        border: '1px solid #FDE68A', borderRadius: 6, padding: '2px 7px', fontWeight: 700 }}>
-                        🟡 รอดำเนินการ
-                      </span>
+                      {rf.status === 'partial' ? (
+                        <span style={{ fontSize: 10, background: '#FFEDD5', color: '#C2410C',
+                          border: '1px solid #FED7AA', borderRadius: 6, padding: '2px 7px', fontWeight: 700 }}>
+                          🟠 ส่งบางส่วน · ค้างส่ง
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 10, background: '#FFF7ED', color: '#D97706',
+                          border: '1px solid #FDE68A', borderRadius: 6, padding: '2px 7px', fontWeight: 700 }}>
+                          🟡 รอดำเนินการ
+                        </span>
+                      )}
+                      {/* ปุ่มแก้ไข (editor ทุกคน) */}
+                      <button
+                        onClick={e => { e.stopPropagation(); openEditRF(rf) }}
+                        title="แก้ไขใบแจ้งเติม"
+                        style={{ width: 28, height: 28, border: 'none', borderRadius: 8, cursor: 'pointer',
+                          background: '#EFF6FF', color: '#2563EB',
+                          fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          flexShrink: 0, transition: 'all 0.15s' }}>
+                        ✏️
+                      </button>
                       {/* ปุ่มลบ */}
                       <button
                         onClick={e => { e.stopPropagation()
@@ -1914,15 +2095,30 @@ export default function Dashboard() {
 
                     {/* Row 3: รายการ chips */}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 32, marginBottom: rfDeleteId === rf.id ? 10 : 0 }}>
-                      {(rf.items || []).map((it, i) => (
-                        <span key={i} style={{ fontSize: 11, background: '#F3F4F6',
-                          borderRadius: 6, padding: '3px 8px', border: '1px solid #E5E7EB' }}>
-                          {it.img} {it.itemName}
-                          {it.qty > 0
-                            ? <span style={{ color: '#D97706', fontWeight: 700 }}> ×{it.qty} {it.unit}</span>
-                            : null}
-                        </span>
-                      ))}
+                      {(rf.items || []).map((it, i) => {
+                        // ยอดค้าง (เฉพาะใบ partial): ขอ - ส่งแล้ว (เทียบใน unitUse)
+                        const master = items.find(m => m.id === it.itemId)
+                        const factor = parseConvFactor(master?.unitConversion) || 1
+                        const reqUse = (it.unit && master?.unitBase && it.unit === master.unitBase) ? (parseFloat(it.qty)||0)*factor : (parseFloat(it.qty)||0)
+                        const fulfilled = Number(it.fulfilledQtyUse) || 0
+                        const isPartialItem = rf.status === 'partial' && fulfilled + 1e-6 < reqUse
+                        return (
+                          <span key={i} style={{ fontSize: 11,
+                            background: isPartialItem ? '#FFF7ED' : '#F3F4F6',
+                            borderRadius: 6, padding: '3px 8px',
+                            border: `1px solid ${isPartialItem ? '#FED7AA' : '#E5E7EB'}` }}>
+                            {it.img} {it.itemName}
+                            {it.qty > 0
+                              ? <span style={{ color: '#D97706', fontWeight: 700 }}> ×{it.qty} {it.unit}</span>
+                              : null}
+                            {isPartialItem && master && (
+                              <span style={{ color: '#C2410C', fontWeight: 700 }}>
+                                {' '}· ค้าง {formatStockQty(reqUse - fulfilled, master)}
+                              </span>
+                            )}
+                          </span>
+                        )
+                      })}
                     </div>
 
                     {/* Inline Delete Confirm */}
@@ -1965,36 +2161,59 @@ export default function Dashboard() {
               })}
             </div>
 
-            {/* ── Sticky bar: สร้างใบโอนรวม ── */}
-            {someSelected && (
-              <div style={{ position: 'sticky', bottom: 72, zIndex: 50,
-                margin: '12px 1rem 0', padding: '12px 16px',
-                background: 'linear-gradient(135deg,#DC2626,#B91C1C)',
-                borderRadius: 14, boxShadow: '0 4px 16px rgba(220,38,38,0.4)',
-                display: 'flex', alignItems: 'center', gap: 12 }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ color: '#fff', fontWeight: 700, fontSize: 14, fontFamily: 'Prompt' }}>
-                    🚚 สร้างใบโอนรวม ({rfSelectedIds.size} ใบ)
-                  </div>
-                  <div style={{ color: 'rgba(255,255,255,0.8)', fontSize: 11, marginTop: 2 }}>
-                    {selectedRFs.reduce((n, r) => n + (r.items?.length || 0), 0)} รายการ
-                    {rfSelectedIds.size > 1 && ' · รวม qty อัตโนมัติ'}
-                  </div>
-                </div>
-                <button
-                  onClick={e => { e.stopPropagation(); openTransferFromRFs(selectedRFs) }}
-                  style={{ background: '#fff', color: '#DC2626', border: 'none', borderRadius: 10,
-                    padding: '10px 18px', fontWeight: 700, fontSize: 13, cursor: 'pointer',
-                    fontFamily: 'Prompt', flexShrink: 0 }}>
-                  ดำเนินการ →
-                </button>
-              </div>
-            )}
+            {/* ปุ่มสร้างใบโอนรวมย้ายไปอยู่ที่ header แล้ว (เล็กลง ไม่เด่นเกินไป) */}
           </div>
         )
       })()}
 
-      {/* ── Section: ใบโอนกำลังนำส่ง (in_transit) ── */}
+      {/* ── Section: ใบโอนเตรียมจัดส่ง (preparing) — เฟส 1 ── */}
+      {transfers.filter(t => t.status === 'preparing').length > 0 && (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 1rem' }}>
+            <div className="section-label" style={{ padding: 0, marginBottom: 0, flex: 1 }}>📦 เตรียมจัดส่ง</div>
+            <span style={{ background: '#DBEAFE', color: '#1D4ED8', borderRadius: 10,
+              padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
+              {transfers.filter(t => t.status === 'preparing').length}
+            </span>
+          </div>
+          <div style={{ padding: '8px 1rem 0', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {transfers.filter(t => t.status === 'preparing').map(tf => {
+              const fromName = warehouses.find(w => w.id === tf.fromWarehouseId)?.name || tf.fromWarehouseName || 'คลัง'
+              const toName   = warehouses.find(w => w.id === tf.toWarehouseId)?.name   || tf.toWarehouseName   || 'ร้าน'
+              return (
+                <div key={tf.id} style={{ background: '#fff', borderRadius: 14,
+                  border: '1px solid #BFDBFE', boxShadow: '0 1px 4px rgba(0,0,0,0.05)', padding: 14 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13 }}>{tf.tfRef || tf.id.slice(-6)}</span>
+                    <span style={{ fontSize: 10, background: '#DBEAFE', color: '#1D4ED8',
+                      borderRadius: 6, padding: '2px 7px', fontWeight: 700 }}>📦 เตรียมสินค้า</span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--txt2)', marginBottom: 6 }}>
+                    {fromName} → {toName}
+                    {tf.driver ? <span style={{ color: '#6B7280' }}> · 🧑 {tf.driver}</span> : null}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 10 }}>
+                    {tf.items?.length || 0} รายการ
+                    {tf.items?.slice(0, 3).map((it, i) => (
+                      <span key={i} style={{ marginLeft: 6 }}>{it.img}{it.itemName}</span>
+                    ))}
+                    {(tf.items?.length || 0) > 3 && <span> +{tf.items.length - 3}</span>}
+                  </div>
+                  {isOwner() && (
+                    <button onClick={() => dispatchTransfer(tf)}
+                      style={{ width: '100%', background: '#1D4ED8', color: '#fff', border: 'none',
+                        borderRadius: 10, padding: '10px 0', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+                      🚚 ส่งสินค้า (เริ่มนำส่ง)
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Section: ใบโอนกำลังนำส่ง (in_transit) — เฟส 2 ── */}
       {transfers.filter(t => t.status === 'in_transit').length > 0 && (
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 1rem' }}>
@@ -2107,8 +2326,10 @@ export default function Dashboard() {
 
       {/* ══ Modal: แจ้งเติมของ — Step 1: เลือกสาขา / Step 2: เลือก item ══ */}
       <Modal open={refillOpen}
-        onClose={() => { setRefillOpen(false); setRefillSelected(new Set()); setRefillQtys({}); setRefillUnits({}); setRefillCat('low'); setRefillStep('branch'); setRefillBranch('') }}
-        title={refillStep === 'branch' ? 'แจ้งเติมของ — เลือกสาขา' : `แจ้งเติมของ — ${warehouses.find(w => w.id === refillBranch)?.name || ''}`}
+        onClose={() => { setRefillOpen(false); setRefillSelected(new Set()); setRefillQtys({}); setRefillUnits({}); setRefillCat('low'); setRefillStep('branch'); setRefillBranch(''); setRefillEditId(null) }}
+        title={refillEditId
+          ? `✏️ แก้ไขใบแจ้งเติม — ${warehouses.find(w => w.id === refillBranch)?.name || ''}`
+          : (refillStep === 'branch' ? 'แจ้งเติมของ — เลือกสาขา' : `แจ้งเติมของ — ${warehouses.find(w => w.id === refillBranch)?.name || ''}`)}
         lockClose={true}
         footer={refillStep === 'branch'
           ? (
@@ -2120,16 +2341,22 @@ export default function Dashboard() {
             </button>
           ) : (
             <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={() => { setRefillStep('branch'); setRefillSelected(new Set()); setRefillQtys({}) }}
-                style={{ flex: '0 0 auto', border: '1.5px solid var(--border)', borderRadius: 12,
-                  padding: '12px 16px', fontSize: 13, background: 'var(--bg)',
-                  color: 'var(--txt2)', cursor: 'pointer', fontWeight: 600 }}>
-                ← สาขา
-              </button>
+              {!refillEditId && (
+                <button onClick={() => { setRefillStep('branch'); setRefillSelected(new Set()); setRefillQtys({}) }}
+                  style={{ flex: '0 0 auto', border: '1.5px solid var(--border)', borderRadius: 12,
+                    padding: '12px 16px', fontSize: 13, background: 'var(--bg)',
+                    color: 'var(--txt2)', cursor: 'pointer', fontWeight: 600 }}>
+                  ← สาขา
+                </button>
+              )}
               <button className="btn-primary" onClick={submitRefill}
                 disabled={refillSaving || refillSelected.size === 0}
                 style={{ flex: 1, opacity: refillSaving || refillSelected.size === 0 ? 0.5 : 1 }}>
-                {refillSaving ? 'กำลังส่ง...' : `🧾 แจ้งเติมของ (${refillSelected.size} รายการ)`}
+                {refillSaving
+                  ? 'กำลังบันทึก...'
+                  : refillEditId
+                    ? `✏️ บันทึกการแก้ไข (${refillSelected.size} รายการ)`
+                    : `🧾 แจ้งเติมของ (${refillSelected.size} รายการ)`}
               </button>
             </div>
           )
@@ -2137,9 +2364,9 @@ export default function Dashboard() {
 
         {/* ── Step 1: เลือกสาขา ─────────────────────────── */}
         {refillStep === 'branch' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ fontSize: 13, color: '#92400E', background: '#FFF7ED',
-              borderRadius: 10, padding: '10px 14px', border: '1px solid #FDE68A' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+            <div style={{ fontSize: 12, color: '#1D4ED8', background: '#EFF6FF',
+              borderRadius: 9, padding: '7px 11px', border: '1px solid #BFDBFE', fontWeight: 600 }}>
               🏪 เลือกสาขาที่ต้องการแจ้งเติมของ
             </div>
             {warehouses
@@ -2155,28 +2382,28 @@ export default function Dashboard() {
               }).length
               return (
                 <button key={wh.id} onClick={() => setRefillBranch(wh.id)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 14,
-                    padding: '14px 16px', borderRadius: 14, cursor: 'pointer',
-                    border: `2px solid ${selected ? '#F59E0B' : 'var(--border)'}`,
-                    background: selected ? '#FFFBEB' : 'var(--bg)',
+                  style={{ display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '10px 12px', borderRadius: 11, cursor: 'pointer',
+                    border: `1.5px solid ${selected ? '#3B82F6' : 'var(--border)'}`,
+                    background: selected ? '#EFF6FF' : 'var(--bg)',
                     transition: 'all .15s', textAlign: 'left', width: '100%' }}>
                   {/* Radio circle */}
-                  <div style={{ width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
-                    border: `2px solid ${selected ? '#F59E0B' : 'var(--border2)'}`,
-                    background: selected ? '#F59E0B' : '#fff',
+                  <div style={{ width: 20, height: 20, borderRadius: '50%', flexShrink: 0,
+                    border: `2px solid ${selected ? '#3B82F6' : 'var(--border2)'}`,
+                    background: selected ? '#3B82F6' : '#fff',
                     display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    {selected && <span style={{ color: '#fff', fontSize: 14, fontWeight: 800, lineHeight: 1 }}>✓</span>}
+                    {selected && <span style={{ color: '#fff', fontSize: 12, fontWeight: 800, lineHeight: 1 }}>✓</span>}
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 700, fontSize: 15, color: selected ? '#92600A' : 'var(--txt1)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5, color: selected ? '#1D4ED8' : 'var(--txt1)' }}>
                       🏪 {wh.name}
                     </div>
-                    <div style={{ fontSize: 11, marginTop: 3,
+                    <div style={{ fontSize: 10.5, marginTop: 2,
                       color: lowCount > 0 ? '#DC2626' : '#16A34A', fontWeight: 600 }}>
                       {lowCount > 0 ? `⚠️ Stock ต่ำ/หมด ${lowCount} รายการ` : '✅ Stock ปกติทุกรายการ'}
                     </div>
                   </div>
-                  {selected && <span style={{ fontSize: 18 }}>→</span>}
+                  {selected && <span style={{ fontSize: 16, color: '#3B82F6' }}>→</span>}
                 </button>
               )
             })}
@@ -2187,8 +2414,8 @@ export default function Dashboard() {
         {refillStep === 'item' && <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {/* Branch pill */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            background: '#FFF7ED', borderRadius: 10, padding: '8px 12px', border: '1px solid #FDE68A' }}>
-            <span style={{ fontSize: 12, color: '#92400E', fontWeight: 600 }}>
+            background: '#EFF6FF', borderRadius: 9, padding: '7px 11px', border: '1px solid #BFDBFE' }}>
+            <span style={{ fontSize: 12, color: '#1D4ED8', fontWeight: 600 }}>
               🏪 {warehouses.find(w => w.id === refillBranch)?.name} · เลือกรายการที่ต้องการเติม
             </span>
           </div>
@@ -2214,8 +2441,12 @@ export default function Dashboard() {
               const qty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               return qty > getMin(item.id)
             }).sort(sortBySortOrder)
+            const mainWh = warehouses.find(w => w.type === 'main' || w.isMain)
             const renderItem = (item) => {
               const stockQty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
+              const mainQty  = mainWh
+                ? balances.filter(b => b.itemId === item.id && b.warehouseId === mainWh.id).reduce((s,b) => s+(b.qty||0),0)
+                : 0
               const minQ     = getMin(item.id)
               const checked  = refillSelected.has(item.id)
               const isOut    = stockQty <= 0
@@ -2230,6 +2461,11 @@ export default function Dashboard() {
               if (u3 && u3 !== u1 && u3 !== u2) unitOpts.push(u3)
               // default: หน่วยที่ใหญ่ที่สุด (ลัง) — สั่งซื้อทีละลัง
               const selectedUnit = refillUnits[item.id] || u1 || unitOpts[0] || ''
+
+              // จำนวนที่ขอ → แปลงเป็นหน่วยเล็ก (unitUse) เพื่อเทียบกับสต็อกคลังกลาง (เก็บใน unitUse)
+              const _factor = parseConvFactor(item.unitConversion) || 1
+              const reqInUse = (selectedUnit === u1 && _factor > 1) ? currentQty * _factor : currentQty
+              const overMain = checked && currentQty > 0 && reqInUse > mainQty
 
               function toggleCheck(e) {
                 e.stopPropagation()
@@ -2249,47 +2485,48 @@ export default function Dashboard() {
               }
 
               return (
-                <div key={item.id} style={{ borderRadius: 14,
-                  border: `2px solid ${checked ? '#FCD34D' : 'var(--border)'}`,
-                  background: checked ? '#FFFBEB' : '#fff',
+                <div key={item.id} style={{ borderRadius: 11,
+                  border: `1.5px solid ${overMain ? '#FCA5A5' : checked ? '#FCD34D' : 'var(--border)'}`,
+                  background: overMain ? '#FFF5F5' : checked ? '#FFFBEB' : '#fff',
                   overflow: 'hidden', transition: 'border-color .15s' }}>
 
                   {/* Row บน: checkbox + info */}
                   <div onClick={toggleCheck}
-                    style={{ display: 'flex', alignItems: 'center', gap: 10,
-                      padding: '11px 14px', cursor: 'pointer' }}>
+                    style={{ display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '7px 11px', cursor: 'pointer' }}>
                     {/* Checkbox */}
-                    <div style={{ width: 24, height: 24, borderRadius: 7, flexShrink: 0,
+                    <div style={{ width: 20, height: 20, borderRadius: 6, flexShrink: 0,
                       border: `2px solid ${checked ? '#F59E0B' : 'var(--border2)'}`,
                       background: checked ? '#F59E0B' : '#fff',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       transition: 'all .15s' }}>
-                      {checked && <span style={{ color: '#fff', fontSize: 14, fontWeight: 700, lineHeight: 1 }}>✓</span>}
+                      {checked && <span style={{ color: '#fff', fontSize: 12, fontWeight: 700, lineHeight: 1 }}>✓</span>}
                     </div>
-                    <span style={{ fontSize: 22, flexShrink: 0 }}>{item.img || '📦'}</span>
+                    <span style={{ fontSize: 18, flexShrink: 0 }}>{item.img || '📦'}</span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700 }}>{item.name}</div>
-                      <div style={{ fontSize: 11, fontWeight: 600, marginTop: 2,
-                        color: isOut ? '#DC2626' : stockQty <= minQ ? '#D97706' : '#6B7280' }}>
-                        {(() => {
-                          if (isOut) return '🔴 หมดแล้ว'
-                          const disp = formatStockQty(stockQty, item)
-                          const icon = stockQty <= minQ ? '🟡' : '🟢'
-                          return `${icon} เหลือ ${disp}`
-                        })()}
+                      <div style={{ fontSize: 12.5, fontWeight: 700, whiteSpace: 'nowrap',
+                        overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.displayName || item.name}</div>
+                      <div style={{ fontSize: 9.5, fontWeight: 600, marginTop: 1, color: '#9CA3AF',
+                        display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          🏠 กลาง {formatStockQty(mainQty, item)}
+                        </span>
+                        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {isOut ? '🔴' : stockQty <= minQ ? '🟡' : '🟢'} สาขา {formatStockQty(stockQty, item)}
+                        </span>
                       </div>
                     </div>
                   </div>
 
                   {/* Row ล่าง: stepper + unit (เฉพาะเมื่อเลือก) */}
-                  {checked && (
+                  {checked && (<>
                     <div onClick={e => e.stopPropagation()}
-                      style={{ borderTop: '1px solid #FDE68A', padding: '10px 14px',
-                        display: 'flex', alignItems: 'center', gap: 10, background: '#FFFDF0' }}>
+                      style={{ borderTop: '1px solid #FDE68A', padding: '6px 11px',
+                        display: 'flex', alignItems: 'center', gap: 6, background: '#FFFDF0' }}>
 
                       {/* Unit pills */}
                       {unitOpts.length > 1 && (
-                        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                        <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
                           {unitOpts.map(u => {
                             const active = selectedUnit === u
                             return (
@@ -2297,8 +2534,8 @@ export default function Dashboard() {
                                 style={{ border: `1.5px solid ${active ? '#F59E0B' : 'var(--border2)'}`,
                                   background: active ? '#F59E0B' : '#fff',
                                   color: active ? '#fff' : 'var(--txt2)',
-                                  borderRadius: 8, padding: '4px 10px',
-                                  fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                                  borderRadius: 7, padding: '3px 8px',
+                                  fontSize: 10.5, fontWeight: 700, cursor: 'pointer' }}>
                                 {u}
                               </button>
                             )
@@ -2306,8 +2543,8 @@ export default function Dashboard() {
                         </div>
                       )}
                       {unitOpts.length === 1 && (
-                        <span style={{ fontSize: 12, fontWeight: 700, color: '#D97706',
-                          background: '#FEF3C7', borderRadius: 8, padding: '4px 10px', flexShrink: 0 }}>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: '#D97706',
+                          background: '#FEF3C7', borderRadius: 7, padding: '3px 8px', flexShrink: 0 }}>
                           {selectedUnit}
                         </span>
                       )}
@@ -2317,29 +2554,36 @@ export default function Dashboard() {
 
                       {/* POS Stepper */}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 0,
-                        border: '1.5px solid #FCD34D', borderRadius: 12, overflow: 'hidden' }}>
+                        border: '1.5px solid #FCD34D', borderRadius: 9, overflow: 'hidden' }}>
                         <button onClick={() => setQty(currentQty - 1)}
-                          style={{ width: 38, height: 38, border: 'none', background: currentQty > 0 ? '#FEF3C7' : '#F3F4F6',
+                          style={{ width: 30, height: 30, border: 'none', background: currentQty > 0 ? '#FEF3C7' : '#F3F4F6',
                             color: currentQty > 0 ? '#D97706' : '#C7C7CC',
-                            fontSize: 20, fontWeight: 700, cursor: 'pointer',
+                            fontSize: 16, fontWeight: 700, cursor: 'pointer',
                             display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           −
                         </button>
-                        <div style={{ minWidth: 44, textAlign: 'center',
-                          fontFamily: 'Prompt', fontWeight: 700, fontSize: 18,
+                        <div style={{ minWidth: 34, textAlign: 'center',
+                          fontFamily: 'Prompt', fontWeight: 700, fontSize: 15,
                           color: currentQty > 0 ? '#1C1C1E' : '#C7C7CC',
-                          padding: '0 4px', background: '#fff' }}>
+                          padding: '0 3px', background: '#fff' }}>
                           {currentQty || 0}
                         </div>
                         <button onClick={() => setQty(currentQty + 1)}
-                          style={{ width: 38, height: 38, border: 'none', background: '#F59E0B',
-                            color: '#fff', fontSize: 20, fontWeight: 700, cursor: 'pointer',
+                          style={{ width: 30, height: 30, border: 'none', background: '#F59E0B',
+                            color: '#fff', fontSize: 16, fontWeight: 700, cursor: 'pointer',
                             display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           +
                         </button>
                       </div>
                     </div>
-                  )}
+                    {/* ⚠️ เตือนเมื่อขอเติมมากกว่าที่คลังกลางมี */}
+                    {overMain && (
+                      <div style={{ padding: '5px 11px 7px', background: '#FEF2F2',
+                        borderTop: '1px solid #FECACA', fontSize: 10.5, fontWeight: 700, color: '#DC2626' }}>
+                        ⚠️ เกินสต็อกคลังกลาง (มี {formatStockQty(mainQty, item)}) — โอนได้ไม่ครบ
+                      </div>
+                    )}
+                  </>)}
                 </div>
               )
             }
@@ -2347,17 +2591,22 @@ export default function Dashboard() {
             const FALLBACK_CATS = ['ผลไม้','แยม','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
             const ORDER = catOrder.length > 0 ? catOrder : FALLBACK_CATS
             const CAT_EMOJI = { ผลไม้:'🍋', แยม:'🍓', ไซรัป:'🍯', ท็อปปิ้ง:'💎', วัตถุดิบ:'🥛', บรรจุภัณฑ์:'🥤', อื่นๆ:'🔖' }
-            const availableCats = ['low', ...ORDER.filter(c =>
-              items.some(i => (i.category || 'อื่นๆ') === c)
-            )]
+            // 'selected' = แท็บรวมทุกรายการที่เลือกจะแจ้งเติม (โผล่เฉพาะตอนมีของเลือก)
+            const availableCats = ['low',
+              ...(refillSelected.size > 0 ? ['selected'] : []),
+              ...ORDER.filter(c => items.some(i => (i.category || 'อื่นๆ') === c))
+            ]
 
-            // กรองตาม tab
+            // กรองตาม tab — ทุก tab เรียงตาม Master Data (sortOrder)
             const displayItems = refillCat === 'low'
-              ? allItems                                             // stock ต่ำ/หมด
-              : items.filter(i => (i.category || 'อื่นๆ') === refillCat)
+              ? allItems                                             // stock ต่ำ/หมด (sort แล้ว)
+              : refillCat === 'selected'
+                ? items.filter(i => refillSelected.has(i.id)).sort(sortBySortOrder)  // ทั้งหมดที่เลือก
+                : items.filter(i => (i.category || 'อื่นๆ') === refillCat).sort(sortBySortOrder)
 
             // นับ selected ต่อ cat
             function selCount(cat) {
+              if (cat === 'selected') return refillSelected.size
               if (cat === 'low') return [...refillSelected].filter(id => allItems.find(i=>i.id===id)).length
               return [...refillSelected].filter(id => {
                 const it = items.find(i=>i.id===id)
@@ -2378,12 +2627,14 @@ export default function Dashboard() {
                         style={{ flexShrink: 0, border: 'none', borderRadius: 20,
                           padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
                           transition: 'all .15s',
-                          background: active ? '#F59E0B' : '#F3F4F6',
+                          background: active ? (cat === 'selected' ? '#16A34A' : '#F59E0B') : '#F3F4F6',
                           color: active ? '#fff' : '#6B7280',
                           display: 'flex', alignItems: 'center', gap: 5 }}>
                         {cat === 'low'
                           ? <><span>⚠️</span> ต่ำ/หมด</>
-                          : <><span>{CAT_EMOJI[cat]||'📦'}</span> {cat}</>
+                          : cat === 'selected'
+                            ? <><span>✅</span> ที่เลือก</>
+                            : <><span>{CAT_EMOJI[cat]||'📦'}</span> {cat}</>
                         }
                         {cnt > 0 && (
                           <span style={{ background: active ? 'rgba(255,255,255,0.35)' : '#F59E0B',
@@ -2401,13 +2652,19 @@ export default function Dashboard() {
                 {/* รายการตาม tab */}
                 {displayItems.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: 24, color: 'var(--txt3)', fontSize: 13 }}>
-                    {refillCat === 'low' ? '✅ ไม่มีรายการ stock ต่ำ' : 'ไม่มีรายการในหมวดนี้'}
+                    {refillCat === 'low' ? '✅ ไม่มีรายการ stock ต่ำ'
+                      : refillCat === 'selected' ? '☑ ยังไม่ได้เลือกรายการ'
+                      : 'ไม่มีรายการในหมวดนี้'}
                   </div>
                 ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {refillCat === 'low' && (
                       <div style={{ fontSize: 10, fontWeight: 700, color: '#DC2626',
                         letterSpacing: 0.5, paddingLeft: 2 }}>⚠️ STOCK ต่ำ / หมด</div>
+                    )}
+                    {refillCat === 'selected' && (
+                      <div style={{ fontSize: 10, fontWeight: 700, color: '#16A34A',
+                        letterSpacing: 0.5, paddingLeft: 2 }}>✅ ทั้งหมดที่จะแจ้งเติม ({refillSelected.size})</div>
                     )}
                     {displayItems.map(renderItem)}
                   </div>
@@ -2426,8 +2683,21 @@ export default function Dashboard() {
           : `Step 2/2 · กำหนดจำนวน + หน่วย (${transferItems.length})`}
         footer={(() => {
           const hasOutItem = transferItems.some(ti => {
-            const b = balances.find(b => b.itemId === ti.itemId && b.warehouseId === tfr.fromWH)
-            return !b || (b.qty || 0) <= 0
+            // รวมทุก balance doc (กัน duplicate ค้างจาก legacy ที่อาจมี doc qty=0)
+            const stockUse = balances
+              .filter(b => b.itemId === ti.itemId && b.warehouseId === tfr.fromWH)
+              .reduce((s, b) => s + (b.qty || 0), 0)
+            return stockUse <= 0
+          })
+          // 🔒 มีรายการที่โอนเกินสต็อกคลังกลางไหม (กันโอนเกิน)
+          const hasOverItem = transferItems.some(ti => {
+            const master = items.find(i => i.id === ti.itemId)
+            const stockUse = balances.filter(b => b.itemId === ti.itemId && b.warehouseId === tfr.fromWH)
+              .reduce((s, b) => s + (b.qty || 0), 0)
+            const factor = parseConvFactor(master?.unitConversion) || 1
+            const qtyIn = parseFloat(ti.qty) || 0
+            const qtyUseOut = (ti.unit && master?.unitBase && ti.unit === master.unitBase) ? qtyIn * factor : qtyIn
+            return qtyUseOut > stockUse
           })
           // Step 1 footer = "ถัดไป"
           if (tfStep === 'pick') {
@@ -2442,7 +2712,7 @@ export default function Dashboard() {
           }
           // Step 2 footer = "ย้อนกลับ" + "เปิดสรุป"
           const allHasQty = transferItems.every(ti => parseFloat(ti.qty) > 0)
-          const disabled = transferSaving || !allHasQty || hasOutItem
+          const disabled = transferSaving || !allHasQty || hasOutItem || hasOverItem
           return (
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn-secondary" style={{ flex: 1 }}
@@ -2450,16 +2720,16 @@ export default function Dashboard() {
               <button className="btn-primary" style={{ flex: 2, opacity: disabled ? 0.5 : 1 }}
                 disabled={disabled}
                 onClick={() => setTfStep('confirm')}>
-                {hasOutItem ? '⚠️ Stock หมด' : !allHasQty ? 'กรอกจำนวนให้ครบ' : 'ตรวจสอบ → ยืนยัน'}
+                {hasOutItem ? '⚠️ Stock หมด' : hasOverItem ? '⚠️ จำนวนเกินสต็อก' : !allHasQty ? 'กรอกจำนวนให้ครบ' : 'ตรวจสอบ → ยืนยัน'}
               </button>
             </div>
           )
         })()}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
 
           {/* ── RF Import Picker ── */}
           {(() => {
-            const pendingRFs = refillRequests.filter(r => r.status === 'pending')
+            const pendingRFs = refillRequests.filter(r => r.status === 'pending' || r.status === 'partial')
             if (pendingRFs.length === 0) return null
             return (
               <div style={{ borderRadius: 12, border: '1.5px solid #FCD34D',
@@ -2467,9 +2737,9 @@ export default function Dashboard() {
                 {/* Header แถบกด toggle */}
                 <div onClick={() => setTfrRFExpand(v => !v)}
                   style={{ display: 'flex', alignItems: 'center', gap: 8,
-                    padding: '9px 12px', cursor: 'pointer' }}>
-                  <span style={{ fontSize: 14 }}>📋</span>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: '#92400E', flex: 1 }}>
+                    padding: '7px 11px', cursor: 'pointer' }}>
+                  <span style={{ fontSize: 13 }}>📋</span>
+                  <span style={{ fontSize: 11.5, fontWeight: 700, color: '#92400E', flex: 1 }}>
                     นำเข้าจากใบแจ้งเติมของ ({pendingRFs.length} ใบรอ)
                   </span>
                   {tfrRFImport.size > 0 && (
@@ -2483,8 +2753,8 @@ export default function Dashboard() {
                 </div>
 
                 {tfrRFExpand && (
-                  <div style={{ borderTop: '1px solid #FDE68A', padding: '8px 10px',
-                    display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ borderTop: '1px solid #FDE68A', padding: '6px 8px',
+                    display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {pendingRFs.map(rf => {
                       const sel = tfrRFImport.has(rf.id)
                       const ts  = rf.requestedAt?.seconds
@@ -2537,10 +2807,10 @@ export default function Dashboard() {
                         }))
                         setTfrRFExpand(false)
                       }}
-                      style={{ marginTop: 4, padding: '9px 0', border: 'none', borderRadius: 10,
+                      style={{ marginTop: 2, padding: '7px 0', border: 'none', borderRadius: 9,
                         background: tfrRFImport.size > 0 ? '#F59E0B' : '#E5E7EB',
                         color: tfrRFImport.size > 0 ? '#fff' : '#9CA3AF',
-                        fontWeight: 700, fontSize: 13, cursor: tfrRFImport.size > 0 ? 'pointer' : 'default',
+                        fontWeight: 700, fontSize: 12, cursor: tfrRFImport.size > 0 ? 'pointer' : 'default',
                         fontFamily: 'Prompt' }}>
                       {tfrRFImport.size > 0
                         ? `📥 นำเข้า ${tfrRFImport.size} ใบ → เพิ่มรายการในใบโอน`
@@ -2552,33 +2822,39 @@ export default function Dashboard() {
             )
           })()}
 
-          {/* คลัง */}
-          <div style={{ display: 'flex', gap: 8 }}>
-            <div style={{ flex: 1 }}>
-              <label className="fi-label">จากคลัง</label>
-              <select className="fi" value={tfr.fromWH} onChange={e => setTfr(t => ({ ...t, fromWH: e.target.value }))}>
-                <option value="">เลือก</option>
-                {warehouses.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+          {/* ควบรวม: คลังต้นทาง(ล็อก) → สาขา + คนนำส่ง ในการ์ดเดียว */}
+          <div style={{ border: '1px solid var(--border)', borderRadius: 11, padding: 9,
+            background: 'var(--bg)', display: 'flex', flexDirection: 'column', gap: 7 }}>
+            {/* แถวคลัง: 🏭 กลาง → สาขา */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '7px 9px',
+                borderRadius: 8, background: '#F3F4F6', fontSize: 12.5, fontWeight: 700,
+                color: '#6B7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
+                🏭 {warehouses.find(w => w.id === tfr.fromWH)?.name || 'คลังกลาง'} 🔒
+              </span>
+              <span style={{ fontSize: 15, color: '#9CA3AF', flexShrink: 0 }}>→</span>
+              <select className="fi" value={tfr.toWH} style={{ flex: 1, height: 36, padding: '0 10px' }}
+                onChange={e => setTfr(t => ({ ...t, toWH: e.target.value }))}>
+                <option value="">เลือกสาขาปลายทาง</option>
+                {warehouses
+                  .filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
+                  .map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
               </select>
             </div>
-            <div style={{ flex: 1 }}>
-              <label className="fi-label">ไปยัง</label>
-              <select className="fi" value={tfr.toWH} onChange={e => setTfr(t => ({ ...t, toWH: e.target.value }))}>
-                <option value="">เลือก</option>
-                {warehouses.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
-              </select>
+            {/* แถวคนนำส่ง */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ fontSize: 12, color: 'var(--txt2)', fontWeight: 600,
+                whiteSpace: 'nowrap', flexShrink: 0 }}>🛵 คนนำส่ง</span>
+              <input className="fi" placeholder="ระบุชื่อ (ถ้ามี)" value={tfr.driver}
+                style={{ flex: 1, height: 36, padding: '0 10px' }}
+                onChange={e => setTfr(t => ({ ...t, driver: e.target.value }))} />
             </div>
-          </div>
-          <div>
-            <label className="fi-label">คนนำส่ง</label>
-            <input className="fi" placeholder="ระบุชื่อคนนำส่ง" value={tfr.driver}
-              onChange={e => setTfr(t => ({ ...t, driver: e.target.value }))} />
           </div>
 
           {/* รายการ */}
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <label className="fi-label" style={{ margin: 0 }}>📦 วัตถุดิบ — กดเพื่อเลือก/ยกเลิก</label>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <label className="fi-label" style={{ margin: 0, fontSize: 11 }}>📦 วัตถุดิบ — กดเพื่อเลือก/ยกเลิก</label>
               {transferItems.length > 0 && (
                 <span style={{ fontSize: 11, color: 'var(--red)', fontWeight: 700,
                   background: 'var(--red-p)', borderRadius: 8, padding: '3px 10px' }}>
@@ -2772,11 +3048,23 @@ export default function Dashboard() {
                               p.itemId === it.itemId ? { ...p, unit: u } : p))}
                           />
                         )}
-                        <PosQty
-                          value={parseFloat(it.qty) || 0}
-                          onChange={v => setTransferItems(prev => prev.map(p =>
-                            p.itemId === it.itemId ? { ...p, qty: String(v) } : p))}
-                        />
+                        {(() => {
+                          // 🔒 Block กรอกเกินสต็อกคลังกลาง — cap ตามหน่วยที่เลือก
+                          const _f = parseConvFactor(master?.unitConversion) || 1
+                          const _isBase = it.unit && master?.unitBase && it.unit === master.unitBase
+                          const maxInUnit = _isBase ? Math.floor(stockInFrom / _f) : Math.floor(stockInFrom)
+                          return (
+                            <PosQty
+                              value={parseFloat(it.qty) || 0}
+                              onChange={v => {
+                                const capped = Math.min(Math.max(0, v), Math.max(0, maxInUnit))
+                                if (v > maxInUnit) setToast(`⚠️ คลังกลางมีแค่ ${formatStockQty(stockInFrom, master)} — โอนได้สูงสุด ${maxInUnit} ${it.unit}`)
+                                setTransferItems(prev => prev.map(p =>
+                                  p.itemId === it.itemId ? { ...p, qty: String(capped) } : p))
+                              }}
+                            />
+                          )
+                        })()}
                       </div>
                     </div>
                   )

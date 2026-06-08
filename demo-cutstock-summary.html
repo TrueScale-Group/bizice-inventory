@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>Demo — สรุปตัดสต็อกวันนี้</title>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Sarabun', sans-serif; background: #F5F5F7; min-height: 100vh; }
+  .phone { max-width: 390px; margin: 0 auto; background: #F5F5F7; min-height: 100vh; padding-bottom: 80px; }
+
+  /* Topbar */
+  .topbar { background: #fff; padding: 14px 16px 10px; display: flex; align-items: center;
+    justify-content: space-between; border-bottom: 1px solid #E5E7EB; position: sticky; top: 0; z-index: 10; }
+  .topbar-brand { font-size: 16px; font-weight: 800; color: #111; }
+  .topbar-sub { font-size: 11px; color: #9CA3AF; font-weight: 600; }
+  .live-badge { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #22C55E; font-weight: 700; }
+  .live-dot { width: 6px; height: 6px; background: #22C55E; border-radius: 50%;
+    animation: blink 1.5s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* Hero */
+  .hero-card { background: linear-gradient(135deg,#E31E24,#c0171c); border-radius: 18px;
+    padding: 18px 20px; color: #fff; margin: 12px 16px 0; position: relative; overflow: hidden; }
+  .hero-card::before { content:''; position:absolute; right:-20px; top:-20px; width:100px; height:100px;
+    background:rgba(255,255,255,.08); border-radius:50%; }
+  .hero-label { font-size: 11px; opacity:.75; font-weight:600; letter-spacing:.5px; }
+  .hero-val { font-size: 32px; font-weight: 800; margin: 4px 0 2px; letter-spacing:-1px; }
+  .hero-sub { font-size: 10px; opacity:.6; }
+
+  /* KPI */
+  .kpi-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:8px 16px 0; }
+  .kpi-card { background:#fff; border-radius:14px; padding:12px 14px; border:1px solid #F0F0F0; }
+  .kpi-label { font-size:10px; color:#9CA3AF; font-weight:700; letter-spacing:.3px; }
+  .kpi-val { font-size:22px; font-weight:800; color:#111; margin:2px 0; }
+  .kpi-sub { font-size:10px; color:#9CA3AF; }
+  .kpi-red { color:#E31E24; }
+
+  /* ── CUT SUMMARY SECTION (compact) ── */
+  .cut-summary { margin: 12px 16px 0; }
+  .cut-summary-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .cut-summary-title { font-size:13px; font-weight:800; color:#111; display:flex; align-items:center; gap:6px; }
+  .cut-summary-badge { background:#E31E24; color:#fff; border-radius:20px; font-size:10px; font-weight:700; padding:2px 8px; }
+  .cut-summary-date { font-size:11px; color:#9CA3AF; font-weight:600; }
+
+  /* Main compact card */
+  .cut-card { background:#fff; border-radius:16px; border:1px solid #F0F0F0; overflow:hidden;
+    box-shadow:0 1px 4px rgba(0,0,0,.04); cursor:pointer; transition:box-shadow .2s; }
+  .cut-card:active { box-shadow:0 2px 12px rgba(0,0,0,.1); }
+
+  /* Staff row */
+  .staff-row { display:flex; align-items:center; gap:6px; padding:10px 14px 8px; flex-wrap:wrap; }
+  .staff-chip { background:#F3F4F6; border-radius:20px; padding:3px 10px;
+    font-size:11px; color:#374151; font-weight:600; display:flex; align-items:center; gap:4px; }
+  .av { width:16px; height:16px; border-radius:50%; color:#fff; font-size:9px;
+    display:flex; align-items:center; justify-content:center; font-weight:800; flex-shrink:0; }
+
+  /* Category row — compact */
+  .cat-row { display:flex; align-items:center; gap:10px; padding:8px 14px;
+    border-top:1px solid #F5F5F7; animation:fadeIn .3s ease both; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+  .cat-row-emoji { font-size:18px; width:24px; text-align:center; flex-shrink:0; }
+  .cat-row-name { flex:1; font-size:13px; font-weight:700; color:#222; }
+  .cat-row-count { font-size:12px; font-weight:700; color:#6366F1;
+    background:#EEF2FF; border-radius:20px; padding:2px 9px; flex-shrink:0; }
+  .cat-row-items { font-size:11px; color:#9CA3AF; font-weight:600; }
+
+  /* Footer */
+  .cut-footer { display:flex; align-items:center; justify-content:space-between;
+    padding:9px 14px; background:#F9FAFB; border-top:1px solid #F0F0F0; }
+  .cut-footer-left { font-size:11px; color:#6B7280; font-weight:600; }
+  .cut-footer-tap { font-size:11px; color:#6366F1; font-weight:700; display:flex; align-items:center; gap:3px; }
+
+  /* Empty state */
+  .cut-empty { padding:28px 0; text-align:center; color:#9CA3AF; font-size:13px; font-weight:600; }
+
+  /* ── POPUP (half-screen, above bottom bar) ── */
+  .popup-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:50;
+    display:flex; align-items:center; justify-content:center;
+    padding-bottom:68px; /* เว้นเหนือ bottom bar */
+    padding-left:16px; padding-right:16px;
+    animation:bdIn .2s ease; }
+  @keyframes bdIn { from{opacity:0} to{opacity:1} }
+
+  .popup-sheet { background:#fff; border-radius:20px; width:100%;
+    max-width:390px;
+    max-height:60vh; min-height:300px;
+    display:flex; flex-direction:column;
+    box-shadow:0 8px 40px rgba(0,0,0,.22);
+    animation:popIn .28s cubic-bezier(.22,1,.36,1); }
+  @keyframes popIn { from{opacity:0;transform:scale(.93)} to{opacity:1;transform:scale(1)} }
+
+  .sheet-handle { display:none; }
+  .sheet-header { display:flex; align-items:center; justify-content:space-between;
+    padding:10px 16px 8px; flex-shrink:0; border-bottom:1px solid #F0F0F0; }
+  .sheet-title { font-size:15px; font-weight:800; color:#111; }
+  .sheet-close { border:none; background:#F3F4F6; border-radius:50%; width:28px; height:28px;
+    font-size:13px; cursor:pointer; color:#555; flex-shrink:0; }
+  .sheet-body { overflow-y:auto; flex:1; padding:0 0 12px; -webkit-overflow-scrolling:touch; }
+
+  /* Staff summary in popup */
+  .popup-staff-row { display:flex; align-items:center; gap:6px; padding:10px 16px 8px; flex-wrap:wrap;
+    border-bottom:1px solid #F5F5F7; }
+  .popup-staff-label { font-size:10px; color:#9CA3AF; font-weight:700; letter-spacing:.3px; margin-right:2px; }
+
+  /* Detailed item rows in popup */
+  .popup-cat-head { display:flex; align-items:center; gap:8px; padding:10px 16px 5px;
+    background:#FAFAFA; position:sticky; top:0; }
+  .popup-cat-emoji { font-size:16px; }
+  .popup-cat-name { font-size:11px; font-weight:800; color:#555; letter-spacing:.4px; text-transform:uppercase; flex:1; }
+  .popup-cat-total { font-size:10px; color:#9CA3AF; font-weight:600; }
+
+  .popup-item-row { display:flex; align-items:center; gap:8px; padding:7px 16px 7px 38px;
+    border-top:1px solid #F5F5F7; }
+  .popup-item-name { flex:1; font-size:13px; color:#222; font-weight:600; }
+  .popup-item-dots { flex:1; border-bottom:1.5px dotted #E5E7EB; margin:0 6px;
+    align-self:flex-end; margin-bottom:4px; max-width:60px; }
+  .popup-item-qty { font-size:13px; font-weight:800; color:#E31E24; white-space:nowrap; }
+  .popup-item-unit { font-size:11px; color:#9CA3AF; font-weight:600; white-space:nowrap; }
+
+  /* Popup item animate */
+  .popup-item-row { animation:itemIn .25s ease both; }
+  @keyframes itemIn { from{opacity:0;transform:translateX(-6px)} to{opacity:1;transform:translateX(0)} }
+
+  /* Bottom total row */
+  .popup-total-row { display:flex; align-items:center; justify-content:space-between;
+    margin:8px 16px 0; padding:10px 14px; background:#F9FAFB; border-radius:12px; }
+  .popup-total-left { font-size:12px; color:#6B7280; font-weight:600; }
+  .popup-total-right { font-size:13px; font-weight:800; color:#111; }
+
+  /* Demo bar */
+  .demo-bar { position:fixed; bottom:0; left:0; right:0; background:#1F2937;
+    padding:10px 16px; display:flex; gap:8px; justify-content:center; z-index:100; height:60px; align-items:center; }
+  .demo-btn { background:#6366F1; color:#fff; border:none; border-radius:12px;
+    padding:8px 16px; font-family:'Sarabun',sans-serif; font-size:13px; font-weight:700;
+    cursor:pointer; }
+  .demo-btn.red { background:#E31E24; }
+  .demo-btn.green { background:#16A34A; }
+  .demo-label { color:#9CA3AF; font-size:11px; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="phone">
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <div>
+      <div class="topbar-brand">📦 Mixue Inventory</div>
+      <div class="topbar-sub">แดชบอร์ด</div>
+    </div>
+    <div class="live-badge"><div class="live-dot"></div> Online</div>
+  </div>
+
+  <!-- Hero -->
+  <div class="hero-card">
+    <div class="hero-label">มูลค่าใช้วัตถุดิบวันนี้ — ร้าน ITU</div>
+    <div class="hero-val" id="hero-val">฿0.00</div>
+    <div class="hero-sub">เชื่อม Cost Manager · real-time</div>
+  </div>
+
+  <!-- KPI -->
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">ต้นทุนวันนี้</div>
+      <div class="kpi-val" id="kpi-cost">฿0</div>
+      <div class="kpi-sub">บาท</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">ครั้งตัดวันนี้</div>
+      <div class="kpi-val kpi-red" id="kpi-cuts">0</div>
+      <div class="kpi-sub">ครั้ง</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">ใกล้หมด</div>
+      <div class="kpi-val" style="color:#F59E0B">2</div>
+      <div class="kpi-sub">รายการ</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">หมดแล้ว</div>
+      <div class="kpi-val" style="color:#9CA3AF">0</div>
+      <div class="kpi-sub">รายการ</div>
+    </div>
+  </div>
+
+  <!-- ══ CUT SUMMARY ══ -->
+  <div class="cut-summary">
+    <div class="cut-summary-header">
+      <div class="cut-summary-title">
+        ✂️ ตัดสต็อกวันนี้
+        <span class="cut-summary-badge" id="sum-badge">0 ครั้ง</span>
+      </div>
+      <div class="cut-summary-date" id="sum-date"></div>
+    </div>
+
+    <div class="cut-card" id="cut-card" onclick="openPopup()">
+      <div class="cut-empty" id="cut-empty">
+        <div style="font-size:32px;margin-bottom:8px">✂️</div>
+        ยังไม่มีการตัดสต็อกวันนี้<br>
+        <span style="font-size:11px">กด "+ จำลองตัดสต็อก" เพื่อดู demo</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ══ POPUP SHEET ══ -->
+<div class="popup-backdrop" id="popup" style="display:none" onclick="closePopup()">
+  <div class="popup-sheet" onclick="event.stopPropagation()">
+    <div class="sheet-handle"></div>
+    <div class="sheet-header">
+      <div class="sheet-title">📋 สรุปตัดสต็อกวันนี้</div>
+      <button class="sheet-close" onclick="closePopup()">✕</button>
+    </div>
+    <div class="sheet-body" id="popup-body"></div>
+  </div>
+</div>
+
+<!-- Demo Controls -->
+<div class="demo-bar">
+  <span class="demo-label">Demo:</span>
+  <button class="demo-btn green" onclick="addCut()">✂️ + จำลองตัดสต็อก</button>
+  <button class="demo-btn red" onclick="resetCut()">🗑️ รีเซ็ต</button>
+</div>
+
+<script>
+const CUTS_DATA = [
+  {
+    staff:'ลินลี่', cuts:2,
+    items:[
+      {cat:'แยม',   emoji:'🍓', name:'แยมสตอเบอร์รี่', qty:3,  unit:'กระปุก'},
+      {cat:'แยม',   emoji:'🍓', name:'แยมพีชชมพู',     qty:2,  unit:'กระปุก'},
+      {cat:'ผลไม้', emoji:'🍋', name:'มะนาว',           qty:12, unit:'ลูก'},
+      {cat:'ผลไม้', emoji:'🍋', name:'ส้ม',             qty:3,  unit:'ลูก'},
+      {cat:'วัตถุดิบ',emoji:'🥛',name:'กาแฟ',          qty:1,  unit:'ถัง'},
+    ]
+  },
+  {
+    staff:'บีม', cuts:1,
+    items:[
+      {cat:'ผลไม้',   emoji:'🍋', name:'มะนาว',          qty:9, unit:'ลูก'},
+      {cat:'ผลไม้',   emoji:'🍋', name:'นะขวดสี่เหลี่ยม',qty:2, unit:'ลัง'},
+      {cat:'ท็อปปิ้ง',emoji:'💎', name:'เจลลี่คริสตัล',  qty:2, unit:'ถุง'},
+      {cat:'ท็อปปิ้ง',emoji:'💎', name:'วุ้นมะพร้าว',    qty:1, unit:'ถุง'},
+      {cat:'บรรจุภัณฑ์',emoji:'🥤',name:'แก้ว 500',     qty:1, unit:'แตรว'},
+    ]
+  },
+  {
+    staff:'โบว์', cuts:2,
+    items:[
+      {cat:'แยม',       emoji:'🍓',name:'แยมมะม่วง',      qty:1, unit:'กระปุก'},
+      {cat:'ท็อปปิ้ง',  emoji:'💎',name:'ผงนม',           qty:2, unit:'ถุง'},
+      {cat:'ท็อปปิ้ง',  emoji:'💎',name:'ไอติมเผือก',     qty:1, unit:'ถุง'},
+      {cat:'บรรจุภัณฑ์',emoji:'🥤',name:'หลอดเล็ก',      qty:1, unit:'แพ็ค'},
+      {cat:'บรรจุภัณฑ์',emoji:'🥤',name:'ตุกตาลิ้มลุก',  qty:1, unit:'แพ็ค'},
+      {cat:'บรรจุภัณฑ์',emoji:'🥤',name:'กระดาษใบเสร็จ', qty:1, unit:'ม้วน'},
+    ]
+  }
+]
+
+const CAT_ORDER = ['แยม','ผลไม้','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
+const CAT_EMOJI = {แยม:'🍓',ผลไม้:'🍋',ไซรัป:'🍯',ท็อปปิ้ง:'💎',วัตถุดิบ:'🥛',บรรจุภัณฑ์:'🥤',อื่นๆ:'🔖'}
+const AV_COLORS = ['#6366F1','#E31E24','#0EA5E9','#16A34A','#F59E0B']
+
+let step = 0
+let accumulated = {}   // { name: {cat,emoji,name,unit,qty} }
+let staffDone  = []
+let totalCuts  = 0
+
+function addCut() {
+  if (step >= CUTS_DATA.length) { step=0; accumulated={}; staffDone=[]; totalCuts=0 }
+  const batch = CUTS_DATA[step++]
+  totalCuts += batch.cuts
+  if (!staffDone.includes(batch.staff)) staffDone.push(batch.staff)
+  batch.items.forEach(it => {
+    if (accumulated[it.name]) accumulated[it.name].qty += it.qty
+    else accumulated[it.name] = {...it}
+  })
+  renderCard()
+}
+
+function resetCut() {
+  step=0; accumulated={}; staffDone=[]; totalCuts=0
+  renderCard()
+  document.getElementById('hero-val').textContent='฿0.00'
+  document.getElementById('kpi-cost').textContent='฿0'
+  document.getElementById('kpi-cuts').textContent='0'
+  closePopup()
+}
+
+/* ── Group helper ── */
+function getBycat() {
+  const bycat = {}
+  Object.values(accumulated).forEach(it=>{
+    if (!bycat[it.cat]) bycat[it.cat]=[]
+    bycat[it.cat].push(it)
+  })
+  return bycat
+}
+function sortedCats(bycat) {
+  return Object.keys(bycat).sort((a,b)=>{
+    const ai=CAT_ORDER.indexOf(a), bi=CAT_ORDER.indexOf(b)
+    return (ai<0?99:ai)-(bi<0?99:bi)
+  })
+}
+
+/* ── Render compact card (category summary only) ── */
+function renderCard() {
+  const card   = document.getElementById('cut-card')
+  const badge  = document.getElementById('sum-badge')
+  badge.textContent = totalCuts + ' ครั้ง'
+  document.getElementById('kpi-cuts').textContent = totalCuts
+
+  const fakeCost = Object.values(accumulated).reduce((s,i)=>s+i.qty*18, 0)
+  document.getElementById('hero-val').textContent =
+    '฿'+fakeCost.toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2})
+  document.getElementById('kpi-cost').textContent =
+    '฿'+fakeCost.toLocaleString('th-TH',{maximumFractionDigits:0})
+
+  if (Object.keys(accumulated).length === 0) {
+    card.innerHTML = `<div class="cut-empty" id="cut-empty">
+      <div style="font-size:32px;margin-bottom:8px">✂️</div>
+      ยังไม่มีการตัดสต็อกวันนี้<br>
+      <span style="font-size:11px">กด "+ จำลองตัดสต็อก" เพื่อดู demo</span>
+    </div>`
+    return
+  }
+
+  const bycat = getBycat()
+  const cats  = sortedCats(bycat)
+  const totalItems = Object.keys(accumulated).length
+
+  let html = ''
+
+  /* Staff chips — ชื่อเฉยๆ ไม่รายละเอียด */
+  html += `<div class="staff-row">`
+  html += `<span style="font-size:10px;color:#9CA3AF;font-weight:700;margin-right:2px">โดย</span>`
+  staffDone.forEach((s,i)=>{
+    html += `<div class="staff-chip">
+      <div class="av" style="background:${AV_COLORS[i%AV_COLORS.length]}">${s.charAt(0)}</div>${s}
+    </div>`
+  })
+  html += `</div>`
+
+  /* Category rows — compact: emoji + ชื่อหมวด + จำนวนรายการ */
+  cats.forEach((cat, idx)=>{
+    const list = bycat[cat]
+    html += `<div class="cat-row" style="animation-delay:${idx*50}ms">
+      <span class="cat-row-emoji">${CAT_EMOJI[cat]||'📦'}</span>
+      <span class="cat-row-name">${cat}</span>
+      <span class="cat-row-count">${list.length} รายการ</span>
+    </div>`
+  })
+
+  /* Footer tap hint */
+  html += `<div class="cut-footer">
+    <div class="cut-footer-left">รวม ${totalItems} รายการ · ${totalCuts} ครั้ง</div>
+    <div class="cut-footer-tap">กดดูรายละเอียด ›</div>
+  </div>`
+
+  card.innerHTML = html
+  card.onclick = openPopup
+}
+
+/* ── Popup detail ── */
+function openPopup() {
+  if (Object.keys(accumulated).length === 0) return
+  const bycat = getBycat()
+  const cats  = sortedCats(bycat)
+  const totalItems = Object.keys(accumulated).length
+
+  let html = ''
+
+  /* Staff — "ใครตัดบ้าง" ไม่ระบุละเอียด */
+  html += `<div class="popup-staff-row">
+    <span class="popup-staff-label">ตัดโดย</span>`
+  staffDone.forEach((s,i)=>{
+    html += `<div class="staff-chip">
+      <div class="av" style="background:${AV_COLORS[i%AV_COLORS.length]}">${s.charAt(0)}</div>${s}
+    </div>`
+  })
+  html += `</div>`
+
+  /* Detail per category */
+  cats.forEach(cat=>{
+    const list = bycat[cat]
+    html += `<div class="popup-cat-head">
+      <span class="popup-cat-emoji">${CAT_EMOJI[cat]||'📦'}</span>
+      <span class="popup-cat-name">${cat}</span>
+      <span class="popup-cat-total">${list.length} รายการ</span>
+    </div>`
+    list.forEach((it,idx)=>{
+      html += `<div class="popup-item-row" style="animation-delay:${idx*40}ms">
+        <span class="popup-item-name">${it.name}</span>
+        <div class="popup-item-dots"></div>
+        <span class="popup-item-qty">${it.qty}</span>
+        <span class="popup-item-unit">${it.unit}</span>
+      </div>`
+    })
+  })
+
+  /* Total summary */
+  html += `<div class="popup-total-row">
+    <span class="popup-total-left">รวมทั้งหมด</span>
+    <span class="popup-total-right">${totalItems} รายการ · ${totalCuts} ครั้ง</span>
+  </div>`
+
+  document.getElementById('popup-body').innerHTML = html
+  document.getElementById('popup').style.display  = 'flex'
+}
+
+function closePopup() {
+  document.getElementById('popup').style.display = 'none'
+}
+
+/* Date */
+document.getElementById('sum-date').textContent =
+  new Date().toLocaleDateString('th-TH',{day:'numeric',month:'short',year:'numeric'})
+</script>
+</body>
+</html>

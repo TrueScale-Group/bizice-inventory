@@ -4,6 +4,7 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore'
+import { getFunctions, httpsCallable } from 'firebase/functions'
 
 const firebaseConfig = {
   apiKey: 'AIzaSyDRs60WURPcNArQXl5RRuwqJcLjtN3CMe4',
@@ -24,3 +25,13 @@ export const db = initializeFirestore(app, {
     tabManager: persistentMultipleTabManager(),
   }),
 })
+
+// 🔔 Cloud Functions — push notification ผ่าน FCM
+const functions = getFunctions(app, 'asia-southeast1')
+const sendHubPushFn = httpsCallable(functions, 'sendHubPush')
+
+/** ส่ง FCM push หลังเขียน hub_notifications doc (call ทันที, ไม่ block) */
+export function sendHubPush(notifId) {
+  if (!notifId) return
+  sendHubPushFn({ notifId }).catch(e => console.warn('[sendHubPush]', e?.message || e))
+}

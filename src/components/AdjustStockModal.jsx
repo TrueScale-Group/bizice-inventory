@@ -1,8 +1,13 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { Modal } from './Modal'
 import { adjustStock, ADJUST_REASONS } from '../utils/adjustStock'
-import { parseConvFactor, formatStockQty, convertToUse } from '../utils/unit'
+import { parseConvFactor, formatStockQty } from '../utils/unit'
 import { beepSuccess } from '../utils/audio'
+
+// หน่วยชั่ง/ตวง — Inventory ซ่อนจากการปรับยอด (ใช้หน่วยนับ เช่น ถุง/ลัง แทน)
+const WEIGHT_VOL_UNITS = ['กรัม','กก.','กิโลกรัม','มล.','มิลลิลิตร','ลิตร','ซีซี','cc','ml','g','kg','l','oz','ออนซ์']
+const isWeightVolUnit = (name) =>
+  WEIGHT_VOL_UNITS.some(u => (name || '').toLowerCase().trim() === u.toLowerCase())
 
 /**
  * AdjustStockModal — Owner-only ปรับยอดคงคลัง
@@ -33,16 +38,31 @@ export default function AdjustStockModal({
   //   factorToUse: 1 ของ level นี้ = N ของ unitUse
   //   ถ้าไม่มี (item รุ่นเก่า) → fallback เป็น base/use/sub
   const unitLevels = useMemo(() => {
+    let list
     if (Array.isArray(item?.unitLevels) && item.unitLevels.length > 0) {
-      return item.unitLevels.filter(l => l?.name && Number(l.factorToUse) > 0)
+      list = item.unitLevels.filter(l => l?.name && Number(l.factorToUse) > 0)
+    } else {
+      // Fallback (legacy items)
+      list = []
+      if (hasBase) list.push({ name: item.unitBase, factorToUse: factor })
+      list.push({ name: item?.unitUse || '', factorToUse: 1 })
+      if (hasSub)  list.push({ name: item.unitSub, factorToUse: 1 / convSub })
+      list = list.filter(l => l.name)
     }
-    // Fallback (legacy items)
-    const list = []
-    if (hasBase) list.push({ name: item.unitBase, factorToUse: factor })
-    list.push({ name: item?.unitUse || '', factorToUse: 1 })
-    if (hasSub)  list.push({ name: item.unitSub, factorToUse: 1 / convSub })
-    return list.filter(l => l.name)
+    // ซ่อนหน่วยชั่ง/ตวง (กรัม ฯลฯ) — เว้นแต่ Owner เปิด showSubInInventory
+    if (item?.showSubInInventory !== true) {
+      const filtered = list.filter(l => !isWeightVolUnit(l.name))
+      if (filtered.length > 0) list = filtered   // กันเผลอกรองหมดเกลี้ยง
+    }
+    return list
   }, [item, factor, hasBase, hasSub, convSub])
+
+  // ถ้าหน่วยที่เลือกอยู่ไม่อยู่ใน list (เช่น default ไปโดนหน่วยชั่ง) → รีเซ็ตเป็นหน่วยแรก (ใหญ่สุด)
+  useEffect(() => {
+    if (unitLevels.length > 0 && !unitLevels.some(l => l.name === unitMode)) {
+      setUnitMode(unitLevels[0].name)
+    }
+  }, [unitLevels, unitMode])
 
   // จำนวนที่กรอก แปลงเป็น unitUse
   const qtyUseAfterInput = useMemo(() => {
@@ -198,7 +218,9 @@ export default function AdjustStockModal({
               </div>
             ) : (
               <div style={{ padding: '10px 14px', borderRadius: 10, background: 'var(--bg)',
-                fontSize: 13, fontWeight: 600, color: 'var(--txt2)' }}>{unitLabel}</div>
+                fontSize: 13, fontWeight: 600, color: 'var(--txt2)' }}>
+                {unitLevels[0]?.name || unitLabel}
+              </div>
             )}
           </div>
           {qtyInput && unitMode !== item.unitUse && unitMode !== 'use' && (

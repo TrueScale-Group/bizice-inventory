@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { db } from '../firebase'
+import { db, sendHubPush } from '../firebase'
 import { collection, query, where, onSnapshot, orderBy, doc, getDocs,
          updateDoc, addDoc, serverTimestamp, getDoc, writeBatch, increment, documentId } from 'firebase/firestore'
 import { useSession } from '../hooks/useSession'
@@ -94,7 +94,7 @@ function calcItemCost(it, items, cmCosts) {
   return q * (cm.costPerUse || 0)
 }
 
-function CutLogCard({ log, items, cmCosts, onCancel, onCancelItem, onRestoreItem }) {
+function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestoreItem }) {
   const [open, setOpen] = useState(false)
 
   // คำนวณต้นทุนรายชิ้น
@@ -120,6 +120,12 @@ function CutLogCard({ log, items, cmCosts, onCancel, onCancelItem, onRestoreItem
       <div onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center',
         gap: 8, padding: '7px 12px', cursor: 'pointer' }}>
         <span style={{ fontSize: 14, flexShrink: 0 }}>✂️</span>
+        {seq != null && (
+          <span style={{ fontSize: 11, fontWeight: 800, color: '#fff', background: '#FF6B9D',
+            borderRadius: 6, padding: '1px 6px', flexShrink: 0, minWidth: 22, textAlign: 'center' }}>
+            {String(seq).padStart(2, '0')}
+          </span>
+        )}
         <span style={{ fontSize: 12, fontWeight: 700, color: '#1C1C1E', flexShrink: 0 }}>
           {log.timestamp ? toThaiTime(log.timestamp) : ''}
         </span>
@@ -390,7 +396,7 @@ function TransferDetailModal({ tf, onClose, items = [], catOrder = [] }) {
           background: '#fff', position: 'sticky', top: 0, zIndex: 2, flexShrink: 0 }}>
           <span style={{ fontSize: 18 }}>🚚</span>
           <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, flex: 1 }}>
-            ใบโอน #{tf.id?.slice(-6) || tf.id}
+            ใบโอน {tf.tfRef || `#${tf.id?.slice(-6) || tf.id}`}
           </span>
           <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 6, padding: '2px 8px',
             background: st.bg, color: st.color }}>{st.label}</span>
@@ -694,6 +700,7 @@ function EventDetailPopup({ detail, items = [], catOrder = [], onClose }) {
             const stMap = {
               pending:    { label: '🟡 รอดำเนินการ',     color: '#D97706', bg: '#FEF3C7' },
               processing: { label: '🔵 กำลังดำเนินการ',   color: '#1D4ED8', bg: '#DBEAFE' },
+              partial:    { label: '🟠 ส่งบางส่วน · ค้างส่ง', color: '#C2410C', bg: '#FFEDD5' },
               done:       { label: '🟢 เสร็จแล้ว',        color: '#16A34A', bg: '#DCFCE7' },
               cancelled:  { label: '⚫ ยกเลิก',           color: '#6B7280', bg: '#F3F4F6' },
             }
@@ -708,6 +715,7 @@ function EventDetailPopup({ detail, items = [], catOrder = [], onClose }) {
                 _sort: typeof m.sortOrder === 'number' ? m.sortOrder : 9999,
                 _img: m.img || it.img || '📦',
                 _name: m.displayName || it.itemName,
+                _master: m,
               }
             })
             const groups = {}
@@ -765,6 +773,21 @@ function EventDetailPopup({ detail, items = [], catOrder = [], onClose }) {
                             </span>
                             <span style={{ fontSize: 12, fontWeight: 700, color: '#1C1C1E', flexShrink: 0 }}>
                               {it.qty > 0 ? `×${it.qty}` : '-'}
+                              {it.qty > 0 && it.unit && (
+                                <span style={{ fontSize: 10, fontWeight: 600, color: '#9CA3AF', marginLeft: 3 }}>
+                                  {it.unit}
+                                </span>
+                              )}
+                              {rf.status === 'partial' && (() => {
+                                const m = it._master || {}
+                                const factor = parseConvFactor(m.unitConversion) || 1
+                                const isBase = it.unit && m.unitBase && it.unit === m.unitBase
+                                const reqUse = isBase ? (parseFloat(it.qty)||0)*factor : (parseFloat(it.qty)||0)
+                                const remain = Math.max(0, reqUse - (Number(it.fulfilledQtyUse)||0))
+                                return remain < 1e-6
+                                  ? <span style={{ fontSize: 10, fontWeight: 700, color: '#16A34A', marginLeft: 5 }}>✓ ครบ</span>
+                                  : <span style={{ fontSize: 10, fontWeight: 700, color: '#C2410C', marginLeft: 5 }}>· ค้าง {Number(remain.toFixed(2))} {m.unitUse || ''}</span>
+                              })()}
                             </span>
                           </div>
                         ))}
@@ -867,8 +890,8 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
         )}>
         {activeCut.length === 0 && cutLogs.filter(l => l.cancelled || l.deletedAt).length === 0
           ? <EmptyState msg="ยังไม่มีการตัดสต็อก" />
-          : [...activeCut].sort((a,b) => (b.timestamp?.seconds||0) - (a.timestamp?.seconds||0)).map(log => (
-            <CutLogCard key={log.id} log={log} items={items} cmCosts={cmCosts}
+          : [...activeCut].sort((a,b) => (b.timestamp?.seconds||0) - (a.timestamp?.seconds||0)).map((log, i, arr) => (
+            <CutLogCard key={log.id} log={log} seq={arr.length - i} items={items} cmCosts={cmCosts}
               onCancel={log => openCancel({ ...log,
                 _desc: `ตัดสต็อก ${log.items?.length || 0} รายการ`,
                 _staff: log.staffName }, 'ตัดสต็อก', cancelCutLog)}
@@ -1005,7 +1028,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
               opacity: tf.cancelled || tf.status === 'cancelled' ? 0.55 : 1 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                 <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13 }}>
-                  #{tf.id?.slice(-6) || tf.id}
+                  {tf.tfRef || `#${tf.id?.slice(-6) || tf.id}`}
                 </span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} onClick={e => e.stopPropagation()}>
                   <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 6, padding: '2px 8px',
@@ -1015,7 +1038,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
                   </span>
                   {!tf.cancelled && tf.status !== 'cancelled' && (
                     <CancelBtn onClick={() => openCancel({ ...tf,
-                      _desc: `ใบโอน #${tf.id?.slice(-6)} ${tf.fromWarehouseName || ''} → ${tf.toWarehouseName || ''}`,
+                      _desc: `ใบโอน ${tf.tfRef || '#'+tf.id?.slice(-6)} ${tf.fromWarehouseName || ''} → ${tf.toWarehouseName || ''}`,
                       _staff: tf.createdBy || '' }, 'ใบโอนสินค้า', cancelTransfer)} />
                   )}
                 </div>
@@ -1051,6 +1074,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
               const statusMap = {
                 pending:    { label: '🟡 รอดำเนินการ', color: '#D97706' },
                 processing: { label: '🔵 กำลังดำเนินการ', color: '#1D4ED8' },
+                partial:    { label: '🟠 ส่งบางส่วน', color: '#C2410C' },
                 done:       { label: '🟢 เสร็จแล้ว', color: '#16A34A' },
                 cancelled:  { label: '⚫ ยกเลิก', color: '#6B7280' },
               }
@@ -1088,7 +1112,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
                       {(rf.items || []).slice(0, 3).map((it, i) => (
                         <span key={i} style={{ fontSize: 10, background: '#F3F4F6',
                           borderRadius: 5, padding: '2px 6px', color: '#374151' }}>
-                          {it.img} {it.itemName}{it.qty > 0 ? ` ×${it.qty}` : ''}
+                          {it.img} {it.itemName}{it.qty > 0 ? ` ×${it.qty}${it.unit ? ` ${it.unit}` : ''}` : ''}
                         </span>
                       ))}
                       {(rf.items?.length || 0) > 3 && (
@@ -1691,6 +1715,7 @@ function AnalyzeTab() {
 /* ── WasteAnalysisTab ──────────────────────────────────────────────────── */
 function WasteAnalysisTab() {
   const [period, setPeriod] = useState('7days')
+  const [selectedDay, setSelectedDay] = useState(null)   // null = ทั้งช่วง · 'YYYY-MM-DD' = เจาะวันเดียว
   const [wasteLogs, setWasteLogs] = useState([])
   const [cutLogs, setCutLogs] = useState([])     // ใช้คำนวณ Effective Use %
   const [revenue, setRevenue] = useState(0)
@@ -1721,7 +1746,23 @@ function WasteAnalysisTab() {
     return { start: todayKey, end: todayKey }
   }
 
-  const { start, end } = getWasteRange(period)
+  const rangeFull = getWasteRange(period)
+  // วันที่ทั้งหมดในช่วง (ใหม่สุดก่อน) — สำหรับปุ่มเจาะวัน
+  const rangeDays = (() => {
+    const out = []
+    const toD = s => new Date(`${s}T00:00:00`)
+    let d = toD(rangeFull.start)
+    const last = toD(rangeFull.end)
+    let guard = 0
+    while (d <= last && guard < 40) {
+      out.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`)
+      d.setDate(d.getDate()+1); guard++
+    }
+    return out.reverse()
+  })()
+  // ช่วงที่ใช้ query จริง — ถ้าเจาะวัน = วันเดียว
+  const start = selectedDay || rangeFull.start
+  const end   = selectedDay || rangeFull.end
 
   useEffect(() => {
     const q = query(collection(db, COL.WASTE_LOGS),
@@ -1775,12 +1816,34 @@ function WasteAnalysisTab() {
   const closingGroups = groupByItem(closing)
   const worstItem = [...fruitGroups,...closingGroups].sort((a,b)=>b.cost-a.cost)[0]
 
+  // ── ของเสียรายวัน — group ตามวันที่ (ใหม่สุดก่อน) ──
+  const dailyWaste = (() => {
+    const map = {}
+    active.forEach(l => {
+      const d = l.date || ''
+      if (!d) return
+      if (!map[d]) map[d] = { date: d, cost: 0, count: 0, fruit: 0, closing: 0 }
+      map[d].cost += (l.totalCost || 0)
+      map[d].count += 1
+      if (l.type === 'fruit_daily') map[d].fruit += (l.totalCost || 0)
+      else if (l.type === 'closing') map[d].closing += (l.totalCost || 0)
+    })
+    return Object.values(map).sort((a,b) => b.date.localeCompare(a.date))
+  })()
+  const THAI_MONTHS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.']
+  const fmtDayLabel = (d) => {
+    const [y, m, day] = (d || '').split('-')
+    if (!day) return d
+    return `${parseInt(day, 10)} ${THAI_MONTHS[parseInt(m, 10) - 1] || ''}`
+  }
+  const maxDayCost = Math.max(1, ...dailyWaste.map(r => r.cost))
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       {/* Pills */}
       <div style={{ display: 'flex', gap: 6 }}>
         {PILLS.map(p => (
-          <button key={p.id} onClick={() => setPeriod(p.id)}
+          <button key={p.id} onClick={() => { setPeriod(p.id); setSelectedDay(null) }}
             style={{ border: 'none', borderRadius: 20, padding: '6px 14px', fontSize: 12,
               fontWeight: 700, cursor: 'pointer',
               background: period === p.id ? 'var(--red)' : '#F2F2F7',
@@ -1788,6 +1851,30 @@ function WasteAnalysisTab() {
             {p.label}
           </button>
         ))}
+      </div>
+
+      {/* เจาะวัน — เลือกวันใดวันหนึ่งในช่วง (เลื่อนแนวนอน) */}
+      <div style={{ display: 'flex', gap: 6, overflowX: 'auto', scrollbarWidth: 'none', paddingBottom: 2 }}>
+        <button onClick={() => setSelectedDay(null)}
+          style={{ flexShrink: 0, border: 'none', borderRadius: 16, padding: '5px 12px', fontSize: 11.5,
+            fontWeight: 700, cursor: 'pointer',
+            background: !selectedDay ? '#1F2937' : '#F2F2F7',
+            color: !selectedDay ? '#fff' : '#6B7280' }}>
+          📅 ทั้งช่วง
+        </button>
+        {rangeDays.map(d => {
+          const isToday = d === rangeFull.end
+          const on = selectedDay === d
+          return (
+            <button key={d} onClick={() => setSelectedDay(on ? null : d)}
+              style={{ flexShrink: 0, border: 'none', borderRadius: 16, padding: '5px 12px', fontSize: 11.5,
+                fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap',
+                background: on ? 'var(--red)' : '#F2F2F7',
+                color: on ? '#fff' : '#6B7280' }}>
+              {fmtDayLabel(d)}{isToday ? ' (วันนี้)' : ''}
+            </button>
+          )
+        })}
       </div>
 
       {/* KPI 2×2 */}
@@ -1859,6 +1946,33 @@ function WasteAnalysisTab() {
           </div>
         </div>
       )}
+
+      {/* ของเสียรายวัน */}
+      <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #F3F4F6', padding: '14px 12px' }}>
+        <SectionHeader icon="📅" label="ของเสียรายวัน" count={dailyWaste.length} />
+        {dailyWaste.length === 0 ? <EmptyState /> : dailyWaste.map(r => {
+          const pct = Math.round((r.cost / maxDayCost) * 100)
+          return (
+            <div key={r.date} style={{ padding: '8px 0', borderBottom: '1px solid #F9FAFB' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 5 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: '#1C1C1E' }}>{fmtDayLabel(r.date)}</span>
+                <span style={{ fontSize: 11, color: '#9CA3AF' }}>{r.count} ครั้ง</span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: '#D97706', marginLeft: 'auto' }}>{thb(r.cost)}</span>
+              </div>
+              <div style={{ height: 6, background: '#F2F2F7', borderRadius: 4, overflow: 'hidden' }}>
+                <div style={{ height: '100%', borderRadius: 4, background: '#F59E0B',
+                  width: `${pct}%`, transition: 'width .4s' }} />
+              </div>
+              {(r.fruit > 0 || r.closing > 0) && (
+                <div style={{ fontSize: 9.5, color: '#9CA3AF', marginTop: 3, display: 'flex', gap: 10 }}>
+                  {r.fruit > 0 && <span>🍋 ระหว่างวัน {thb(r.fruit)}</span>}
+                  {r.closing > 0 && <span>🌙 ปิดร้าน {thb(r.closing)}</span>}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
 
       {/* Fruit waste */}
       <div style={{ background: '#fff', borderRadius: 14, border: '1px solid #F3F4F6', padding: '14px 12px' }}>
@@ -2337,7 +2451,19 @@ export default function Report() {
       detail: `ยกเลิกใบโอน ${tf.tfRef || tf.id} (${tf.status === 'received' ? 'คืน stock + LOT แล้ว' : 'ยังไม่ได้รับ'}) — ${reason}`,
       timestamp: serverTimestamp(),
     })
+    // 🔔 Push → Hub bell + FCM (Owner ต้องรู้เพราะกระทบ stock)
+    const notifRef = doc(collection(db, 'hub_notifications'))
+    batch.set(notifRef, {
+      app: 'inventory', type: 'transfer-cancel', tag: 'stock',
+      title: `↩️ ยกเลิกใบโอน ${tf.tfRef || tf.id?.slice(-6)}`,
+      body: `${tf.fromWarehouseName || ''} → ${tf.toWarehouseName || ''} · ${staffName} · ${reason}`,
+      tfRef: tf.tfRef || tf.id, wasReceived: tf.status === 'received',
+      cancelReason: reason,
+      createdAt: serverTimestamp(),
+      read: false, read_by: [],
+    })
     await batch.commit()
+    sendHubPush(notifRef.id)
   }
 
   return (

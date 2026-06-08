@@ -15,6 +15,11 @@ export default function App() {
   const [tab, setTab]           = useState('dashboard')
   const [refreshKey, setRefreshKey] = useState(0)
 
+  // 📱 อัพเดทสี status bar เมื่อสลับหน้า/แท็บ (ใช้ theme color เดิมของแอพ)
+  useEffect(() => {
+    window.setStatusBarColor?.('#E31E24')
+  }, [tab])
+
   // 📱 Service Worker — cache app shell สำหรับ offline mode
   useEffect(() => {
     if ('serviceWorker' in navigator) {

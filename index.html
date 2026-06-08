@@ -7,12 +7,65 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Inventory" />
-  <meta name="theme-color" content="#E31E24" />
+  <meta name="theme-color" id="meta-theme-color" content="#E31E24" />
   <link rel="manifest" href="/bizice-inventory/manifest.json" />
   <link rel="icon" type="image/png" href="./icon-inventory.png" />
   <link rel="apple-touch-icon" href="./icon-inventory.png" />
   <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&family=Sarabun:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <title>Mixue Inventory</title>
+  <style>
+    /* ── Native App Feel ── */
+    *, *::before, *::after {
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    input, textarea, [contenteditable] {
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    html { touch-action: manipulation; -ms-touch-action: manipulation; }
+    html, body {
+      overscroll-behavior: none;
+      overscroll-behavior-y: contain;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
+  </style>
+  <script>
+    // บล็อก pinch-zoom (iOS ไม่สน user-scalable=no) + double-tap zoom
+    (function () {
+      // iOS Safari gesture events
+      ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (ev) {
+        document.addEventListener(ev, function (e) { e.preventDefault(); }, { passive: false });
+      });
+      // pinch ด้วย 2 นิ้ว (touchmove หลายจุด)
+      document.addEventListener('touchmove', function (e) {
+        if (e.touches && e.touches.length > 1) e.preventDefault();
+      }, { passive: false });
+      // double-tap zoom จัดการด้วย CSS touch-action: manipulation (ไม่บล็อกการกดเร็ว)
+      // กัน Ctrl + scroll / Ctrl + +/- บน desktop
+      window.addEventListener('wheel', function (e) {
+        if (e.ctrlKey) e.preventDefault();
+      }, { passive: false });
+      window.addEventListener('keydown', function (e) {
+        if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '0'].indexOf(e.key) !== -1) e.preventDefault();
+      });
+
+      // ── Haptic feedback — สั่นเบาๆ ทุกปุ่ม (event delegation) ──
+      window.hapticTap = function () { if (navigator.vibrate) navigator.vibrate(10); };
+      document.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('button, [role="button"], .btn, [onclick]')) window.hapticTap();
+      });
+
+      // ── Status bar color (iOS PWA) — เปลี่ยนสีได้เมื่อ navigate ──
+      window.setStatusBarColor = function (color) {
+        var meta = document.getElementById('meta-theme-color');
+        if (meta && color) meta.setAttribute('content', color);
+      };
+    })();
+  </script>
   <script>
     (function () {
       const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/';

@@ -13,8 +13,6 @@ import DataSheetModal from '../components/DataSheetModal'
 import { COL } from '../constants/collections'
 import { beepAdd, beepRemove } from '../utils/audio'
 
-const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/'
-
 const CAT_EMOJI = {
   'แยม': '🍓', 'ผลไม้': '🍑', 'ไซรัป': '🍯',
   'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
@@ -1493,19 +1491,11 @@ function CategoryModal({ open, onClose, cats, setCats, items, cmCompounds = [] }
 }
 
 export default function Settings() {
-  const { name, phone, role, isOwner } = useSession()
+  const { name, phone, isOwner } = useSession()
   const [loading, setLoading] = useState(true)
   const [lastSync, setLastSync] = useState('')
   const [settings, setSettings] = useState({})
-  const [hubStaff, setHubStaff] = useState(null)   // live profile จาก Hub staff/{phone}
-  useEffect(() => {
-    const p = window._bizSession?.phone || phone
-    if (!p) return
-    const unsub = onSnapshot(doc(db, 'staff', p),
-      snap => setHubStaff(snap.exists() ? { id: snap.id, ...snap.data() } : null),
-      () => {})
-    return unsub
-  }, [phone])
+  // โปรไฟล์ย้ายไปจัดการที่ BizICE Hub แล้ว — ไม่ subscribe staff/{phone} ในแอพนี้
   const [warehouses, setWarehouses] = useState([])
   const [items, setItems] = useState([])
   const [balanceMap, setBalanceMap] = useState({})  // { `${wh}_${item}`: balance doc }
@@ -1688,9 +1678,24 @@ export default function Settings() {
     // unitPrice ใหม่ = rawBasePrice / cumFromBase (ฐาน ÷ จำนวนหน่วย-เล็ก-ต่อ-ฐาน)
     const newUnitPrice = cumFromBase > 0 ? rawBasePrice / cumFromBase : prevUnitPrice
 
+    // ── Normalize stockLimits: บันทึกหน่วย min/max ให้ชัดเจนเสมอ ──
+    //   default = หน่วยใหญ่สุด (buy/ลัง) ตรงกับที่ฟอร์มโชว์เป็นค่าเริ่มต้น (unitOpts[0])
+    //   กัน bug: user ไม่กดเปลี่ยน dropdown → unit undefined → การ์ดเดาผิดเป็น use
+    const defLimUnit = itemForm.unitBuy ? 'buy' : (itemForm.unitUse ? 'use' : 'sub')
+    const normLimits = {}
+    Object.entries(itemForm.stockLimits || {}).forEach(([whId, lim]) => {
+      if (!lim) return
+      normLimits[whId] = {
+        ...lim,
+        minUnit: lim.minUnit || defLimUnit,
+        maxUnit: lim.maxUnit || defLimUnit,
+      }
+    })
+
     // backward compat: keep unitBase = unitBuy
     const data = {
       ...itemForm,
+      stockLimits:   normLimits,
       unitBase:      itemForm.unitBuy || '',
       // Effective fields — ใช้ในระบบ (stock_balances, formatStockQty)
       unitUse:       effUnitUse,
@@ -1753,14 +1758,15 @@ export default function Settings() {
         const now = serverTimestamp()
         whIds.forEach(whId => {
           const lim = limits[whId] || {}
+          const minUnitEff = lim.minUnit || defLimUnit
           const rawMin = parseFloat(lim.minQty) || 0
-          const minInUse = rawMin > 0 ? rawMin * rawToEffFactor(lim.minUnit) : 0
+          const minInUse = rawMin > 0 ? rawMin * rawToEffFactor(minUnitEff) : 0
           const balRef = doc(db, COL.STOCK_BALANCES, `${whId}_${itemId}`)
           batch.set(balRef, {
             warehouseId: whId,
             itemId,
             minQty:      minInUse,
-            minUnit:     lim.minUnit || 'use',     // จำหน่วยที่ user เลือก ('buy'|'use'|'sub')
+            minUnit:     minUnitEff,               // จำหน่วยที่ user เลือก ('buy'|'use'|'sub')
             minQtyRaw:   rawMin,                   // ค่าที่ user กรอกตามหน่วย minUnit
             unit:        itemForm.unitUse || '',
             lastUpdated: now,
@@ -1801,21 +1807,7 @@ export default function Settings() {
     await setDoc(doc(db, COL.APP_SETTINGS, 'inventory_settings'), updates, { merge: true })
   }
 
-  async function forceRefresh() {
-    setToast('🔄 กำลัง refresh...')
-    window.location.reload()
-  }
-
-  function logout() {
-    localStorage.removeItem('bizice_session')
-    window.location.replace(HUB)
-  }
-
-  function goHome() {
-    window.top.location.href = HUB
-  }
-
-  const initials = name ? name.trim().slice(-2) : '??'
+  // (รีเฟรชข้อมูล + โปรไฟล์ + กลับหน้าหลัก ย้ายไปจัดการที่อื่นแล้ว — ลบ dead code ออก)
 
   // ── ซ่อมข้อมูล Stock ย้อนหลัง ──────────────────────────────────────────
   async function retroFixStock() {
@@ -1861,12 +1853,16 @@ export default function Settings() {
   const SettingRow = ({ icon, title, desc, right, onClick, danger }) => (
     <div className="setting-row" onClick={onClick}
       style={danger ? { color: '#DC2626' } : {}}>
-      <div className="setting-left" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span className="setting-icon">{icon}</span>
-          <span className="setting-title" style={danger ? { color: '#DC2626' } : {}}>{title}</span>
-        </div>
-        {desc && <span style={{ fontSize: 11, color: 'var(--txt3)', paddingLeft: 30 }}>{desc}</span>}
+      <div className="setting-left">
+        <span className="setting-icon">{icon}</span>
+        <span className="setting-title" style={danger ? { color: '#DC2626' } : {}}>{title}</span>
+        {/* รายละเอียดซ่อนเป็น tooltip — เอาเมาส์ชี้ (หรือแตะ ⓘ) เพื่อแสดง */}
+        {desc && (
+          <span className="setting-info" tabIndex={0}
+            onClick={e => e.stopPropagation()}>ⓘ
+            <span className="setting-tip">{desc}</span>
+          </span>
+        )}
       </div>
       {right !== undefined ? right : <span className="setting-arrow">›</span>}
     </div>
@@ -1894,89 +1890,12 @@ export default function Settings() {
         )}
       </div>
 
-      {/* ══ Profile card — บนสุด ══ */}
-      <div style={{ padding: '0 1rem' }}>
-        {(() => {
-          const session = window._bizSession || {}
-          // Live profile จาก Firestore staff/{phone} (ผ่าน hubStaff state)
-          const _phone = session.phone || phone || ''
-          const _name = hubStaff?.displayName || hubStaff?.name || session.name || name || 'ผู้ใช้งาน'
-          const _role = hubStaff?.role || session.role || role || 'viewer'
-          const roleLabel = _role === 'owner' ? '👑 Owner' : _role === 'editor' ? '✏️ Editor' : '👁️ Viewer'
-          const roleColor = _role === 'owner' ? '#B45309' : _role === 'editor' ? '#1D4ED8' : '#6B7280'
-          const roleBg    = _role === 'owner' ? '#FEF3C7' : _role === 'editor' ? '#EFF6FF'  : '#F3F4F6'
-          // ตัด prefix "พี่/น้อง/คุณ" ออกก่อนเอาตัวแรก (ให้ได้ "จ" จาก "พี่จีโน่")
-          const cleanName = (_name || '').replace(/^(พี่|น้อง|คุณ)\s*/, '').trim()
-          const initial   = (cleanName || _name || '?').charAt(0).toUpperCase()
-          // ใช้ photo จาก Hub Firestore staff/{phone} เป็นหลัก (localStorage cache อาจเก่า)
-          const _photo = hubStaff?.photo || hubStaff?.photoURL || null
-          return (
-            <div style={{ background: '#fff', borderRadius: 16, padding: 18, boxShadow: 'var(--sh)',
-              display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                <label htmlFor="profile-photo-input"
-                  title="กดเพื่อเปลี่ยนรูปโปรไฟล์"
-                  style={{ width: 52, height: 52, borderRadius: '50%',
-                  background: _photo ? `center/cover url(${_photo})` : 'var(--red)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontFamily: 'Prompt', fontWeight: 700, fontSize: 22, color: '#fff',
-                  flexShrink: 0, cursor: 'pointer', position: 'relative' }}>
-                  {_photo ? '' : initial}
-                  <span style={{ position: 'absolute', bottom: -2, right: -2,
-                    background: '#fff', borderRadius: '50%', width: 20, height: 20,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 11, border: '2px solid #fff',
-                    boxShadow: '0 1px 3px rgba(0,0,0,.2)' }}>📷</span>
-                </label>
-                <input id="profile-photo-input" type="file" accept="image/*"
-                  style={{ display: 'none' }}
-                  onChange={async e => {
-                    const file = e.target.files?.[0]
-                    if (!file || !_phone) return
-                    if (file.size > 600 * 1024) {
-                      setToast('❌ รูปใหญ่เกิน 600KB กรุณาเลือกรูปขนาดเล็กกว่า')
-                      return
-                    }
-                    const reader = new FileReader()
-                    reader.onload = async ev => {
-                      const dataUrl = ev.target.result
-                      try {
-                        await setDoc(doc(db, 'staff', _phone),
-                          { photo: dataUrl, photoUpdatedAt: serverTimestamp() },
-                          { merge: true })
-                        try { localStorage.setItem('bizice_avatar_' + _phone, dataUrl) } catch {}
-                        setToast('✅ เปลี่ยนรูปโปรไฟล์แล้ว')
-                      } catch (err) {
-                        console.error(err)
-                        setToast('❌ บันทึกไม่สำเร็จ: ' + (err.message || ''))
-                      }
-                    }
-                    reader.readAsDataURL(file)
-                  }} />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 16 }}>{_name}</div>
-                  <div style={{ marginTop: 4 }}>
-                    <span style={{ background: roleBg, color: roleColor, borderRadius: 20,
-                      padding: '2px 10px', fontSize: 11, fontWeight: 700 }}>{roleLabel}</span>
-                  </div>
-                  {_phone && <div style={{ fontSize: 12, color: 'var(--txt3)', marginTop: 4 }}>{_phone}</div>}
-                </div>
-              </div>
-              <button style={{ background: '#FEF2F2', border: 'none', borderRadius: 10, padding: '10px 14px',
-                color: '#B01519', fontWeight: 700, fontSize: 13, cursor: 'pointer', width: '100%',
-                fontFamily: 'Sarabun', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
-                onClick={goHome}>
-                🏠 กลับหน้าหลัก (BizICE Hub)
-              </button>
-            </div>
-          )
-        })()}
-      </div>
+      {/* (การ์ดโปรไฟล์ถูกย้ายไปจัดการที่ BizICE Hub แล้ว) */}
 
       {/* ══ กลุ่ม 1 — คลัง + วัตถุดิบ (Editor + Owner) ══ */}
       <div>
         <div className="section-label">คลัง + วัตถุดิบ</div>
-        <div className="card" style={{ margin: '0 1rem' }}>
+        <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
           <SettingRow icon="🏪" title="จัดการคลังสินค้า" onClick={() => setWhModal(true)} />
           <SettingRow icon="🚚" title="แหล่งที่มาสินค้า" desc="แก้ไขรายการแหล่งที่มา" onClick={() => setSrcModal(true)} />
           <SettingRow icon="🏷️" title="หมวดหมู่วัตถุดิบ" desc={`${cats.length} หมวด`} onClick={() => setCatModal(true)} />
@@ -2004,7 +1923,7 @@ export default function Settings() {
             <span style={{ fontSize: 10, background: '#FEF3C7', color: '#B45309',
               borderRadius: 20, padding: '1px 8px', fontWeight: 700 }}>👑 Owner</span>
           </div>
-          <div className="card" style={{ margin: '0 1rem' }}>
+          <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
             <SettingRow icon="📉" title="Stock ต่ำกว่า min"
               right={<button className={`toggle${notifLow ? ' on' : ''}`} onClick={async () => {
                 const next = !notifLow; setNotifLow(next)
@@ -2020,19 +1939,19 @@ export default function Settings() {
               desc={`🟡 ≤ ${expThresholds.yellow} วัน · 🔴 ≤ ${expThresholds.red} วัน`}
               onClick={() => setExpColorModal(true)} />
             {/* ของเสียเกิน threshold — toggle + inline % input */}
-            <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10,
-              borderTop: '1px solid #F2F2F7' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <span style={{ fontSize: 20 }}>🗑️</span>
-                <span style={{ flex: 1, fontSize: 15, fontWeight: 600 }}>ของเสียเกิน threshold</span>
+            <div style={{ padding: '6px 14px', display: 'flex', flexDirection: 'column', gap: 8,
+              borderTop: '1px solid var(--border)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                <span style={{ fontSize: 16 }}>🗑️</span>
+                <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>ของเสียเกิน threshold</span>
                 <button className={`toggle${notifWaste ? ' on' : ''}`} onClick={async () => {
                   const next = !notifWaste; setNotifWaste(next)
                   await saveSettings({ notifWasteOverThreshold: next })
                 }} />
               </div>
               {notifWaste && (
-                <div style={{ background: '#F9FAFB', borderRadius: 12, padding: '10px 14px',
-                  display: 'flex', alignItems: 'center', gap: 10, marginLeft: 30 }}>
+                <div style={{ background: '#F9FAFB', borderRadius: 10, padding: '8px 12px',
+                  display: 'flex', alignItems: 'center', gap: 10, marginLeft: 25 }}>
                   <span style={{ fontSize: 13, color: '#6B7280', flex: 1 }}>แจ้งเมื่อของเสีย ≥</span>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <button onClick={() => {
@@ -2066,7 +1985,7 @@ export default function Settings() {
             <span style={{ fontSize: 10, background: '#FEF3C7', color: '#B45309',
               borderRadius: 20, padding: '1px 8px', fontWeight: 700 }}>👑 Owner</span>
           </div>
-          <div className="card" style={{ margin: '0 1rem' }}>
+          <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
             <SettingRow icon="⚡" title="Quick Template" onClick={() => setQuickTplModalV2(true)} />
             <SettingRow icon="🔗" title="เชื่อมต่อระบบ"
               desc="Cost Manager / Daily Income / น้องมี่"
@@ -2080,14 +1999,13 @@ export default function Settings() {
             <SettingRow icon="📊" title="Data Sheet"
               desc="แก้ items + stock ทุกคลังในไฟล์ CSV เดียว"
               onClick={() => setDataSheetOpen(true)} />
-            <SettingRow icon="🔄" title="รีเฟรชข้อมูล" onClick={forceRefresh} />
           </div>
         </div>
 
         {/* Danger Zone */}
         <div>
           <div className="section-label" style={{ color: '#DC2626' }}>Danger Zone</div>
-          <div className="card" style={{ margin: '0 1rem' }}>
+          <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
             <SettingRow icon="🔧" title="ซ่อมข้อมูล Stock ย้อนหลัง"
               desc="ลด stock_balances ตาม cut_stock_logs ที่มีอยู่ (ใช้ครั้งเดียว)"
               onClick={retroFixStock} />
@@ -2115,7 +2033,7 @@ export default function Settings() {
             background: 'var(--bg)', border: '1px solid var(--border2)',
             borderRadius: 20, padding: '1px 8px', fontWeight: 700, fontSize: 10.5,
             color: 'var(--txt2)'
-          }}>v2.0.36</span>
+          }}>v2.0.87</span>
           <span>·</span>
           <span>อัพเดท 2 มิ.ย. 2569</span>
         </div>

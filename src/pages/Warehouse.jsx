@@ -235,15 +235,22 @@ export default function Warehouse() {
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 8, padding: 8 }}>
               {rows.map(({ item, qty, itemLots, warnLots, worstExp, status, pct }) => (
                 <div key={item.id} className="stock-card" onClick={() => setHoverItem(hoverItem === item.id ? null : item.id)}
-                  style={{ cursor: 'pointer', position: 'relative', minWidth: 0, overflow: 'hidden' }}>
-                  <div style={{ position: 'absolute', top: 6, right: 6,
-                    width: 18, height: 18, borderRadius: '50%',
-                    background: hoverItem === item.id ? 'var(--red)' : '#E5E5EA',
+                  style={{ cursor: 'pointer', position: 'relative', minWidth: 0, overflow: 'hidden',
+                    background: hoverItem === item.id ? '#FFF1F5' : undefined,
+                    borderColor: hoverItem === item.id ? '#FFC2D6' : undefined,
+                    gridColumn: hoverItem === item.id ? '1 / -1' : 'auto' }}>
+                  <div style={{ position: 'absolute', top: 6, right: 6, zIndex: 2,
+                    width: 20, height: 20, borderRadius: '50%',
+                    background: hoverItem === item.id ? 'var(--red)' : '#FCE4EC',
+                    border: hoverItem === item.id ? 'none' : '1px solid #F8BBD0',
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 10, color: hoverItem === item.id ? '#fff' : '#8E8E93',
-                    fontWeight: 700, transition: 'all .15s', flexShrink: 0 }}>
-                    {hoverItem === item.id ? '✕' : 'ⓘ'}
+                    fontSize: hoverItem === item.id ? 11 : 13,
+                    color: hoverItem === item.id ? '#fff' : '#C2185B',
+                    fontWeight: 700, transition: 'all .15s', flexShrink: 0,
+                    lineHeight: 1 }}>
+                    {hoverItem === item.id ? '✕' : '⟳'}
                   </div>
+                  {hoverItem !== item.id && (<>
                   <div className="stock-emoji">{item.img || '📦'}</div>
                   <div className="stock-name">{item.displayName || item.name}</div>
                   <div className="stock-cat">{item.category}</div>
@@ -309,57 +316,85 @@ export default function Warehouse() {
                   <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
                     ตัด: {item.unitUse}{item.unitConversion ? ` · ${item.unitConversion}` : ''}
                   </div>
+                  </>)}
 
-                  {/* Action buttons row */}
+                  {/* ── ด้านหลังการ์ด (พลิก) — สีชมพูทั้งใบ ข้อมูลครบ (ไม่มี emoji) ── */}
                   {hoverItem === item.id && (
-                    <div style={{ marginTop: 8, padding: '10px 12px', background: '#FFF1F5', border: '1px solid #FFD4E0', borderRadius: 12, fontSize: 11, color: '#5C2A3E' }}>
-                      <div style={{ fontSize: 10, color: '#C2185B', fontWeight: 700, marginBottom: 8 }}>
-                        {item.img || '📦'} หน่วยบรรจุ
+                    <div className="stock-card-back" style={{ fontSize: 11, color: '#5C2A3E',
+                      display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {/* ชื่อวัตถุดิบ (เหลือแค่ชื่อ) */}
+                      <div style={{ paddingRight: 22, fontSize: 14, fontWeight: 800, color: '#3D1A28',
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {item.displayName || item.name}
                       </div>
-                      {item.unitConversion ? (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
-                          <span style={{ background: '#FFD4E0', color: '#5C2A3E', borderRadius: 6, padding: '3px 8px', fontWeight: 700 }}>
+                      {/* หน่วยบรรจุ + ราคา (แถวเดียว) */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 10, color: '#C2185B', fontWeight: 700, flexShrink: 0 }}>หน่วยบรรจุ</span>
+                        {item.unitConversion ? (
+                          <span style={{ background: '#FFD4E0', color: '#5C2A3E', borderRadius: 6,
+                            padding: '2px 8px', fontWeight: 700, fontSize: 10.5 }}>
                             {item.unitConversion}
                           </span>
-                        </div>
-                      ) : (
-                        <div style={{ color: '#B8859A', marginBottom: 8 }}>ไม่มีข้อมูลหน่วย</div>
-                      )}
-                      {item.unitPrice ? (
-                        <div style={{ fontSize: 10, color: '#8B5A6F', marginBottom: 4 }}>
-                          ราคา: ฿{Number(item.unitPrice).toFixed(2)}/{item.unitUse}
-                        </div>
-                      ) : null}
-                      {(() => {
+                        ) : (
+                          <span style={{ color: '#B8859A', fontSize: 10 }}>ไม่มีข้อมูลหน่วย</span>
+                        )}
+                        {item.unitPrice ? (
+                          <span style={{ fontSize: 10, color: '#8B5A6F', fontWeight: 600, marginLeft: 'auto' }}>
+                            ฿{Number(item.unitPrice).toFixed(2)}/{item.unitUse}
+                          </span>
+                        ) : null}
+                      </div>
+                      {/* MAX / MIN — 2 กล่องสถิติเต็มกว้าง (ไม่โชว์ชื่อคลังซ้ำ เพราะ toggle บนบอกแล้ว) */}
+                      {scope && (() => {
                         const bal = getBalance(item.id)
-                        const min = bal?.minQty || 0
-                        const whName = warehouses.find(w => w.id === scope)?.name || 'คลังนี้'
-                        if (!scope) return null
+                        const unitLabel = (u) =>
+                          u === 'buy' ? (item.unitBuy || item.unitBase || '')
+                          : u === 'sub' ? (item.unitSubRaw || item.unitSub || '')
+                          : (item.unitUseRaw || item.unitUse || '')
+                        // หน่วย default = หน่วยใหญ่สุด (buy/ลัง) ตรงกับที่ Settings โชว์เป็นค่าเริ่มต้น
+                        const defUnit = (item.unitBuy || item.unitBase) ? 'buy'
+                          : (item.unitUseRaw || item.unitUse) ? 'use' : 'sub'
+                        const minRaw = bal?.minQtyRaw
+                        const minStr = (minRaw != null && minRaw !== '')
+                          ? `${minRaw} ${unitLabel(bal?.minUnit || defUnit)}`
+                          : (bal?.minQty ? formatStockQty(bal.minQty, item) : '—')
+                        const lim = item.stockLimits?.[scope] || {}
+                        const maxStr = lim.maxQty ? `${lim.maxQty} ${unitLabel(lim.maxUnit || defUnit)}` : '—'
                         return (
-                          <div style={{ fontSize: 10, color: '#8B5A6F', marginBottom: 8 }}>
-                            ขั้นต่ำ ({whName}): <span style={{ color: '#C2185B', fontWeight: 700 }}>{formatStockQty(min, item)}</span>
+                          <div style={{ display: 'flex', gap: 7 }}>
+                            <div style={{ flex: 1, background: '#FFF7ED', border: '1px solid #FED7AA',
+                              borderRadius: 8, padding: '6px 10px', textAlign: 'center' }}>
+                              <div style={{ fontSize: 9, fontWeight: 700, color: '#EA580C' }}>🟧 MIN</div>
+                              <div style={{ fontSize: 13, fontWeight: 800, color: '#C2410C', whiteSpace: 'nowrap' }}>{minStr}</div>
+                            </div>
+                            <div style={{ flex: 1, background: '#F0FDF4', border: '1px solid #BBF7D0',
+                              borderRadius: 8, padding: '6px 10px', textAlign: 'center' }}>
+                              <div style={{ fontSize: 9, fontWeight: 700, color: '#16A34A' }}>🟩 MAX</div>
+                              <div style={{ fontSize: 13, fontWeight: 800, color: '#15803D', whiteSpace: 'nowrap' }}>{maxStr}</div>
+                            </div>
                           </div>
                         )
                       })()}
-                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {/* ปุ่ม 3 อัน เรียงนอนเต็มกว้าง (กดง่าย ไม่ตัดคำ) */}
+                      <div style={{ display: 'flex', gap: 7 }}>
                         {isOwner() && (
                           <button onClick={e => { e.stopPropagation(); setAdjustItem({ item, currentQty: qty }) }}
-                            style={{ flex: 1, minWidth: 80, padding: '6px 10px', borderRadius: 8,
-                              border: 'none', background: '#FF6B9D', color: '#fff',
-                              fontSize: 11, fontWeight: 700, cursor: 'pointer', boxShadow: '0 1px 3px rgba(255,107,157,.3)' }}>
+                            style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: 'none',
+                              background: '#FF6B9D', color: '#fff', fontSize: 11.5, fontWeight: 700,
+                              cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 1px 3px rgba(255,107,157,.3)' }}>
                             ⚖️ ปรับยอด
                           </button>
                         )}
                         <button onClick={e => { e.stopPropagation(); openLotPopup(item, itemLots, warnLots, qty) }}
-                          style={{ flex: 1, minWidth: 80, padding: '6px 10px', borderRadius: 8,
-                            border: '1px solid #FFD4E0', background: '#fff', color: '#C2185B',
-                            fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                          style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: '1px solid #FFD4E0',
+                            background: '#fff', color: '#C2185B', fontSize: 11.5, fontWeight: 700,
+                            cursor: 'pointer', whiteSpace: 'nowrap' }}>
                           📦 LOT ({itemLots.length})
                         </button>
                         <button onClick={e => { e.stopPropagation(); setHistoryItem(item) }}
-                          style={{ flex: 1, minWidth: 80, padding: '6px 10px', borderRadius: 8,
-                            border: '1px solid #DBEAFE', background: '#fff', color: '#1D4ED8',
-                            fontSize: 11, fontWeight: 700, cursor: 'pointer' }}
+                          style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: '1px solid #DBEAFE',
+                            background: '#fff', color: '#1D4ED8', fontSize: 11.5, fontWeight: 700,
+                            cursor: 'pointer', whiteSpace: 'nowrap' }}
                           title="ดูประวัติย้อนหลังทุกเหตุการณ์">
                           👓 ประวัติ
                         </button>
@@ -1573,11 +1608,26 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
     }
     const meta = typeMap[m.type] || { icon: '📝', label: m.type || 'บันทึก', color: '#6B7280', bg: '#F3F4F6', delta: 0 }
     const whName = warehouses.find(w => w.id === m.warehouseId)?.name || m.warehouseId || ''
-    // ใช้ qtyUse + unitUse ก่อน (ตรงกับสิ่งที่ผู้ใช้กรอก) — fallback ไป qty/unit
+    // เลือกหน่วยแสดงที่ตรงกับ user input
+    //   - ถ้า qty เป็นจำนวนเต็ม (≥1) → user ปรับใน unitBase (เช่น +2 แพ็ค) → ใช้ qty + unit
+    //   - ถ้า qty เป็นเศษ (<1 หรือไม่ใช่ int) → user ปรับใน unitUse (เช่น +1 กระป๋อง) → ใช้ qtyUse + unitUse
+    const absQty = Math.abs(Number(m.qty || 0))
+    const absQtyUse = Math.abs(Number(m.qtyUse || 0))
+    const qtyIsCleanInt = absQty >= 1 && Math.abs(absQty - Math.round(absQty)) < 0.001 && m.unit
     const hasUse = m.qtyUse != null && m.qtyUse !== 0 && m.unitUse
-    const displayQ = hasUse ? Math.abs(Number(m.qtyUse)) : Math.abs(Number(m.qty || 0))
-    const displayU = hasUse ? m.unitUse : (m.unit || m.unitUse || item?.unitUse || '')
-    const qUse = hasUse ? Math.abs(Number(m.qtyUse)) : toQtyUse(m.qty || 0, m.unit)
+    let displayQ, displayU
+    if (qtyIsCleanInt) {
+      displayQ = absQty
+      displayU = m.unit
+    } else if (hasUse) {
+      displayQ = absQtyUse
+      displayU = m.unitUse
+    } else {
+      displayQ = absQty
+      displayU = m.unit || item?.unitUse || ''
+    }
+    // qUse สำหรับ math running balance — ใช้ qtyUse เสมอ
+    const qUse = hasUse ? absQtyUse : toQtyUse(m.qty || 0, m.unit)
     events.push({
       id: 'mv_' + m.id, ts, type: m.type, meta,
       qty: displayQ,
