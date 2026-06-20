@@ -12,6 +12,7 @@ import SeedStockModal from '../components/SeedStockModal'
 import DataSheetModal from '../components/DataSheetModal'
 import { COL } from '../constants/collections'
 import { beepAdd, beepRemove } from '../utils/audio'
+import { saveOrShareFile } from '../utils/download'
 
 const CAT_EMOJI = {
   'แยม': '🍓', 'ผลไม้': '🍑', 'ไซรัป': '🍯',
@@ -520,11 +521,12 @@ function SourcesModal({ open, onClose }) {
               /* inline edit mode */
               <>
                 <input autoFocus value={editVal} onChange={e => setEditVal(e.target.value)}
+                  onFocus={e => { const t = e.target; setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 80) }}
                   onKeyDown={e => { if (e.key === 'Enter') commitEdit(i); if (e.key === 'Escape') setEditIdx(null) }}
                   style={{ flex: 1, border: '1.5px solid var(--red)', borderRadius: 8,
                     padding: '5px 8px', fontSize: 13, outline: 'none', fontFamily: 'Sarabun' }} />
                 {iconBtn(() => commitEdit(i), '✓', '#16A34A')}
-                {iconBtn(() => setEditIdx(null), '✕')}
+                {iconBtn(() => setEditIdx(null), '×')}
               </>
             ) : (
               /* display mode */
@@ -1092,7 +1094,7 @@ function OpeningStockModal({ open, onClose, warehouses, items, onSaved }) {
                   value={search} onChange={e => setSearch(e.target.value)} />
                 {search && (
                   <button onClick={() => setSearch('')}
-                    style={{ border: 'none', background: 'none', cursor: 'pointer', padding: '0 6px', color: 'var(--txt3)', fontSize: 16 }}>✕</button>
+                    style={{ border: 'none', background: 'none', cursor: 'pointer', padding: '0 6px', color: 'var(--txt3)', fontSize: 16 }}>×</button>
                 )}
               </div>
               <select value={sortMode} onChange={e => setSortMode(e.target.value)}
@@ -1618,14 +1620,8 @@ export default function Settings() {
     return () => { u1(); u2(); u2b(); u3(); u4() }
   }, [])
 
-  async function saveWH() {
-    if (!whForm.name) return
-    const data = { ...whForm, active: true, isMain: whForm.type === 'main', branchCode: '', createdAt: serverTimestamp() }
-    if (editWH) await updateDoc(doc(db, COL.WAREHOUSES, editWH.id), data)
-    else await addDoc(collection(db, COL.WAREHOUSES), data)
-    setWhModal(false); setEditWH(null); setWhForm({ name: '', type: 'branch', color: WH_COLORS[0] })
-    setToast('✅ บันทึกคลังสินค้าเรียบร้อย')
-  }
+  // จัดการสาขา/คลัง ย้ายไป Hub ทั้งหมดแล้ว — modal นี้เหลือ read-only
+  // (saveWH เดิมถูกลบออก กันเผลอแก้ซ้อนกับ Hub)
 
   async function saveItem() {
     if (!itemForm.name) return
@@ -1859,7 +1855,7 @@ export default function Settings() {
         {/* รายละเอียดซ่อนเป็น tooltip — เอาเมาส์ชี้ (หรือแตะ ⓘ) เพื่อแสดง */}
         {desc && (
           <span className="setting-info" tabIndex={0}
-            onClick={e => e.stopPropagation()}>ⓘ
+            onClick={e => { e.stopPropagation(); e.currentTarget.classList.toggle('tip-open') }}>ⓘ
             <span className="setting-tip">{desc}</span>
           </span>
         )}
@@ -2033,9 +2029,9 @@ export default function Settings() {
             background: 'var(--bg)', border: '1px solid var(--border2)',
             borderRadius: 20, padding: '1px 8px', fontWeight: 700, fontSize: 10.5,
             color: 'var(--txt2)'
-          }}>v2.0.87</span>
+          }}>v{__APP_VERSION__}</span>
           <span>·</span>
-          <span>อัพเดท 2 มิ.ย. 2569</span>
+          <span>อัพเดท {__BUILD_DATE__}</span>
         </div>
       </div>
 
@@ -2056,10 +2052,9 @@ export default function Settings() {
         }}
       />
 
-      <Modal open={whModal} onClose={() => { setWhModal(false); setEditWH(null) }} title="จัดการคลังสินค้า"
-        footer={isOwner() && <button className="btn-primary" onClick={saveWH}>บันทึก</button>}>
+      <Modal open={whModal} onClose={() => { setWhModal(false); setEditWH(null) }} title="จัดการคลังสินค้า">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {/* List */}
+          {/* List — ดูอย่างเดียว (เพิ่ม/แก้/ลบ ย้ายไป Hub) */}
           {warehouses.map(w => (
             <div key={w.id} style={{ display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
@@ -2068,41 +2063,16 @@ export default function Settings() {
                 <div style={{ fontWeight: 700, fontSize: 14 }}>{w.name}</div>
                 <div style={{ fontSize: 11, color: 'var(--txt3)' }}>{w.type === 'main' ? 'คลังหลัก' : 'สาขา'}</div>
               </div>
-              {isOwner() && (
-                <button style={{ border: 'none', background: 'none', fontSize: 14, cursor: 'pointer' }}
-                  onClick={() => { setEditWH(w); setWhForm({ name: w.name, type: w.type, color: w.color }) }}>
-                  ✏️
-                </button>
-              )}
             </div>
           ))}
-          {isOwner() && (
-            <>
-              <div style={{ fontWeight: 700, fontSize: 13, marginTop: 8 }}>
-                {editWH ? `แก้ไข: ${editWH.name}` : '+ เพิ่มคลัง'}
-              </div>
-              <div>
-                <label className="fi-label">ชื่อคลัง</label>
-                <input className="fi" value={whForm.name} onChange={e => setWhForm(f => ({ ...f, name: e.target.value }))} placeholder="เช่น ร้าน ITU" />
-              </div>
-              <div>
-                <label className="fi-label">ประเภท</label>
-                <select className="fi" value={whForm.type} onChange={e => setWhForm(f => ({ ...f, type: e.target.value }))}>
-                  <option value="main">คลังหลัก</option>
-                  <option value="branch">สาขา</option>
-                </select>
-              </div>
-              <div>
-                <label className="fi-label">สี</label>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  {WH_COLORS.map(c => (
-                    <button key={c} onClick={() => setWhForm(f => ({ ...f, color: c }))}
-                      style={{ width: 32, height: 32, borderRadius: '50%', background: c, border: whForm.color === c ? '3px solid var(--txt)' : '2px solid transparent', cursor: 'pointer' }} />
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
+          {/* ย้ายการจัดการสาขาไป Hub — รายการนี้ซิงค์จาก Hub real-time (collection เดียวกัน) */}
+          <div style={{ background: '#EFF6FF', border: '1px solid #BFDBFE', borderRadius: 12,
+            padding: '12px 14px', fontSize: 12.5, color: '#1E40AF', lineHeight: 1.55 }}>
+            ℹ️ การ <strong>เพิ่ม / แก้ไข / ลบสาขา</strong> ย้ายไปที่ <strong>Hub → ตั้งค่า → จัดการสาขา</strong> แล้ว
+            <div style={{ marginTop: 4, color: '#3B82F6', fontSize: 11.5 }}>
+              🔄 รายการด้านบนซิงค์จาก Hub อัตโนมัติ (แก้ที่ Hub แล้วเด้งที่นี่ทันที)
+            </div>
+          </div>
         </div>
       </Modal>
 
@@ -2134,7 +2104,7 @@ export default function Settings() {
             {itemSearch && (
               <button onClick={() => setItemSearch('')}
                 style={{ border: 'none', background: 'none', color: '#8E8E93',
-                  fontSize: 15, cursor: 'pointer', padding: '0 8px', lineHeight: 1 }}>✕</button>
+                  fontSize: 15, cursor: 'pointer', padding: '0 8px', lineHeight: 1 }}>×</button>
             )}
           </div>
 
@@ -2779,7 +2749,7 @@ export default function Settings() {
                       <button onClick={() => setItemForm(f => ({ ...f, displayName: '' }))}
                         style={{ fontSize: 11, color: '#8E8E93', background: '#F2F2F7', border: 'none',
                           borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontFamily: 'Sarabun' }}>
-                        ✕ ใช้ชื่อเดียวกับ CM
+                        × ใช้ชื่อเดียวกับ CM
                       </button>
                     )}
                   </div>
@@ -3299,7 +3269,7 @@ export default function Settings() {
                         <span style={{ fontSize: 11, color: 'var(--txt3)', marginLeft: 2 }}>{found.unitUse}</span>
                       </div>
                       <button onClick={() => setTplForm(f => ({ ...f, items: f.items.filter(x => x.itemId !== ti.itemId) }))}
-                        style={{ border: 'none', background: 'none', fontSize: 16, cursor: 'pointer', color: '#FF3B30', padding: '0 4px' }}>✕</button>
+                        style={{ border: 'none', background: 'none', fontSize: 16, cursor: 'pointer', color: '#FF3B30', padding: '0 4px' }}>×</button>
                     </div>
                   )
                 })}
@@ -3541,7 +3511,7 @@ export default function Settings() {
                 <div style={{ fontSize: 12, color: 'var(--txt3)' }}>{sys.desc}</div>
               </div>
               <span className={`badge badge-${sys.ok ? 'ok' : 'out'}`}>
-                {sys.ok ? '✓ เชื่อมต่อ' : '✕ ไม่ได้เชื่อม'}
+                {sys.ok ? '✓ เชื่อมต่อ' : '× ไม่ได้เชื่อม'}
               </span>
             </div>
           ))}
@@ -3751,13 +3721,7 @@ function ExportModalV2({ open, onClose, onSuccess }) {
         return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g,'""')}"` : s
       }).join(',')),
     ].join('\n')
-    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
+    return saveOrShareFile(filename, '﻿' + csv, 'text/csv;charset=utf-8;')
   }
 
   async function handleExport() {
