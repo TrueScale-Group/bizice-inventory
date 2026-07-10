@@ -2,7 +2,7 @@ import { ConnectionStatus } from './ConnectionStatus'
 import NotifBell from './NotifBell'
 
 function goHome() {
-  window.top.location.href = 'https://truescale-group.github.io/mixue-ice-sakon/'
+  window.top.location.href = 'https://bizice.web.app'
 }
 
 // Hard refresh — ล้าง Service Worker cache + unregister SW แล้ว reload (โหลดเวอร์ชันใหม่ล่าสุด)

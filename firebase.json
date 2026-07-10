@@ -1,0 +1,16 @@
+{
+  "hosting": {
+    "site": "bizice-inventory",
+    "public": "dist",
+    "ignore": [
+      "firebase.json",
+      ".firebaserc",
+      "**/.*",
+      "**/.*/**",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      { "source": "**", "destination": "/index.html" }
+    ]
+  }
+}

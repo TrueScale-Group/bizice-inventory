@@ -28,7 +28,7 @@ function injectSwVersion(version) {
 
 export default defineConfig({
   plugins: [react(), injectSwVersion(pkg.version)],
-  base: '/bizice-inventory/',
+  base: '/',   // .web.app deploy = root · (github.io เดิม '/bizice-inventory/' อยู่ branch main)
   build: { outDir: 'dist' },
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),

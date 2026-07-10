@@ -78,7 +78,7 @@ export default function App() {
   useEffect(() => {
     if (!window.__invBackStack) window.__invBackStack = []
     window.history.pushState({ inv: 1 }, '')   // guard entry กันหลุดออก
-    const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/'
+    const HUB = 'https://bizice.web.app'
     const reguard = () => window.history.pushState({ inv: 1 }, '')
     const onPop = () => {
       const stack = window.__invBackStack

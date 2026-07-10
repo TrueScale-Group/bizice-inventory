@@ -5,6 +5,7 @@ import {
   persistentMultipleTabManager,
 } from 'firebase/firestore'
 import { getFunctions, httpsCallable } from 'firebase/functions'
+import { getAuth } from 'firebase/auth'
 
 const firebaseConfig = {
   apiKey: 'AIzaSyDRs60WURPcNArQXl5RRuwqJcLjtN3CMe4',
@@ -16,6 +17,10 @@ const firebaseConfig = {
 }
 
 const app = initializeApp(firebaseConfig)
+
+// 🔐 Auth — ใช้สำหรับ SSO bootstrap (signInWithCustomToken จาก Hub) → มี request.auth จริง
+//    รองรับ Firestore role-based rules · ใช้ firebaseConfig ตัวเดิม ไม่สร้าง app ใหม่
+export const auth = getAuth(app)
 
 // 📱 Offline persistence — แคชข้อมูล Firestore ลง IndexedDB
 //    เปิด multi-tab support → หลายแท็บใช้แคชเดียวกันได้

@@ -1,5 +1,5 @@
 function goHome() {
-  window.top.location.href = 'https://truescale-group.github.io/mixue-ice-sakon/'
+  window.top.location.href = 'https://bizice.web.app'
 }
 
 // Hard refresh — ล้าง cache + unregister SW แล้วโหลดใหม่ (เหมือน Cost Manager)
