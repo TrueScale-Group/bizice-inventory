@@ -88,6 +88,12 @@
           };
         }
 
+        // 🧪 localhost dev bypass — เข้าทดสอบได้โดยไม่ต้อง login/ผ่าน Hub
+        //    เช็ค hostname ตรงๆ (ไม่ใช้ env var) → production (github.io / .web.app) เข้าเงื่อนไขนี้ไม่ได้เด็ดขาด
+        if ((!s || !s.name) && (location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+          s = { name: 'Dev Tester', phone: '0000000000', role: 'owner' };
+        }
+
         if (!s || !s.name) { window.location.replace(HUB); return; }
         if (s.expiry && Date.now() > s.expiry) {
           localStorage.removeItem('bizice_session');

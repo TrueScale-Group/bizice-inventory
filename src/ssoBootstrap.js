@@ -29,8 +29,17 @@ export async function ssoBootstrap() {
     const off = onAuthStateChanged(auth, u => { off(); res(u) })
   })
 
+  // 🧪 localhost dev bypass — เข้าทดสอบได้โดยไม่ต้อง auth/ผ่าน Hub
+  //    เช็ค hostname ตรงๆ (ไม่ใช้ env var) → production (github.io / .web.app) เข้าเงื่อนไขนี้ไม่ได้เด็ดขาด
+  const isLocalDev = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+
   // ไม่มี user = ไม่ได้เข้าทาง Hub (หรือ token หมดอายุ) → เด้งกลับ Hub ให้ mint ใหม่
   if (!user) {
+    if (isLocalDev) {
+      // localhost = ให้ render แอพต่อ (ไม่มี request.auth จริง — Firestore rules ที่บังคับ auth จะ fail ตามคาด)
+      console.warn('[SSO] localhost dev — ข้าม auth, ไม่มี request.auth')
+      return {}
+    }
     location.href = HUB_URL
     return null
   }
