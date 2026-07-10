@@ -73,7 +73,7 @@ export default function MinStockEditModal({
         {warehouses.map(w => (
           <div key={w.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div style={{ flex: 1, fontSize: 14, fontWeight: 600, color: 'var(--txt)' }}>{w.name}</div>
-            <input type="number" value={values[w.id] ?? 0}
+            <input type="number" inputMode="decimal" value={values[w.id] ?? 0}
               onChange={e => setValues(v => ({ ...v, [w.id]: e.target.value }))}
               min="0" step="any"
               style={{ width: 100, padding: '8px 12px', borderRadius: 10,

@@ -3,10 +3,12 @@
    Strategy:
    • App shell (HTML, JS, CSS, images) → cache-first + network-revalidate
    • Firestore / Firebase / Google APIs → ผ่านตรงๆ (Firebase ใช้ IndexedDB ของตัวเองอยู่แล้ว)
-   • อัปเดต SW เมื่อ deploy ใหม่ → bump CACHE_VERSION
+   • อัปเดต SW เมื่อ deploy ใหม่ → เลขแคช = เวอร์ชันแอพอัตโนมัติ (ไม่ต้องแก้มือ)
 */
 
-const CACHE_VERSION = 'bizice-inv-v2.0.36'
+// __APP_VERSION__ ถูกแทนด้วยเวอร์ชันจาก package.json ตอน build (ดู vite.config.js)
+// → เลขแคชตรงกับเวอร์ชันแอพเสมอ เหลือ bump ที่ package.json ที่เดียว
+const CACHE_VERSION = 'bizice-inv-v__APP_VERSION__'
 const APP_SHELL = [
   './',
   './index.html',

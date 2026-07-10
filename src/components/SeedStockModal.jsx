@@ -3,8 +3,10 @@ import { db } from '../firebase'
 import { writeBatch, doc, collection, serverTimestamp } from 'firebase/firestore'
 import { Modal } from './Modal'
 import { COL } from '../constants/collections'
-import { parseConvFactor, balanceId } from '../utils/unit'
+import { parseConvFactor, balanceId, qtyToUse } from '../utils/unit'
 import { beepSuccess } from '../utils/audio'
+import { saveOrShareFile } from '../utils/download'
+import { sortByMaster } from '../utils/sortItems'
 
 /**
  * SeedStockModal — Owner only · seed stock_balances ครั้งเดียว
@@ -110,9 +112,10 @@ function parseQtyString(str, item) {
         warnings.push(`no convSub for ${unit}`)
       }
     } else {
-      // ไม่ตรง — ลองใช้ factor ถ้าน่าจะเป็นหน่วยใหญ่
-      warnings.push(`unknown unit "${unit}"`)
-      total += n * factor   // assume unitBase
+      // ลองแปลงผ่าน unitLevels (รองรับหน่วยกลาง เช่น "มัด")
+      const viaLevels = qtyToUse(n, unit, item)
+      total += viaLevels
+      if (viaLevels === n) warnings.push(`unknown unit "${unit}" → ถือเป็น ${item?.unitUse || 'unitUse'}`)
     }
   }
 
@@ -140,7 +143,8 @@ function escapeCsv(s) {
 
 function buildTemplateCSV(items) {
   const header = ['ชื่อ','หน่วยซื้อ','หน่วยใช้','หน่วยชั่ง','อัตราแปลง','qty_หน่วยซื้อ','qty_หน่วยใช้','qty_หน่วยชั่ง','min_stock']
-  const rows = items.map(i => [
+  // เรียงตาม Master Data (catOrder ไม่มีใน scope → fallback CAT_ORDER)
+  const rows = sortByMaster(items).map(i => [
     i.name || '',
     i.unitBase || '',
     i.unitUse || '',
@@ -201,13 +205,7 @@ function csvRowsToText(rows) {
 }
 
 function downloadFile(filename, content, mime = 'text/csv;charset=utf-8;') {
-  const blob = new Blob([content], { type: mime })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
+  return saveOrShareFile(filename, content, mime)
 }
 
 export default function SeedStockModal({ open, onClose, items = [], warehouses = [],

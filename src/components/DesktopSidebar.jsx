@@ -2,6 +2,25 @@ function goHome() {
   window.top.location.href = 'https://truescale-group.github.io/mixue-ice-sakon/'
 }
 
+// Hard refresh — ล้าง cache + unregister SW แล้วโหลดใหม่ (เหมือน Cost Manager)
+async function hardRefresh() {
+  try {
+    if ('caches' in window) {
+      const keys = await caches.keys()
+      await Promise.all(keys.map(k => caches.delete(k)))
+    }
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations()
+      await Promise.all(regs.map(r => r.unregister()))
+    }
+  } catch (e) { console.warn('[hardRefresh]', e) }
+  finally {
+    const url = new URL(window.location.href)
+    url.searchParams.set('_r', Date.now().toString())
+    window.location.replace(url.toString())
+  }
+}
+
 const NAV_ITEMS = [
   { key: 'dashboard', icon: '📊', label: 'แดชบอร์ด' },
   { key: 'warehouse', icon: '🏪', label: 'คลังสินค้า' },
@@ -13,7 +32,7 @@ const NAV_ITEMS = [
 export default function DesktopSidebar({ tab, onChange }) {
   const session = window._bizSession || {}
   const name    = session.name  || 'ผู้ใช้งาน'
-  const role    = session.role  || 'viewer'
+  const role    = (session.role || 'viewer').toLowerCase()
   const initial = name.charAt(0).toUpperCase()
   // รูปโปรไฟล์จาก Hub: s.photo → bizice_avatar_<phone> (same-origin)
   const photo   = session.photo ||
@@ -21,14 +40,12 @@ export default function DesktopSidebar({ tab, onChange }) {
 
   // role badge colour
   const roleColor = role === 'owner'  ? '#E31E24' :
+                    role === 'admin'  ? '#7C3AED' :
                     role === 'editor' ? '#0284C7' : '#6B7280'
-  const roleLabel = role === 'owner'  ? 'Owner' :
-                    role === 'editor' ? 'Editor' : 'Viewer'
-
-  // today Thai short date
-  const today = new Date().toLocaleDateString('th-TH', {
-    day: 'numeric', month: 'short',
-  })
+  // role + emoji: 👑 Owner · 🛡️ Admin · ✏️ Editor · 👁️ Viewer
+  const roleLabel = role === 'owner'  ? '👑 Owner' :
+                    role === 'admin'  ? '🛡️ Admin' :
+                    role === 'editor' ? '✏️ Editor' : '👁️ Viewer'
 
   return (
     <aside className="desk-sidebar">
@@ -39,7 +56,7 @@ export default function DesktopSidebar({ tab, onChange }) {
         </div>
         <div>
           <div className="dsb-brand-name">Mixue Inventory</div>
-          <div className="dsb-brand-sub">BizICE · Stock Manager</div>
+          <div className="dsb-brand-sub">BizICE · ระบบจัดการคลังสินค้า</div>
         </div>
       </div>
 
@@ -75,11 +92,12 @@ export default function DesktopSidebar({ tab, onChange }) {
           : { background: roleColor }}>
           {photo ? '' : initial}
         </div>
-        <div>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <div className="dsb-user-name">{name}</div>
           <div className="dsb-user-role">{roleLabel}</div>
         </div>
-        <div className="dsb-date">{today}</div>
+        <button className="dsb-refresh-btn" onClick={hardRefresh}
+          title="Hard Refresh — ล้างแคชและโหลดใหม่">🔄</button>
       </div>
     </aside>
   )

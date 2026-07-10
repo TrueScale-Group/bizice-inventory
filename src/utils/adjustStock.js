@@ -20,6 +20,7 @@ import {
 } from 'firebase/firestore'
 import { COL } from '../constants/collections'
 import { convertToBase, balanceId } from './unit'
+import { fetchLotsForWarehouse, planFifoConsume, applyFifoConsume, addLot, writeLotShortage } from './lotFifo'
 
 export async function adjustStock({
   itemId, itemName, warehouseId, qtyUse, direction, reason, item,
@@ -46,6 +47,19 @@ export async function adjustStock({
     lastUpdated:   now,
     lastUpdatedBy: staffPhone,
   }, { merge: true })
+
+  // 1b. sync LOT: เพิ่ม → สร้างล็อตใหม่ · ลด → หัก FIFO (atomic ใน batch เดียว)
+  //     ข้ามถ้า item ปิดระบบ LOT (lotEnabled=false ใน Master Data — ของไม่มีวันหมดอายุ)
+  if (item?.lotEnabled !== false) {
+    if (direction === 'add') {
+      addLot(batch, { itemId, itemName, warehouseId, qtyUse, source: `ปรับยอด(+) · ${reason}` })
+    } else {
+      const workingLots = await fetchLotsForWarehouse(warehouseId)
+      const { allocations, shortage } = planFifoConsume(workingLots, { itemId, warehouseId, qtyUse })
+      applyFifoConsume(batch, allocations, warehouseId)
+      if (shortage > 0) writeLotShortage(batch, { itemId, itemName, warehouseId, shortage, unitUse, reasonType: 'ปรับยอด(-)', note: reason })
+    }
+  }
 
   // 2. stock_movements type='adjust'
   const movRef = doc(collection(db, COL.STOCK_MOVEMENTS))

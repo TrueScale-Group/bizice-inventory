@@ -1,4 +1,5 @@
 import { ConnectionStatus } from './ConnectionStatus'
+import WarehouseCycle from './WarehouseCycle'
 
 const TAB_LABEL = {
   dashboard: 'แดชบอร์ด',
@@ -8,7 +9,7 @@ const TAB_LABEL = {
   settings:  'ตั้งค่า',
 }
 
-export default function DesktopContentBar({ tab }) {
+export default function DesktopContentBar({ tab, warehouses = [], wh, setWh, includeAll = true, locked = false }) {
   const now = new Date()
   const dateStr = now.toLocaleDateString('th-TH', {
     weekday: 'long', day: 'numeric', month: 'long',
@@ -18,6 +19,8 @@ export default function DesktopContentBar({ tab }) {
     hour: '2-digit', minute: '2-digit',
   })
 
+  const showCycle = tab !== 'settings' && warehouses.length > 0
+
   return (
     <div className="desk-content-bar">
       {/* วันที่ + เวลา */}
@@ -26,9 +29,11 @@ export default function DesktopContentBar({ tab }) {
         <span className="dcb-sep">·</span>
         <span className="dcb-date">{dateStr}</span>
         <span className="dcb-time">{timeStr} น.</span>
+        {showCycle && (
+          <WarehouseCycle warehouses={warehouses} value={wh} onChange={setWh} includeAll={includeAll} locked={locked} />
+        )}
       </div>
 
-      {/* Online status */}
       <div className="desk-content-bar-right">
         <ConnectionStatus />
       </div>

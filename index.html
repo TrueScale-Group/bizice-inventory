@@ -10,7 +10,11 @@
   <meta name="theme-color" id="meta-theme-color" content="#E31E24" />
   <link rel="manifest" href="/bizice-inventory/manifest.json" />
   <link rel="icon" type="image/png" href="./icon-inventory.png" />
-  <link rel="apple-touch-icon" href="./icon-inventory.png" />
+  <!-- apple-touch-icon: iOS อยากได้ขนาดเฉพาะ (180 iPhone · 167 iPad Pro · 152 iPad) จะคมกว่า/โหลดเบากว่าไฟล์ 2048px -->
+  <link rel="apple-touch-icon" sizes="180x180" href="./icon-inventory-180.png" />
+  <link rel="apple-touch-icon" sizes="167x167" href="./icon-inventory-167.png" />
+  <link rel="apple-touch-icon" sizes="152x152" href="./icon-inventory-152.png" />
+  <link rel="apple-touch-icon" href="./icon-inventory-180.png" />
   <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&family=Sarabun:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <title>Mixue Inventory</title>
   <style>
@@ -69,6 +73,7 @@
   <script>
     (function () {
       const HUB = 'https://truescale-group.github.io/mixue-ice-sakon/';
+      const TTL = 30 * 86400000;   // 30 วัน — กัน iOS ITP ลบ storage / หมดอายุเร็วจนหลุดบ่อย
       try {
         const params = new URLSearchParams(location.search);
         let s = JSON.parse(localStorage.getItem('bizice_session') || 'null');
@@ -80,9 +85,7 @@
             name: decodeURIComponent(params.get('user') || 'ผู้ใช้'),
             phone: decodeURIComponent(params.get('phone') || ''),
             role: params.get('mode') === 'owner' ? 'owner' : params.get('mode') === 'editor' ? 'editor' : 'viewer',
-            expiry: Date.now() + 86400000
           };
-          try { localStorage.setItem('bizice_session', JSON.stringify(s)); } catch(e){}
         }
 
         if (!s || !s.name) { window.location.replace(HUB); return; }
@@ -91,6 +94,9 @@
           window.location.replace(HUB);
           return;
         }
+        // sliding expiry — ต่ออายุทุกครั้งที่เปิดใช้ (active use ช่วยกัน iOS ITP 7 วันด้วย)
+        s.expiry = Date.now() + TTL;
+        try { localStorage.setItem('bizice_session', JSON.stringify(s)); } catch(e){}
         window._bizSession = s;
         window._bizMode = params.get('mode') || s.role || 'viewer';
       } catch (e) { window.location.replace(HUB); }

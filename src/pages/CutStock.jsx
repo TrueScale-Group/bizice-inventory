@@ -5,12 +5,15 @@ import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { Toast } from '../components/Toast'
 import { useSession } from '../hooks/useSession'
+import { useItems, useItemsLoaded } from '../hooks/useItems'
+import { useStockBalances } from '../hooks/useStock'
 import { useOnline }  from '../hooks/useOnline'
 import { beepClick, beepSuccess, beepAdd, beepRemove } from '../utils/audio'
 import { toDateKey, toThaiTime } from '../utils/formatDate'
 import { COL } from '../constants/collections'
 import { cutStock } from '../utils/cutStock'
 import { formatStockQty, balanceId } from '../utils/unit'
+import { CAT_ORDER } from '../utils/sortItems'
 
 const CATS = [
   { id: 'fav',        name: 'ของฉัน',    emoji: '⭐' },
@@ -20,11 +23,12 @@ const CATS = [
   { id: 'ไซรัป',     name: 'ไซรัป',      emoji: '🍯' },
   { id: 'ท็อปปิ้ง',  name: 'ท็อปปิ้ง',  emoji: '💎' },
   { id: 'วัตถุดิบ',  name: 'วัตถุดิบ',   emoji: '🥛' },
+  { id: 'ขนม',       name: 'ขนม',        emoji: '🍪' },
   { id: 'บรรจุภัณฑ์', name: 'บรรจุ',    emoji: '🥤' },
   { id: 'อื่นๆ', name: 'อื่นๆ', emoji: '🔖' },
 ]
 
-export default function CutStock() {
+export default function CutStock({ wh: shopWH, setWh: setShopWH, warehouses }) {
   const { name, phone, isEditor } = useSession()
   const online = useOnline()
   const canEdit = isEditor() && online   // ❌ offline → ห้ามแก้ไข
@@ -33,45 +37,28 @@ export default function CutStock() {
   const [loading, setLoading] = useState(true)
   const [cat, setCat] = useState('all')
   const [search, setSearch] = useState('')
-  const [items, setItems] = useState([])
-  const [balances, setBalances] = useState([])
+  const items = useItems()                 // shared singleton — ลด Inv_items reads
+  const itemsLoaded = useItemsLoaded()
+  const balances = useStockBalances(shopWH) // shared singleton (กรองสาขา) — ลด stock_balances reads
   const [templates, setTemplates] = useState([])
-  const [warehouses, setWarehouses] = useState([])
-  const [staffList, setStaffList] = useState([])
   const [cart, setCart] = useState({})
   const [faves, setFaves] = useState(() => new Set(JSON.parse(localStorage.getItem(FAVES_KEY) || '[]')))
   const [cartOpen, setCartOpen] = useState(false)
   const [patternOpen, setPatternOpen] = useState(false)
-  const [shopWH, setShopWH] = useState('')
   const [selectedStaff, setSelectedStaff] = useState(name)
   const [toast, setToast] = useState('')
   const [confirmLoading, setConfirmLoading] = useState(false)
   const [cutNote, setCutNote] = useState('')
 
-  // Items, templates, warehouses — ไม่ขึ้นกับ warehouse ที่เลือก
+  // items มาจาก useItems() (shared) — เคลียร์ loading เมื่อโหลดเสร็จ
+  useEffect(() => { if (itemsLoaded) setLoading(false) }, [itemsLoaded])
+  // templates — ไม่ขึ้นกับ warehouse ที่เลือก
   useEffect(() => {
-    const u1 = onSnapshot(collection(db, COL.ITEMS), snap => { setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))); setLoading(false) })
     const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0))))
-    const u4 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
-      const whs = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
-      setWarehouses(whs)
-      if (!shopWH && whs.length > 0) {
-        const shop = whs.find(w => w.type === 'shop' || w.isShop === true)
-          || whs.find((_, i) => i > 0)
-          || whs[0]
-        setShopWH(shop.id)
-      }
-    })
-    return () => { u1(); u3(); u4() }
+    return () => { u3() }
   }, [])
 
-  // Stock balances — filter เฉพาะ warehouse ที่เลือก ลด reads ~50%
-  useEffect(() => {
-    if (!shopWH) return
-    const q = query(collection(db, COL.STOCK_BALANCES), where('warehouseId', '==', shopWH))
-    const unsub = onSnapshot(q, snap => setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
-    return () => unsub()
-  }, [shopWH])
+  // Stock balances — มาจาก useStockBalances(shopWH) shared singleton (ดูบรรทัดประกาศด้านบน)
 
   function getStock(itemId) {
     const total = balances.filter(b => b.itemId === itemId && b.warehouseId === shopWH)
@@ -208,7 +195,10 @@ export default function CutStock() {
     if (cat !== 'all' && cat !== 'fav' && !search.trim()) return i.category === cat
     return true
   }).sort((a, b) => {
-    // เรียงตาม sortOrder (จาก Settings → "ลากเพื่อเรียงลำดับ")
+    // เรียงตาม Master Data: ตำแหน่งหมวด (CAT_ORDER) → sortOrder → name
+    const cia = CAT_ORDER.indexOf(a.category); const ca = cia < 0 ? 999 : cia
+    const cib = CAT_ORDER.indexOf(b.category); const cb = cib < 0 ? 999 : cib
+    if (ca !== cb) return ca - cb
     const oa = a.sortOrder ?? 999
     const ob = b.sortOrder ?? 999
     if (oa !== ob) return oa - ob
@@ -237,70 +227,49 @@ export default function CutStock() {
         </div>
       )}
 
-      {/* Sub-header */}
-      <div className="page-subbar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span className="subbar-title">ตัดสต็อก</span>
-          <button style={{ border: '1.5px solid var(--border2)', borderRadius: 20, padding: '3px 10px',
-            fontSize: 12, fontWeight: 700, background: 'var(--surf2)', cursor: 'pointer' }}
-            onClick={() => {
-              const next = warehouses[(warehouses.findIndex(w => w.id === shopWH) + 1) % (warehouses.length || 1)]
-              if (next) setShopWH(next.id)
-            }}>
-            🏪 {warehouses.find(w => w.id === shopWH)?.name || 'เลือกสาขา'}
-          </button>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer' }}
-            onClick={() => setPatternOpen(true)}>📊</button>
-          {canEdit && (
-            <button onClick={() => cartCount > 0 && setCartOpen(true)}
-              title={cartCount > 0 ? 'กดเพื่อยืนยันตัดสต็อก' : 'ตะกร้าว่าง'}
-              style={{
-                background: cartCount > 0 ? 'var(--red)' : 'transparent',
-                border: cartCount > 0 ? '2px solid var(--red-d)' : '2px solid transparent',
-                borderRadius: 12,
-                padding: cartCount > 0 ? '6px 12px' : '6px',
-                fontSize: 18,
-                cursor: cartCount > 0 ? 'pointer' : 'default',
-                position: 'relative',
-                transition: 'all .15s',
-                boxShadow: cartCount > 0 ? '0 2px 8px rgba(227,30,36,0.35)' : 'none',
-                animation: cartCount > 0 ? 'cartPulse 1.6s ease-in-out infinite' : 'none',
-              }}>
-              <span style={{ filter: cartCount > 0 ? 'grayscale(0) brightness(1.5)' : 'none' }}>🛒</span>
-              {cartCount > 0 && (
-                <span style={{ position: 'absolute', top: -6, right: -6, background: '#fff',
-                  color: 'var(--red)', borderRadius: '50%', width: 18, height: 18, fontSize: 10,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700,
-                  border: '2px solid var(--red-d)' }}>
-                  {cartCount}
-                </span>
-              )}
-            </button>
-          )}
-        </div>
-        <style>{`@keyframes cartPulse{
-          0%,100%{box-shadow:0 2px 8px rgba(227,30,36,0.35)}
-          50%{box-shadow:0 2px 16px rgba(227,30,36,0.7)}
-        }`}</style>
-      </div>
-
-      {/* Search */}
-      <div style={{ padding: '0 1rem', display: 'flex', alignItems: 'center', gap: 10 }}>
+      {/* Search + actions (ยุบหัว "ตัดสต็อก" · ย้ายไอคอน 📊 🛒 มาแถวค้นหา) */}
+      <div style={{ padding: '0 1rem', display: 'flex', alignItems: 'center', gap: 8 }}>
         <div className="search-wrap" style={{ margin: 0, flex: 1 }}>
           <span className="search-icon">🔍</span>
           <input className="search-input" placeholder="ค้นหาวัตถุดิบที่จะตัดสต็อก..."
             value={search} onChange={e => setSearch(e.target.value)} />
           {search && (
-            <button className="search-clear" onClick={() => setSearch('')} title="ล้าง">✕</button>
+            <button className="search-clear" onClick={() => setSearch('')} title="ล้าง">×</button>
           )}
         </div>
-        {search && (
-          <span style={{ fontSize: 12, color: 'var(--txt3)', whiteSpace: 'nowrap', fontWeight: 600 }}>
-            {filteredItems.length} รายการ
-          </span>
+        <button style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', flexShrink: 0, padding: 2 }}
+          title="เทมเพลตตัดสต็อก" onClick={() => setPatternOpen(true)}>📊</button>
+        {canEdit && (
+          <button onClick={() => cartCount > 0 && setCartOpen(true)}
+            title={cartCount > 0 ? 'กดเพื่อยืนยันตัดสต็อก' : 'ตะกร้าว่าง'}
+            style={{
+              flexShrink: 0,
+              background: cartCount > 0 ? 'var(--red)' : 'transparent',
+              border: cartCount > 0 ? '2px solid var(--red-d)' : '2px solid transparent',
+              borderRadius: 12,
+              padding: cartCount > 0 ? '6px 12px' : '6px',
+              fontSize: 20,
+              cursor: cartCount > 0 ? 'pointer' : 'default',
+              position: 'relative',
+              transition: 'all .15s',
+              boxShadow: cartCount > 0 ? '0 2px 8px rgba(227,30,36,0.35)' : 'none',
+              animation: cartCount > 0 ? 'cartPulse 1.6s ease-in-out infinite' : 'none',
+            }}>
+            <span style={{ filter: cartCount > 0 ? 'grayscale(0) brightness(1.5)' : 'none' }}>🛒</span>
+            {cartCount > 0 && (
+              <span style={{ position: 'absolute', top: -6, right: -6, background: '#fff',
+                color: 'var(--red)', borderRadius: '50%', width: 18, height: 18, fontSize: 10,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700,
+                border: '2px solid var(--red-d)' }}>
+                {cartCount}
+              </span>
+            )}
+          </button>
         )}
+        <style>{`@keyframes cartPulse{
+          0%,100%{box-shadow:0 2px 8px rgba(227,30,36,0.35)}
+          50%{box-shadow:0 2px 16px rgba(227,30,36,0.7)}
+        }`}</style>
       </div>
 
       {/* Quick templates */}
@@ -430,7 +399,7 @@ export default function CutStock() {
                   </div>
                 </div>
               </div>
-              <button className="sheet-close" onClick={() => !confirmLoading && setCartOpen(false)}>✕</button>
+              <button className="sheet-close" onClick={() => !confirmLoading && setCartOpen(false)}>×</button>
             </div>
 
             <div className="sheet-body" style={{ flex: 1, minHeight: 0, overflowY: 'auto', WebkitOverflowScrolling: 'touch', padding: '0 16px 8px' }}>
@@ -443,13 +412,19 @@ export default function CutStock() {
                   background: 'transparent', fontWeight: 600 }}
                   value={selectedStaff} onChange={e => setSelectedStaff(e.target.value)}>
                   <option value={name}>{name}</option>
-                  {staffList.map(s => <option key={s.phone} value={s.name}>{s.name}</option>)}
                 </select>
               </div>
 
               {/* Items — compact rows */}
               <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid var(--border)', marginBottom: 10 }}>
-                {Object.entries(cartByCategory).map(([category, list], ci) => (
+                {Object.entries(cartByCategory)
+                  // วนกลุ่มหมวดตามลำดับ Master Data (CAT_ORDER)
+                  .sort(([a], [b]) => {
+                    const ia = CAT_ORDER.indexOf(a); const ca = ia < 0 ? 999 : ia
+                    const ib = CAT_ORDER.indexOf(b); const cb = ib < 0 ? 999 : ib
+                    return ca - cb
+                  })
+                  .map(([category, list], ci) => (
                   <div key={category}>
                     <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt3)',
                       background: 'var(--bg)', padding: '4px 12px', letterSpacing: '0.5px',
@@ -484,7 +459,7 @@ export default function CutStock() {
                               style={{ width: 24, height: 24, borderRadius: 6, border: 'none',
                                 background: '#F2F2F7', color: 'var(--txt2)', fontWeight: 700,
                                 cursor: 'pointer', fontSize: 13 }}>−</button>
-                            <input type="number" value={qty} min="0"
+                            <input type="number" inputMode="decimal" value={qty} min="0"
                               onChange={e => {
                                 const n = parseFloat(e.target.value)
                                 if (!isFinite(n) || n <= 0) setQty(item.id, 0)
@@ -502,7 +477,7 @@ export default function CutStock() {
                               title="ลบรายการนี้"
                               style={{ width: 24, height: 24, borderRadius: 6, border: 'none',
                                 background: '#FEE2E2', color: '#DC2626', fontWeight: 700,
-                                cursor: 'pointer', fontSize: 11, marginLeft: 2 }}>✕</button>
+                                cursor: 'pointer', fontSize: 11, marginLeft: 2 }}>×</button>
                           </div>
                         </div>
                       )
@@ -569,17 +544,17 @@ function UsagePatternPopup({ open, onClose, warehouseId, items = [], balances = 
   useEffect(() => {
     if (!open || !warehouseId) return
     setLoading(true)
-    const today = new Date()
-    const start = new Date(today.getTime() - (days - 1) * 86400000)
     const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1)
+    const start    = new Date(); start.setDate(start.getDate() - days)
     const q = query(
       collection(db, COL.CUT_STOCK_LOGS),
       where('warehouseId', '==', warehouseId),
       where('date', '>=', fmt(start)),
-      where('date', '<=', fmt(today)),
+      where('date', '<=', fmt(yesterday)),
     )
     const unsub = onSnapshot(q, snap => {
-      setLogs(snap.docs.map(d => d.data()).filter(d => !d.deletedAt))
+      setLogs(snap.docs.map(d => d.data()).filter(d => !d.deletedAt && !d.cancelled))
       setLoading(false)
     })
     return () => unsub()
@@ -597,6 +572,8 @@ function UsagePatternPopup({ open, onClose, warehouseId, items = [], balances = 
           name: it.itemName,
           img: it.img || master?.img || '📦',
           unitUse: it.unitUse || master?.unitUse || '',
+          category: master?.category || 'อื่นๆ',
+          sortOrder: master?.sortOrder ?? 999,
           total: 0,
         }
       }
@@ -611,7 +588,18 @@ function UsagePatternPopup({ open, onClose, warehouseId, items = [], balances = 
       const current = bal?.qty || 0
       return { ...r, avgPerDay, suggestQty, current, gap: Math.max(0, suggestQty - current) }
     })
-    .sort((a, b) => b.total - a.total)
+    .sort((a, b) => {
+      const ca = CAT_ORDER.indexOf(a.category); const cb = CAT_ORDER.indexOf(b.category)
+      return ((ca < 0 ? 999 : ca) - (cb < 0 ? 999 : cb)) || (a.sortOrder - b.sortOrder)
+    })
+
+  // Group by category
+  const grouped = []
+  rows.forEach(r => {
+    const last = grouped[grouped.length - 1]
+    if (last && last.cat === r.category) { last.items.push(r) }
+    else { grouped.push({ cat: r.category, items: [r] }) }
+  })
 
   return (
     <Modal open={open} onClose={onClose} title="📊 รูปแบบการใช้งาน">
@@ -642,30 +630,50 @@ function UsagePatternPopup({ open, onClose, warehouseId, items = [], balances = 
         )}
 
         {!loading && rows.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600 }}>
-              📋 ใช้ทั้งหมด {rows.length} รายการ · แนะนำสั่งซื้อสำหรับสัปดาห์หน้า
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600, marginBottom: 4 }}>
+              📋 ใช้ทั้งหมด {rows.length} รายการ · {days} วันย้อนหลัง (ไม่รวมวันนี้)
             </div>
-            {rows.map(r => (
-              <div key={r.itemId} style={{ background: 'var(--bg)', borderRadius: 10,
-                padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
-                <span style={{ fontSize: 22 }}>{r.img}</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--txt)' }}>{r.name}</div>
-                  <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
-                    ใช้ {r.total.toFixed(1)} {r.unitUse} · เฉลี่ย {r.avgPerDay.toFixed(2)}/วัน
-                  </div>
+            {grouped.map(({ cat, items: catItems }) => (
+              <div key={cat}>
+                <div style={{ fontSize: 10, fontWeight: 800, color: 'var(--txt3)',
+                  textTransform: 'uppercase', letterSpacing: 1,
+                  padding: '8px 2px 4px', borderBottom: '1px solid var(--border)', marginBottom: 4 }}>
+                  {cat}
                 </div>
-                <div style={{ textAlign: 'right' }}>
-                  <div style={{ fontSize: 10, color: 'var(--txt3)' }}>แนะนำสั่ง</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--red)' }}>
-                    {r.suggestQty} {r.unitUse}
-                  </div>
-                  {r.gap > 0 && (
-                    <div style={{ fontSize: 10, color: '#D97706', fontWeight: 700 }}>
-                      ขาด {r.gap}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {catItems.map(r => (
+                    <div key={r.itemId} style={{ background: 'var(--bg)', borderRadius: 10,
+                      padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{ fontSize: 22 }}>{r.img}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--txt)' }}>{r.name}</div>
+                        <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                          ใช้ {r.total.toFixed(1)} {r.unitUse} · เฉลี่ย {r.avgPerDay.toFixed(2)}/วัน
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        {r.gap > 0 ? (
+                          <>
+                            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>สั่งเพิ่ม</div>
+                            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--red)' }}>
+                              {r.gap} {r.unitUse}
+                            </div>
+                            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
+                              เป้าหมาย {r.suggestQty}
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div style={{ fontSize: 16 }}>✅</div>
+                            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
+                              เป้าหมาย {r.suggestQty}
+                            </div>
+                          </>
+                        )}
+                      </div>
                     </div>
-                  )}
+                  ))}
                 </div>
               </div>
             ))}

@@ -22,6 +22,8 @@ export function useSession() {
     name: s.name || '',
     phone: s.phone || '',
     role: s.role || 'viewer',
+    branch_id: s.branch_id || '',
+    isStaff: () => s?.role === 'staff',
     // รูปโปรไฟล์จาก Hub: s.photo → bizice_avatar_<phone> (same-origin) → null
     photo: s.photo || (s.phone ? (() => { try { return localStorage.getItem('bizice_avatar_' + s.phone) } catch { return null } })() : null) || '',
     initials: (s.name || '?').replace(/^(พี่|น้อง|คุณ)/, '').trim().charAt(0) || '?',

@@ -1,21 +1,44 @@
 import { useState, useEffect } from 'react'
 import { db, sendHubPush } from '../firebase'
 import { collection, query, where, onSnapshot, orderBy, limit,
-         doc, getDoc, addDoc, updateDoc, serverTimestamp, Timestamp, writeBatch, increment } from 'firebase/firestore'
+         doc, getDoc, getDocs, addDoc, updateDoc, serverTimestamp, Timestamp, writeBatch, increment } from 'firebase/firestore'
 import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { Toast } from '../components/Toast'
 import { useSession } from '../hooks/useSession'
+import { useItems, useItemsLoaded } from '../hooks/useItems'
+import { useStockBalances } from '../hooks/useStock'
 import { toThaiDate, toThaiTime, lotDateStr, toDateKey } from '../utils/formatDate'
 import { COL } from '../constants/collections'
-import { sortLotsFIFO } from '../utils/fifo'
+import { sortLotsFIFO, formatDateDDMMYY } from '../utils/fifo'
+import { fetchLotsForWarehouse, planFifoConsume, applyFifoConsume, writeLotShortage, getLotAvail } from '../utils/lotFifo'
 import { beepAdd, beepRemove } from '../utils/audio'
-import { formatStockQty, balanceId, getStockStatus, parseConvFactor } from '../utils/unit'
+import { formatStockQty, balanceId, getStockStatus, parseConvFactor, qtyToUse, useToQty, unitOptionsOf } from '../utils/unit'
+import { sortByMaster } from '../utils/sortItems'
 
 const DEFAULT_SOURCES = ['ตลาดไท', 'ซัพพลายเออร์', 'โอนจากคลัง', 'ซื้อเอง', 'อื่นๆ']
 
-const CAT_ORDER = ['แยม','ผลไม้','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
-const CAT_EMOJI = { แยม:'🍓', ผลไม้:'🍋', ไซรัป:'🍯', ท็อปปิ้ง:'💎', วัตถุดิบ:'🥛', บรรจุภัณฑ์:'🥤', อื่นๆ:'🔖' }
+// บวกวัน/เดือนเข้าวันที่ (YYYY-MM-DD) → คืน YYYY-MM-DD (ใช้คำนวณวันหมดอายุจากวันผลิต)
+function addDateDuration(dateStr, value, unit) {
+  if (!dateStr || value === '' || value == null) return ''
+  const d = new Date(dateStr + 'T00:00:00')
+  const n = parseInt(value, 10)
+  if (isNaN(d.getTime()) || isNaN(n)) return ''
+  if (unit === 'month') d.setMonth(d.getMonth() + n)
+  else d.setDate(d.getDate() + n)
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), dd = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${dd}`
+}
+// จำนวนวันระหว่าง 2 วันที่ (YYYY-MM-DD) → คืน null ถ้าไม่ครบ
+function daysBetween(fromStr, toStr) {
+  if (!fromStr || !toStr) return null
+  const a = new Date(fromStr + 'T00:00:00'), b = new Date(toStr + 'T00:00:00')
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return null
+  return Math.round((b - a) / 86400000)
+}
+
+const CAT_ORDER = ['แยม','ผลไม้','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','ขนม','บรรจุภัณฑ์','อื่นๆ','สูตรผสม']
+const CAT_EMOJI = { แยม:'🍓', ผลไม้:'🍋', ไซรัป:'🍯', ท็อปปิ้ง:'💎', วัตถุดิบ:'🥛', ขนม:'🍪', บรรจุภัณฑ์:'🥤', อื่นๆ:'🔖' }
 const AV_COLORS = ['#6366F1','#E31E24','#0EA5E9','#16A34A','#F59E0B','#8B5CF6']
 
 const CATS = [
@@ -25,6 +48,7 @@ const CATS = [
   { id: 'ไซรัป', name: 'ไซรัป', emoji: '🍯' },
   { id: 'ท็อปปิ้ง', name: 'ท็อปปิ้ง', emoji: '💎' },
   { id: 'วัตถุดิบ', name: 'วัตถุดิบ', emoji: '🥛' },
+  { id: 'ขนม', name: 'ขนม', emoji: '🍪' },
   { id: 'บรรจุภัณฑ์', name: 'บรรจุ', emoji: '🥤' },
   { id: 'อื่นๆ', name: 'อื่นๆ', emoji: '🔖' },
 ]
@@ -60,7 +84,7 @@ function ItemPickerGrid({ items, balances, warehouseId, selectedId, selectedIds,
         <input className="search-input" placeholder="ค้นหา..." value={search}
           onChange={e => setSearch(e.target.value)} />
         {search && <button onClick={() => setSearch('')}
-          style={{ border: 'none', background: 'none', color: '#8E8E93', fontSize: 15, cursor: 'pointer', padding: '0 8px' }}>✕</button>}
+          style={{ border: 'none', background: 'none', color: '#8E8E93', fontSize: 15, cursor: 'pointer', padding: '0 8px' }}>×</button>}
       </div>
       {/* Sidebar + Grid */}
       <div style={{ display: 'flex', gap: 0, borderRadius: 12, border: '1px solid var(--border)', overflow: 'hidden' }}>
@@ -182,11 +206,9 @@ function UnitChips({ opts, selected, onChange }) {
   )
 }
 
-export default function Dashboard() {
+export default function Dashboard({ wh, setWh, warehouses, mainWarehouse = null }) {
   const { name, isEditor, isOwner } = useSession()
   const [loading, setLoading] = useState(true)
-  const [wh, setWh] = useState('')   // จะ default เป็น "สาขา" หลัง warehouses โหลด
-  const [warehouses, setWarehouses] = useState([])
   const [kpi, setKpi] = useState({ cost: 0, cuts: 0, low: 0, out: 0, wasteCost: 0, wasteCount: 0 })
   const [todayCutLogs, setTodayCutLogs] = useState([])
   const [cutSummaryOpen, setCutSummaryOpen] = useState(false)
@@ -194,8 +216,10 @@ export default function Dashboard() {
   const prevCutsRef = useState(0)
   const [alerts, setAlerts] = useState([])
   const [transfers, setTransfers] = useState([])
-  const [items, setItems] = useState([])
-  const [balances, setBalances] = useState([])
+  const items = useItems()                 // shared singleton — ลด Inv_items reads (เดิม subscribe เอง)
+  const itemsLoaded = useItemsLoaded()
+  // balances ทุกคลัง — shared singleton 'all' (transfer modal + KPI ต้องการข้าม-warehouse)
+  const balances = useStockBalances('all')
   const [sources, setSources] = useState(DEFAULT_SOURCES)
   const [toast, setToast] = useState('')
   const [expAlerts, setExpAlerts] = useState([]) // lots expiring within 7 days with qty > 0
@@ -203,9 +227,9 @@ export default function Dashboard() {
   const [catOrder, setCatOrder] = useState([])   // ลำดับหมวดหมู่จาก Settings (sortOrder)
   const [staffFilter, setStaffFilter] = useState(new Set())   // filter ใน cutSummary popup (ว่าง = ทั้งหมด)
   const [kpiPop, setKpiPop] = useState(null)                  // 'low' | 'out' | null — popover รายการ KPI
+  const [kpiPopRect, setKpiPopRect] = useState(null)          // ตำแหน่ง card (rect) สำหรับ popover แบบ fixed (กันหน้าขยับ)
 
   // Modals
-  const [receiveOpen, setReceiveOpen] = useState(false)
   const [transferOpen, setTransferOpen] = useState(false)
   const [refillOpen, setRefillOpen]   = useState(false)
   const [refillStep, setRefillStep]   = useState('branch') // 'branch' | 'item'
@@ -214,15 +238,12 @@ export default function Dashboard() {
   const [wasteOpen, setWasteOpen] = useState(false)
   const [bellOpen, setBellOpen] = useState(false)
 
-  // Receive form
-  const [receiveSaving, setReceiveSaving] = useState(false)
-  const [rcv, setRcv] = useState({
-    itemId: '', qty: '', unit: '', receiveDate: '', mfgDate: '', expDate: '', source: DEFAULT_SOURCES[0]
-  })
+  // (Receive form เดิม — ลบแล้ว แทนด้วยระบบสั่งซื้อ 2-step ที่ balanceId ถูกต้อง + แปลงหน่วย)
 
   // Transfer form — multi-item
   const [tfr, setTfr] = useState({ fromWH: '', toWH: '', driver: '' })
   const [transferItems, setTransferItems] = useState([])
+  const [ownerNotified, setOwnerNotified] = useState(new Set())   // itemId ที่กด "แจ้ง Owner" แล้ว (กันกดซ้ำ)
   const [tfAddMode, setTfAddMode]         = useState(false)
   const [tfStep, setTfStep]               = useState('pick')   // 'pick' | 'qty' | 'confirm'
   const [transferSaving, setTransferSaving] = useState(false)
@@ -246,8 +267,31 @@ export default function Dashboard() {
   const [receiveTransferOpen, setReceiveTransferOpen] = useState(false)
   const [receivingTF, setReceivingTF]                 = useState(null)  // TF doc being received
   const [receivingChecked, setReceivingChecked]       = useState(new Set()) // indices ticked
+  const [receivingQty, setReceivingQty]               = useState({})        // { [idx]: ยอดรับจริง (string) } — รองรับของมาไม่ครบ
   const [receiveConfirmOpen, setReceiveConfirmOpen]   = useState(false)     // popup สรุปก่อน commit
   const [receivingSaving, setReceivingSaving]         = useState(false)
+
+  // 🛒 Purchase Order (สั่งซื้อ → รับของ) — Supplier → คลังกลาง (2-step)
+  const [purchaseOrders, setPurchaseOrders] = useState([])
+  const [poOpen, setPoOpen]       = useState(false)            // modal สั่งซื้อ (step 1)
+  const [poStep, setPoStep]       = useState('pick')           // 'pick' | 'qty'
+  const [poEditId, setPoEditId]   = useState(null)             // แก้ไขใบสั่งซื้อ (ordered) → doc id, null = สร้างใหม่
+  const [poForm, setPoForm]       = useState({ supplier: '', orderDate: '', expectedDate: '', shipper: '' })
+  const [poItems, setPoItems]     = useState([])               // [{itemId,itemName,img,category,qty,unit,unitOpts}]
+  const [poSaving, setPoSaving]   = useState(false)
+  const [poRcvOpen, setPoRcvOpen] = useState(false)            // modal รับของ (step 2)
+  const [poRcv, setPoRcv]         = useState(null)             // PO doc ที่กำลังตรวจรับ
+  const [poRcvChecked, setPoRcvChecked] = useState({})         // { [idx]: { checked, qty, mismatch, reason } }
+  const [poRcvSaving, setPoRcvSaving]   = useState(false)
+  const [poRcvDate, setPoRcvDate]       = useState('')         // วันที่รับ (ย้อนได้ ≤ 3 วัน)
+  const [poMismatch, setPoMismatch]     = useState(null)       // { idx, itemName, img, orderedQty, unit, qty, reason } | null
+  const [lotInfoOpen, setLotInfoOpen]   = useState(false)      // popup เพิ่มข้อมูล LOT (วันหมดอายุ) หลังรับ
+  const [lotInfoData, setLotInfoData]   = useState({})         // { [lotId]: { receiveDate, mfgDate, expDate, shelfValue, shelfUnit, expMode } }
+  const [lotInfoSaving, setLotInfoSaving] = useState(false)
+  const [lotInfoWh, setLotInfoWh]       = useState('')         // คลังที่ป๊อปอัป LOT แสดง (badge=สาขาที่ดู · auto หลังรับ=คลังกลาง)
+  const [tfConfirmChecks, setTfConfirmChecks] = useState({})   // ตรวจสอบก่อนนำส่ง: { [itemId]: true } — ติ๊กตอนหยิบของออกจากคลัง
+  const [cardDetail, setCardDetail]     = useState(null)       // popup รายละเอียดการ์ด: { type:'po'|'tf', data, statusLabel }
+  const [cutSumXBounce, setCutSumXBounce] = useState(false)    // เด้งกากบาท popup สรุปตัด เมื่อกด background
 
   // Waste form
   const [waste, setWaste] = useState({ itemId: '', qty: '', unit: '', type: 'fruit_daily', wh: '' })
@@ -310,8 +354,13 @@ export default function Dashboard() {
   useEffect(() => {
     if (Object.keys(cmCosts).length === 0) return
     const cost = todayCutLogs.reduce((s, l) => {
-      if (l.totalCost > 0) return s + l.totalCost
-      const itemSum = (l.items || []).reduce((ss, it) => {
+      if (l.cancelled) return s   // ยกเลิกทั้งใบ → ไม่นับเข้ามูลค่าใช้วัตถุดิบ (ตรงกับหน้ารายงาน)
+      // เชื่อ totalCost ที่บันทึก (คิดเฉพาะ item ที่ไม่ cancelled อยู่แล้ว — รวมกรณี =0 จากการยกเลิกทั้งใบ)
+      //   ⚠️ ห้ามใช้ `> 0` เพราะ 0 ที่ถูกต้อง (ทุก item ยกเลิก) จะโดน recompute เอา item ที่ยกเลิกกลับมา
+      if (typeof l.totalCost === 'number') return s + l.totalCost
+      // เฉพาะ log เก่าที่ไม่มี field totalCost → recompute โดยกรอง item ที่ยกเลิก + ใช้ costTotal ที่บันทึกก่อน
+      const itemSum = (l.items || []).filter(it => !it.cancelled).reduce((ss, it) => {
+        if (typeof it.costTotal === 'number') return ss + it.costTotal
         const q = it.qtyUse ?? it.qty ?? 0
         const cm = cmCosts[it.itemName]
         return ss + (cm ? q * (cm.costPerUse || 0) : 0)
@@ -391,14 +440,12 @@ export default function Dashboard() {
         return
       }
 
-      // คำนวณ qty in unitUse สำหรับ deduct stock
+      // คำนวณ qty in unitUse สำหรับ deduct stock (รองรับหน่วยหลายชั้น + หน่วยย่อย)
       let qtyInUse = qtyVal
       if (item) {
-        const factor  = parseConvFactor(item.unitConversion) || 1
         const subConv = Number(item.convSub) || 0
-        if (unit === item.unitBase)      qtyInUse = qtyVal * factor
-        else if (unit === item.unitSub && subConv > 0) qtyInUse = qtyVal / subConv
-        // else: unit === unitUse → qtyInUse = qtyVal (ตามที่กรอก)
+        if (unit === item.unitSub && subConv > 0) qtyInUse = qtyVal / subConv
+        else qtyInUse = qtyToUse(qtyVal, unit, item)   // ลัง/มัด/ใบ ผ่าน unitLevels
       }
 
       const batch = writeBatch(db)
@@ -454,6 +501,14 @@ export default function Dashboard() {
           staffName:    name,
           timestamp:    now,
         })
+
+        // 2b. หัก LOT แบบ FIFO ให้ตรงกับ stock ที่เพิ่งลด (atomic ใน batch เดียว) — ข้ามถ้า item ปิด LOT
+        if (item.lotEnabled !== false) {
+          const workingLots = await fetchLotsForWarehouse(targetWh)
+          const { allocations, shortage } = planFifoConsume(workingLots, { itemId: item.id, warehouseId: targetWh, qtyUse: qtyInUse })
+          applyFifoConsume(batch, allocations, targetWh)
+          if (shortage > 0) writeLotShortage(batch, { itemId: item.id, itemName: item.name, warehouseId: targetWh, shortage, unitUse: item.unitUse || '', reasonType: 'ของเสีย', note: 'fruit_daily' })
+        }
       }
 
       // 3. audit
@@ -534,30 +589,8 @@ export default function Dashboard() {
     }
   }
 
-  // Load warehouses + default scope = สาขาแรก (ไม่ใช่ "ทุกร้าน")
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
-      const wList = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
-      setWarehouses(wList)
-      setWh(prev => {
-        if (prev) return prev   // เคยเลือกไว้แล้ว
-        const shop = wList.find(w => w.type === 'shop' || w.type === 'branch' || w.isShop === true)
-          || wList.find(w => !(w.type === 'main' || w.isMain))
-          || wList[0]
-        return shop?.id || 'all'
-      })
-    })
-    return () => unsub()
-  }, [])
-
-  // Load items
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, COL.ITEMS), snap => {
-      setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-      setLoading(false)
-    })
-    return () => unsub()
-  }, [])
+  // items มาจาก useItems() (shared) — เคลียร์ loading เมื่อโหลด Master Data เสร็จ
+  useEffect(() => { if (itemsLoaded) setLoading(false) }, [itemsLoaded])
 
   // balances โหลดจาก listener ด้านล่าง (Load low/out stock) ที่มี wh filter อยู่แล้ว
 
@@ -577,7 +610,7 @@ export default function Dashboard() {
     const unsub = onSnapshot(q, snap => {
       const logs = snap.docs.map(d => d.data()).filter(d => !d.deletedAt)
       setTodayCutLogs(logs)
-      setKpi(k => ({ ...k, cuts: logs.length }))
+      setKpi(k => ({ ...k, cuts: logs.filter(l => !l.cancelled).length }))
     })
     return () => unsub()
   }, [wh])
@@ -589,7 +622,7 @@ export default function Dashboard() {
       ? query(collection(db, COL.WASTE_LOGS), where('date', '==', today))
       : query(collection(db, COL.WASTE_LOGS), where('date', '==', today), where('warehouseId', '==', wh))
     const unsub = onSnapshot(q, snap => {
-      const wlogs = snap.docs.map(d => d.data()).filter(d => !d.deletedAt)
+      const wlogs = snap.docs.map(d => d.data()).filter(d => !d.deletedAt && !d.cancelled)
       const wasteCost = wlogs.reduce((s, l) => s + (Number(l.totalCost) || 0), 0)
       setKpi(k => ({ ...k, wasteCost, wasteCount: wlogs.length }))
     })
@@ -626,7 +659,14 @@ export default function Dashboard() {
           const daysLeft = Math.ceil((exp - new Date()) / (1000 * 60 * 60 * 24))
           return { ...lot, daysLeft }
         })
-      setExpAlerts(expiring)
+      // 🧹 รวมเป็น 1 chip ต่อ 1 สินค้า — กันซ้ำเมื่อ LOT เดียวกันถูกแบ่งข้ามคลัง (แม่+ลูกจากการโอน)
+      //    เลือกอันที่ exp ใกล้สุด (daysLeft น้อยสุด) เป็นตัวแทน
+      const byItem = {}
+      expiring.forEach(lot => {
+        const k = lot.itemId || lot.itemName
+        if (!byItem[k] || lot.daysLeft < byItem[k].daysLeft) byItem[k] = lot
+      })
+      setExpAlerts(Object.values(byItem))
     })
     // โหลด category order จาก Settings (live sync)
     const unsubCats = onSnapshot(doc(db, COL.APP_SETTINGS, 'categories'), snap => {
@@ -647,12 +687,20 @@ export default function Dashboard() {
     return () => unsub()
   }, [])
 
+  // 🛒 Load active purchase orders (ordered + partial = ยังรับไม่ครบ · received = ไว้ "ถอนการรับ" ภายในวัน)
+  useEffect(() => {
+    const q = query(collection(db, COL.PURCHASE_ORDERS),
+      where('status', 'in', ['ordered', 'partial', 'received']), limit(30))
+    const unsub = onSnapshot(q, snap => setPurchaseOrders(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+    return () => unsub()
+  }, [])
+
   // Load pending refill requests
   // ไม่ใช้ orderBy ใน query เพื่อหลีกเลี่ยง Composite Index requirement
   // — sort ใน client แทน
   useEffect(() => {
     const q = query(collection(db, COL.REFILL_REQUESTS),
-      where('status', 'in', ['pending', 'processing']), limit(30))
+      where('status', 'in', ['pending', 'processing', 'partial']), limit(30))
     const unsub = onSnapshot(q, snap => {
       const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       // เรียงเก่าสุดขึ้นก่อน (pending เก่าสุดควรดำเนินการก่อน)
@@ -664,79 +712,346 @@ export default function Dashboard() {
     return () => unsub()
   }, [])
 
-  // Load balances ทุก warehouse (transfer modal + other features ต้องการข้าม-warehouse)
+  // KPI low/out — คำนวณจาก balances (shared singleton) ทุกครั้งที่ balances / wh / items เปลี่ยน
+  //   (เดิมคำนวณใน callback ของ onSnapshot — ย้ายออกมาเพราะ balances มาจาก hook แล้ว)
   useEffect(() => {
-    const q = query(collection(db, COL.STOCK_BALANCES))
-    const unsub = onSnapshot(q, snap => {
-      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      setBalances(docs)
-      // KPI low/out — กรองเฉพาะ wh ที่ scope ปัจจุบัน (ถ้า all = ทุก wh)
-      const scoped = wh === 'all' ? docs : docs.filter(b => b.warehouseId === wh)
-      let low = 0, out = 0
-      scoped.forEach(b => {
-        const item = items.find(i => i.id === b.itemId)
-        if (!item) return
-        if (b.qty <= 0) out++
-        else if (b.qty <= (b.minQty || item.minQty || 0)) low++
-      })
-      setKpi(k => ({ ...k, low, out }))
+    // กรองเฉพาะ wh ที่ scope ปัจจุบัน (ถ้า all = ทุก wh)
+    const scoped = wh === 'all' ? balances : balances.filter(b => b.warehouseId === wh)
+    let low = 0, out = 0
+    scoped.forEach(b => {
+      const item = items.find(i => i.id === b.itemId)
+      if (!item) return
+      if (item.alertEnabled === false) return   // 🔕 ปิดแจ้งเตือนใน Master → ไม่นับ
+      if (b.qty <= 0) out++
+      else if (b.qty <= (b.minQty || item.minQty || 0)) low++
     })
-    return () => unsub()
-  }, [wh, items])
+    setKpi(k => ({ ...k, low, out }))
+  }, [balances, wh, items])
 
   const whName = wh === 'all' ? 'ทุกร้าน' : (warehouses.find(w => w.id === wh)?.name || wh)
 
-  async function submitReceive() {
-    if (!rcv.itemId || !rcv.qty) { setToast('⚠️ กรุณาเลือกวัตถุดิบและระบุจำนวน'); return }
-    if (!rcv.receiveDate) { setToast('⚠️ กรุณาระบุวันที่รับสินค้า'); return }
-    const item = items.find(i => i.id === rcv.itemId)
-    if (!item) return
-    setReceiveSaving(true)
+  // 🛒 ═══════════ Purchase Order: สั่งซื้อ (step 1) → รับของ (step 2) ═══════════
+  function poToday() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })
+  }
+
+  /** เปิด modal สั่งซื้อ */
+  function openPO() {
+    setPoEditId(null)
+    setPoForm({ supplier: sources[0] || DEFAULT_SOURCES[0], orderDate: poToday(), expectedDate: '', shipper: '' })
+    setPoItems([]); setPoStep('pick'); setPoOpen(true)
+  }
+
+  /** แก้ไขใบสั่งซื้อที่ยัง "ระหว่างขนส่ง" (ordered) — กดผิด/แก้จำนวน */
+  function openEditPO(po) {
+    setPoEditId(po.id)
+    setPoForm({ supplier: po.supplier || sources[0] || '', orderDate: po.orderDate || poToday(),
+      expectedDate: po.expectedDate || '', shipper: po.shipper || '' })
+    setPoItems((po.items || []).map(it => {
+      const m = items.find(x => x.id === it.itemId)
+      const unitOpts = []
+      if (m?.unitBuy || m?.unitBase) unitOpts.push(m.unitBuy || m.unitBase)
+      if (m?.unitUse && !unitOpts.includes(m.unitUse)) unitOpts.push(m.unitUse)
+      if (it.unit && !unitOpts.includes(it.unit)) unitOpts.unshift(it.unit)
+      return { itemId: it.itemId, itemName: it.itemName, img: it.img || m?.img || '📦',
+        category: it.category || m?.category || 'อื่นๆ', qty: String(it.qty), unit: it.unit, unitOpts }
+    }))
+    setPoStep('qty'); setPoOpen(true)
+  }
+
+  /** step 1: บันทึกใบสั่งซื้อ → status ordered (ยังไม่กระทบ stock) */
+  async function submitPO() {
+    if (!poForm.supplier) { setToast('⚠️ เลือกแหล่งที่มา'); return }
+    if (poItems.length === 0) { setToast('⚠️ เพิ่มรายการอย่างน้อย 1 รายการ'); return }
+    if (!poItems.every(it => parseFloat(it.qty) > 0)) { setToast('⚠️ ระบุจำนวนทุกรายการ'); return }
+    setPoSaving(true)
+    try {
+      const itemsPayload = poItems.map(it => ({
+        itemId: it.itemId, itemName: it.itemName, img: it.img, category: it.category || 'อื่นๆ',
+        qty: parseFloat(it.qty), unit: it.unit, fulfilledQtyUse: 0,
+      }))
+      // ── โหมดแก้ไข (ordered) — อัปเดตใบเดิม ไม่สร้างใหม่ ──
+      if (poEditId) {
+        await updateDoc(doc(db, COL.PURCHASE_ORDERS, poEditId), {
+          supplier: poForm.supplier, orderDate: poForm.orderDate, expectedDate: poForm.expectedDate || '',
+          shipper: (poForm.shipper || '').trim(), items: itemsPayload, editedBy: name, editedAt: serverTimestamp(),
+        })
+        await addDoc(collection(db, COL.AUDIT_LOGS), {
+          action: 'purchase_order_edit', staffName: name,
+          detail: `แก้ไขใบสั่งซื้อ ${poEditId.slice(-6)} (${itemsPayload.length} รายการ)`,
+          timestamp: serverTimestamp(),
+        })
+        setPoOpen(false); setPoEditId(null); setPoItems([]); setPoStep('pick')
+        setPoForm({ supplier: '', orderDate: '', expectedDate: '', shipper: '' })
+        setToast('✅ แก้ไขใบสั่งซื้อแล้ว')
+        setPoSaving(false); return
+      }
+      const _n = new Date()
+      const poId = `PO-${String(_n.getMonth()+1).padStart(2,'0')}.${String(_n.getFullYear()).slice(-2)}-${String(Date.now()).slice(-2)}`
+      await addDoc(collection(db, COL.PURCHASE_ORDERS), {
+        poRef: poId, status: 'ordered',
+        supplier: poForm.supplier, orderDate: poForm.orderDate, expectedDate: poForm.expectedDate || '',
+        shipper: (poForm.shipper || '').trim(),
+        items: itemsPayload, createdBy: name, createdAt: serverTimestamp(),
+      })
+      try {
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'purchase-order', tag: 'stock',
+          title: `🛒 สั่งซื้อใหม่ ${poId}`,
+          body: `${poForm.supplier} — ${itemsPayload.length} รายการ · ระหว่างขนส่ง`,
+          poRef: poId, itemCount: itemsPayload.length,
+          createdAt: serverTimestamp(), read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
+      await addDoc(collection(db, COL.AUDIT_LOGS), {
+        action: 'purchase_order', staffName: name,
+        detail: `สั่งซื้อ ${poId} จาก ${poForm.supplier} (${itemsPayload.length} รายการ)`,
+        timestamp: serverTimestamp(),
+      })
+      setPoOpen(false); setPoItems([]); setPoForm({ supplier: '', orderDate: '', expectedDate: '', shipper: '' })
+      setToast(`✅ สั่งซื้อ ${poId} แล้ว — รอรับของ`)
+    } catch (e) { console.error(e); setToast('❌ บันทึกไม่สำเร็จ') }
+    finally { setPoSaving(false) }
+  }
+
+  /** step 2: เปิด modal ตรวจรับ — เติม checklist ตามยอดค้าง */
+  function openReceivePO(po) {
+    setPoRcv(po)
+    const init = {}
+    ;(po.items || []).forEach((it, i) => {
+      const master = items.find(m => m.id === it.itemId)
+      const reqUse = qtyToUse(it.qty, it.unit, master)
+      const remainUse = Math.max(0, reqUse - (Number(it.fulfilledQtyUse) || 0))
+      const remainInUnit = useToQty(remainUse, it.unit, master)
+      // เริ่มต้น "ยังไม่ติ๊ก" — ยอดรับตั้งตามที่สั่ง (ล็อกไว้ กันมือไปกดเพิ่ม) จนกว่าจะกด "ไม่ตรง"
+      init[i] = { checked: false, qty: String(remainInUnit || 0), mismatch: false, reason: '' }
+    })
+    setPoRcvChecked(init); setPoRcvDate(poToday()); setPoRcvOpen(true)
+  }
+
+  /** step 2: ยืนยันรับของ → +stock คลังกลาง (balanceId ถูกต้อง + แปลงหน่วย) + LOT + movement */
+  async function submitReceivePO() {
+    const po = poRcv; if (!po) return
+    const mainWh = mainWarehouse || warehouses.find(w => w.type === 'main' || w.isMain)
+    if (!mainWh) { setToast('⚠️ ไม่พบคลังกลาง'); return }
+    const anyChecked = Object.values(poRcvChecked).some(c => c?.checked && parseFloat(c.qty) > 0)
+    if (!anyChecked) { setToast('⚠️ ติ๊กรายการที่รับ + ระบุจำนวน'); return }
+    setPoRcvSaving(true)
     try {
       const batch = writeBatch(db)
-      const lotId = `${rcv.itemId}_${rcv.receiveDate.replace(/\//g, '')}`
-      const balId = `${rcv.itemId}_${rcv.itemId}`
-      const qty = parseFloat(rcv.qty)
-
-      batch.set(doc(db, COL.LOT_TRACKING, lotId), {
-        itemId: rcv.itemId, itemName: item.name,
-        warehouseId: rcv.fromWH || warehouses[0]?.id || '',
-        receiveDate: rcv.receiveDate, mfgDate: rcv.mfgDate, expDate: rcv.expDate,
-        totalQty: qty, inWarehouse: qty, inShop: 0, used: 0,
-        source: rcv.source, createdAt: serverTimestamp()
-      }, { merge: true })
-
-      const balRef = doc(db, COL.STOCK_BALANCES, balId)
-      const balSnap = await getDoc(balRef)
-      if (balSnap.exists()) {
-        batch.update(balRef, { qty: (balSnap.data().qty || 0) + qty, lastUpdated: serverTimestamp() })
-      } else {
-        batch.set(balRef, { itemId: rcv.itemId, warehouseId: rcv.fromWH || warehouses[0]?.id || '',
-          qty, unit: item.unitBase, lastUpdated: serverTimestamp(), lastUpdatedBy: window._bizSession?.phone || '' })
+      // วันที่รับ — ใช้ที่เลือก (ย้อนได้ ≤ 3 วัน) · ถ้าย้อนหลัง → stamp receivedAt เป็นวันนั้น (เที่ยง) เพื่อให้รายงานลงวันถูก
+      const today = poRcvDate || poToday()
+      const isBackdated = today !== poToday()
+      const rcvStamp = isBackdated ? Timestamp.fromDate(new Date(`${today}T12:00:00+07:00`)) : serverTimestamp()
+      const newItems = [...(po.items || [])]
+      for (let i = 0; i < newItems.length; i++) {
+        const it = newItems[i]
+        const chk = poRcvChecked[i]
+        if (!chk?.checked) continue
+        const recvQty = parseFloat(chk.qty) || 0
+        if (recvQty <= 0) continue
+        const master = items.find(m => m.id === it.itemId)
+        const qtyUse = qtyToUse(recvQty, it.unit, master)   // รองรับหน่วยหลายชั้น
+        // ✅ balance — pattern ถูกต้อง (warehouseId_itemId) + เก็บใน unitUse
+        const balRef = doc(db, COL.STOCK_BALANCES, balanceId(mainWh.id, it.itemId))
+        const snap = await getDoc(balRef)
+        const cur = snap.exists() ? (snap.data().qty || 0) : 0
+        batch.set(balRef, {
+          warehouseId: mainWh.id, itemId: it.itemId, qty: cur + qtyUse,
+          unit: master?.unitUse || it.unit || '', lastUpdated: serverTimestamp(),
+        }, { merge: true })
+        // LOT — id ผูก poRef กันชนข้ามใบ (PO คนละใบ item เดียวกันวันเดียวกัน) + accumulate กันเขียนทับ
+        //     ข้ามถ้า item ปิดระบบ LOT (lotEnabled=false ใน Master Data)
+        if (master?.lotEnabled !== false) {
+          const poTag = String(po.poRef || po.id).replace(/[^A-Za-z0-9]/g, '')
+          const lotId = `${it.itemId}_${today.replace(/-/g, '')}_${poTag}`
+          const lotRef = doc(db, COL.LOT_TRACKING, lotId)
+          const lotSnap = await getDoc(lotRef)
+          const prevQty = lotSnap.exists() ? (Number(lotSnap.data().inWarehouse) || 0) : 0
+          const newQty = prevQty + qtyUse   // รับซ้ำ id เดิม (partial รอบเดียวกัน) → บวกเพิ่ม ไม่ทับ
+          batch.set(lotRef, {
+            itemId: it.itemId, itemName: it.itemName, warehouseId: mainWh.id,
+            receiveDate: today, expDate: lotSnap.exists() ? (lotSnap.data().expDate || '') : '',
+            pendingInfo: lotSnap.exists() ? (lotSnap.data().pendingInfo ?? true) : true,
+            // dual-schema: ทั้ง inWarehouse (PO/transfer/EXP อ่าน) + qty/locationQty (Warehouse อ่าน)
+            totalQty: newQty, inWarehouse: newQty, inShop: 0, used: 0,
+            qty: newQty, locationQty: { [mainWh.id]: newQty },
+            source: po.supplier, poRef: po.poRef, createdAt: serverTimestamp(),
+          }, { merge: true })
+        }
+        // movement (แนบสาเหตุถ้ารับไม่ตรงที่สั่ง)
+        const mmNote = chk.mismatch ? ` · ⚠️ ไม่ตรง: ${(chk.reason || '').trim() || 'ไม่ระบุ'}` : ''
+        batch.set(doc(collection(db, COL.STOCK_MOVEMENTS)), {
+          type: 'receive', itemId: it.itemId, itemName: it.itemName, warehouseId: mainWh.id,
+          qty: qtyUse, qtyUse, unit: master?.unitUse || '', unitUse: master?.unitUse || '',
+          staffName: name, note: `รับจาก ${po.supplier} · ${po.poRef}${mmNote}`, poRef: po.poRef,
+          ...(chk.mismatch ? { mismatch: true, mismatchReason: (chk.reason || '').trim() } : {}),
+          timestamp: serverTimestamp(),
+        })
+        newItems[i] = { ...it, fulfilledQtyUse: (Number(it.fulfilledQtyUse) || 0) + qtyUse }
       }
-
+      // สถานะ PO: รับครบทุกรายการ → received · ไม่ครบ → partial
+      const allDone = newItems.every(it => {
+        const master = items.find(m => m.id === it.itemId)
+        const reqUse = qtyToUse(it.qty, it.unit, master)
+        return (Number(it.fulfilledQtyUse) || 0) + 1e-6 >= reqUse
+      })
+      batch.update(doc(db, COL.PURCHASE_ORDERS, po.id), {
+        items: newItems, status: allDone ? 'received' : 'partial', receiveDate: today,
+        ...(allDone ? { receivedBy: name, receivedAt: rcvStamp } : { partialAt: rcvStamp }),
+      })
       await batch.commit()
-      await addDoc(collection(db, COL.STOCK_MOVEMENTS), {
-        type: 'receive', itemId: rcv.itemId, itemName: item.name,
-        warehouseId: rcv.fromWH || warehouses[0]?.id || '',
-        qty, unit: item.unitBase, unitUse: item.unitUse, qtyUse: qty,
-        staffPhone: window._bizSession?.phone || '', staffName: window._bizSession?.name || '',
-        shopName: whName, timestamp: serverTimestamp(), note: `รับจาก ${rcv.source}`
+      await addDoc(collection(db, COL.AUDIT_LOGS), {
+        action: 'purchase_receive', staffName: name,
+        detail: `รับของ ${po.poRef} จาก ${po.supplier}${allDone ? ' (ครบ)' : ' (บางส่วน)'}`,
+        timestamp: serverTimestamp(),
+      })
+      // 🔔 แจ้ง Hub (หมวด "สั่งซื้อ") — รับของเข้าคลังกลางแล้ว
+      try {
+        const nRecv = Object.values(poRcvChecked).filter(c => c?.checked && parseFloat(c.qty) > 0).length
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'purchase-receive', tag: 'stock',
+          title: `📦 รับเข้าคลังกลาง ${po.poRef}${allDone ? '' : ' (บางส่วน)'}`,
+          body: `${po.supplier} → คลังกลาง · รับ ${nRecv} รายการ · stock อัปเดตแล้ว${allDone ? '' : ' · ยังค้างบางรายการ'}`,
+          poRef: po.poRef, itemCount: nRecv,
+          createdAt: serverTimestamp(), read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
+      setPoRcvOpen(false); setPoRcv(null)
+      setToast(allDone ? `✅ รับของ ${po.poRef} ครบแล้ว` : `🟠 รับของ ${po.poRef} บางส่วน — ค้างบางรายการ`)
+      // 📅 เด้ง popup เพิ่มข้อมูล LOT (วันหมดอายุ) ของรายการที่เพิ่งรับ — รับเข้าคลังกลาง
+      setLotInfoData({}); setLotInfoWh(mainWh.id); setLotInfoOpen(true)
+    } catch (e) { console.error(e); setToast('❌ รับของไม่สำเร็จ') }
+    finally { setPoRcvSaving(false) }
+  }
+
+
+  /** 🗑️ ยกเลิกใบสั่งซื้อ (ordered เท่านั้น — ยังไม่รับ ไม่กระทบ stock) */
+  async function cancelPO(po) {
+    if (po.status !== 'ordered') { setToast('⚠️ ยกเลิกได้เฉพาะใบที่ยังไม่รับ'); return }
+    const reason = window.prompt(`ยกเลิกใบสั่งซื้อ ${po.poRef}?\n\nระบุเหตุผล (เช่น สั่งผิด, ซัพไม่ส่ง):`, '')
+    if (reason === null) return
+    try {
+      await updateDoc(doc(db, COL.PURCHASE_ORDERS, po.id), {
+        status: 'cancelled', cancelReason: (reason || '').trim() || 'ไม่ระบุ',
+        cancelledBy: name, cancelledAt: serverTimestamp(),
       })
       await addDoc(collection(db, COL.AUDIT_LOGS), {
-        action: 'receive', staffPhone: window._bizSession?.phone || '',
-        staffName: window._bizSession?.name || '', warehouseId: rcv.fromWH || '',
-        detail: `รับ ${item.name} ${qty} ${item.unitBase}`, timestamp: serverTimestamp()
+        action: 'purchase_cancel', staffName: name,
+        detail: `ยกเลิกใบสั่งซื้อ ${po.poRef} — ${(reason || '').trim() || 'ไม่ระบุ'}`,
+        timestamp: serverTimestamp(),
       })
-      setReceiveOpen(false)
-      setRcv({ itemId: '', qty: '', unit: '', receiveDate: '', mfgDate: '', expDate: '', source: sources[0] || DEFAULT_SOURCES[0] })
-      setToast(`✅ รับสินค้า ${item.name} ${qty} ${item.unitBase} เรียบร้อย`)
-    } catch (e) {
-      console.error(e)
-      setToast('❌ เกิดข้อผิดพลาด กรุณาลองใหม่')
-    } finally {
-      setReceiveSaving(false)
+      setToast(`🗑️ ยกเลิกใบสั่งซื้อ ${po.poRef} แล้ว`)
+    } catch (e) { console.error(e); setToast('❌ ยกเลิกไม่สำเร็จ') }
+  }
+
+  /** ↩️ ถอนการรับของ (received/partial → ordered) — ดึง stock คืน + ลบ LOT ของ PO นี้ */
+  async function undoReceivePO(po) {
+    const mainWh = mainWarehouse || warehouses.find(w => w.type === 'main' || w.isMain)
+    if (!mainWh) { setToast('⚠️ ไม่พบคลังกลาง'); return }
+    // ── กันถอยข้ามวัน (มาตรฐานเดียวกับยกเลิกใบโอน) ──
+    const refTs = po.receivedAt || po.partialAt
+    const refKey = refTs?.seconds
+      ? new Date(refTs.seconds * 1000).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })
+      : poToday()
+    if (refKey !== poToday()) {
+      window.alert(`❌ ถอนการรับของข้ามวันไม่ได้\n\nรับเมื่อ ${refKey} · วันนี้ ${poToday()}\nกรุณาใช้ "ปรับยอดคงคลัง" แทน`)
+      return
     }
+    // ── เช็ค stock คลังกลางพอที่จะถอนคืนไหม ──
+    const shortages = []
+    for (const it of (po.items || [])) {
+      const recvUse = Number(it.fulfilledQtyUse) || 0
+      if (recvUse <= 0) continue
+      const snap = await getDoc(doc(db, COL.STOCK_BALANCES, balanceId(mainWh.id, it.itemId)))
+      const cur = Number(snap.exists() ? snap.data().qty : 0) || 0
+      if (cur < recvUse - 1e-4) {
+        const m = items.find(x => x.id === it.itemId)
+        shortages.push(`· ${m?.displayName || it.itemName} — ต้องถอน ${recvUse} แต่เหลือ ${cur} ${m?.unitUse || ''}`)
+      }
+    }
+    if (shortages.length > 0) {
+      window.alert(`❌ ถอนไม่ได้ — stock คลังกลางถูกใช้/โอนไปบางส่วนแล้ว:\n\n${shortages.join('\n')}\n\nกรุณาใช้ "ปรับยอดคงคลัง" แทน`)
+      return
+    }
+    if (!window.confirm(`↩️ ถอนการรับของ ${po.poRef}?\n\n• ดึง stock ที่รับเข้าออกจากคลังกลาง\n• ลบ LOT ที่สร้างจากใบนี้\n• ใบกลับเป็น "ระหว่างขนส่ง" (สั่งซื้อใหม่/ตรวจรับใหม่ได้)`)) return
+    try {
+      const batch = writeBatch(db)
+      const newItems = (po.items || []).map(it => {
+        const recvUse = Number(it.fulfilledQtyUse) || 0
+        if (recvUse > 0) {
+          const m = items.find(x => x.id === it.itemId)
+          batch.set(doc(db, COL.STOCK_BALANCES, balanceId(mainWh.id, it.itemId)), {
+            qty: increment(-recvUse), lastUpdated: serverTimestamp(),
+          }, { merge: true })
+          batch.set(doc(collection(db, COL.STOCK_MOVEMENTS)), {
+            type: 'receive_undo', itemId: it.itemId, itemName: it.itemName, warehouseId: mainWh.id,
+            qty: recvUse, qtyUse: recvUse, unit: m?.unitUse || '', unitUse: m?.unitUse || '',
+            adjustReason: 'ถอนการรับของ (ดึง stock คืน)', note: `PO ${po.poRef}`,
+            staffName: name, timestamp: serverTimestamp(),
+          })
+        }
+        return { ...it, fulfilledQtyUse: 0 }
+      })
+      // ลบ LOT ที่สร้างจาก PO นี้
+      const lotsSnap = await getDocs(query(collection(db, COL.LOT_TRACKING), where('poRef', '==', po.poRef)))
+      lotsSnap.docs.forEach(d => batch.delete(doc(db, COL.LOT_TRACKING, d.id)))
+      // PO กลับเป็น ordered
+      batch.update(doc(db, COL.PURCHASE_ORDERS, po.id), {
+        items: newItems, status: 'ordered',
+        receivedBy: null, receivedAt: null, partialAt: null,
+        undoneBy: name, undoneAt: serverTimestamp(),
+      })
+      await batch.commit()
+      await addDoc(collection(db, COL.AUDIT_LOGS), {
+        action: 'purchase_receive_undo', staffName: name,
+        detail: `ถอนการรับของ ${po.poRef} — ดึง stock คืน + ลบ LOT (${lotsSnap.size} ล็อต)`,
+        timestamp: serverTimestamp(),
+      })
+      try {
+        const nref = await addDoc(collection(db, 'hub_notifications'), {
+          app: 'inventory', type: 'purchase-receive-undo', tag: 'stock',
+          title: `↩️ ถอนการรับของ ${po.poRef}`,
+          body: `${po.supplier} → คลังกลาง · ${name} ดึง stock คืนแล้ว · ใบกลับเป็นระหว่างขนส่ง`,
+          poRef: po.poRef, createdAt: serverTimestamp(), read: false, read_by: [],
+        })
+        sendHubPush(nref.id)
+      } catch {}
+      setToast(`↩️ ถอนการรับของ ${po.poRef} แล้ว — stock คืนเข้าที่`)
+    } catch (e) { console.error(e); setToast('❌ ถอนการรับไม่สำเร็จ') }
+  }
+
+  // วันหมดอายุที่มีผล: โหมด 'duration' = คำนวณจากวันผลิต + อายุ · โหมดอื่น = ใส่เอง
+  function effectiveExp(v) {
+    if (!v) return ''
+    if (v.expMode === 'duration') return addDateDuration(v.mfgDate, v.shelfValue, v.shelfUnit || 'day')
+    return v.expDate || ''
+  }
+
+  /** บันทึกวันที่รับ/วันผลิต/วันหมดอายุ เข้า LOT ที่ค้างข้อมูล (รับแล้วแต่ยังไม่ได้ใส่ exp) */
+  async function saveLotInfo() {
+    // บันทึกเฉพาะล็อตที่กรอกอย่างน้อย 1 ช่อง
+    const entries = Object.entries(lotInfoData)
+      .map(([lotId, v]) => [lotId, v, effectiveExp(v)])
+      .filter(([, v, exp]) => v && (exp || v.receiveDate || v.mfgDate))
+    if (entries.length === 0) { setLotInfoOpen(false); return }
+    setLotInfoSaving(true)
+    try {
+      const batch = writeBatch(db)
+      for (const [lotId, v, exp] of entries) {
+        const patch = {}
+        if (exp) { patch.expDate = exp; patch.pendingInfo = false }
+        if (v.receiveDate) patch.receiveDate = v.receiveDate
+        if (v.mfgDate) patch.mfgDate = v.mfgDate
+        batch.set(doc(db, COL.LOT_TRACKING, lotId), patch, { merge: true })
+      }
+      await batch.commit()
+      setToast(`✅ บันทึกข้อมูล LOT ${entries.length} รายการ`)
+      setLotInfoOpen(false); setLotInfoData({})
+    } catch (e) { console.error(e); setToast('❌ บันทึกไม่สำเร็จ') }
+    finally { setLotInfoSaving(false) }
   }
 
   async function receiveTransfer(tf) {
@@ -749,12 +1064,9 @@ export default function Dashboard() {
       // Update each item's stock balance at destination warehouse — แปลง unit ก่อน
       for (const item of (tf.items || [])) {
         const itemMeta = items.find(i => i.id === item.itemId)
-        const factor   = parseConvFactor(itemMeta?.unitConversion) || 1
         const unitUse  = itemMeta?.unitUse || item.unit || ''
         const qtyIn    = parseFloat(item.qty) || 0
-        const addQty   = (item.unit && itemMeta?.unitBase && item.unit === itemMeta.unitBase)
-          ? qtyIn * factor
-          : qtyIn
+        const addQty   = qtyToUse(qtyIn, item.unit, itemMeta)   // รองรับหน่วยหลายชั้น (ลัง/มัด/ใบ)
 
         const toBalRef  = doc(db, COL.STOCK_BALANCES, balanceId(tf.toWarehouseId, item.itemId))
         const toBalSnap = await getDoc(toBalRef)
@@ -797,6 +1109,7 @@ export default function Dashboard() {
       await addDoc(collection(db, COL.AUDIT_LOGS), {
         action: 'transfer_received',
         staffName: name || '',
+        fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
         detail: `รับโอน ${tfLabel} จาก ${fromName} ไปยัง ${toName}`,
         timestamp: serverTimestamp()
       })
@@ -848,6 +1161,7 @@ export default function Dashboard() {
         })
         await addDoc(collection(db, COL.AUDIT_LOGS), {
           action: 'refill_edit', staffName: name,
+          branchId: refillBranch || editRf?.branchId || '',
           detail: `แก้ไขใบแจ้งเติม ${editRf?.rfRef || refillEditId.slice(-8)} — ${rfItems.length} รายการ`,
           timestamp: serverTimestamp()
         })
@@ -864,6 +1178,7 @@ export default function Dashboard() {
         })
         await addDoc(collection(db, COL.AUDIT_LOGS), {
           action: 'refill_request', staffName: name,
+          branchId: refillBranch || '',
           detail: `แจ้งเติมของ ${rfId} — ${rfItems.length} รายการ`,
           timestamp: serverTimestamp()
         })
@@ -874,6 +1189,8 @@ export default function Dashboard() {
             title: `🧾 แจ้งเติมของใหม่ ${rfId}`,
             body: `${name || 'สาขา'} แจ้งเติม ${rfItems.length} รายการ — รอคลังดำเนินการ`,
             rfRef: rfId, itemCount: rfItems.length,
+            // refill ไม่มี toWarehouseId → ระบุ branch_id = สาขาที่ขอเติม · ไม่มีสาขา = owner/admin เท่านั้น (กัน branch หลุด)
+            notifyAppEditors: !!refillBranch, branch_id: refillBranch || '',
             createdAt: serverTimestamp(),
             read: false, read_by: [],
           })
@@ -896,6 +1213,11 @@ export default function Dashboard() {
 
   /** เปิด modal แจ้งเติมของในโหมดแก้ไข — เติมข้อมูลจากใบเดิมกลับมา (editor ทุกคนแก้ได้) */
   function openEditRF(rf) {
+    // 🔒 ใบที่ส่งไปแล้วบางส่วน (partial) ห้ามแก้ — กัน fulfilledQtyUse ถูกล้าง → ส่งซ้ำของที่รับไปแล้ว
+    if (rf.status === 'partial') {
+      setToast('⚠️ ใบนี้ส่งไปแล้วบางส่วน — แก้ไขไม่ได้ (กันยอดเพี้ยน) · ใช้ "ปิดใบ" หรือรอเติมรอบหน้า')
+      return
+    }
     const sel = new Set()
     const qtys = {}
     const units = {}
@@ -944,14 +1266,12 @@ export default function Dashboard() {
         addUnit(itemMaster?.unitSubRaw || itemMaster?.unitSub)
         addUnit(it.unit)   // หน่วยที่ staff เลือกตอนสร้าง RF — ใส่เผื่อ master ไม่มี
 
-        // ยอดที่ต้องโอน = ยอดค้าง (ถ้าใบเคยส่งบางส่วน) ไม่งั้น = ยอดเต็มที่ขอ
-        const _factor   = parseConvFactor(itemMaster?.unitConversion) || 1
-        const _isBase   = it.unit && itemMaster?.unitBase && it.unit === itemMaster.unitBase
-        const _reqUse   = _isBase ? (parseFloat(it.qty)||0)*_factor : (parseFloat(it.qty)||0)
+        // ยอดที่ต้องโอน = ยอดค้าง (ถ้าใบเคยส่งบางส่วน) ไม่งั้น = ยอดเต็มที่ขอ — รองรับหน่วยหลายชั้น
+        const _reqUse   = qtyToUse(parseFloat(it.qty) || 0, it.unit, itemMaster)
         const _fulfilled = Number(it.fulfilledQtyUse) || 0
         const _remainUse = Math.max(0, _reqUse - _fulfilled)
         const effQty = _fulfilled > 0
-          ? (_isBase ? _remainUse / _factor : _remainUse)
+          ? useToQty(_remainUse, it.unit, itemMaster)
           : (parseFloat(it.qty) || 0)
         if (effQty <= 0) return   // รายการนี้ส่งครบแล้ว — ข้าม
 
@@ -975,7 +1295,7 @@ export default function Dashboard() {
 
   /** หา id คลังกลาง (ต้นทางโอนเสมอ) + สาขาเดียวที่มี (ปลายทาง default) */
   function transferDefaults() {
-    const mainId = warehouses.find(w => w.type === 'main' || w.isMain)?.id || ''
+    const mainId = (mainWarehouse || warehouses.find(w => w.type === 'main' || w.isMain))?.id || ''
     const branches = warehouses.filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
     return { mainId, defaultTo: branches.length === 1 ? branches[0].id : '' }
   }
@@ -1007,28 +1327,40 @@ export default function Dashboard() {
     setTransferOpen(true)
   }
 
-  /** ยกเลิก/ลบ RF พร้อมบันทึกเหตุผลลง audit_log */
+  /** ปุ่มเดียวฉลาด (ต้องใส่เหตุผลทั้งคู่):
+   *   • partial (ส่งบางส่วนแล้ว) → ปิดใบ (status done · closedRemaining) — ของที่ส่งไปแล้วยังอยู่
+   *   • pending (ยังไม่ส่ง)       → ยกเลิกทั้งใบ (status cancelled) */
   async function deleteRF(rfId, rfRef, reason) {
     if (!reason || reason.trim().length < 3) {
       setToast('⚠️ กรุณาระบุเหตุผลอย่างน้อย 3 ตัวอักษร'); return
     }
+    const rf = refillRequests.find(r => r.id === rfId)
+    const isPartial = rf?.status === 'partial'
     setRfDeleting(true)
     try {
-      await updateDoc(doc(db, COL.REFILL_REQUESTS, rfId), {
-        status: 'cancelled',
-        cancelledBy: name,
-        cancelReason: reason.trim(),
-        cancelledAt: serverTimestamp(),
-      })
-      await addDoc(collection(db, COL.AUDIT_LOGS), {
-        action: 'refill_cancel',
-        staffName: name,
-        detail: `ยกเลิกคำร้อง ${rfRef || rfId.slice(-8)} | เหตุผล: ${reason.trim()}`,
-        timestamp: serverTimestamp(),
-      })
+      if (isPartial) {
+        await updateDoc(doc(db, COL.REFILL_REQUESTS, rfId), {
+          status: 'done', closedRemaining: true,
+          closedBy: name, closedReason: reason.trim(), closedAt: serverTimestamp(),
+        })
+        await addDoc(collection(db, COL.AUDIT_LOGS), {
+          action: 'refill_close', staffName: name, branchId: rf?.branchId || '',
+          detail: `ปิดใบแจ้งเติม ${rfRef || rfId.slice(-8)} — ไม่ส่งส่วนที่ค้าง | เหตุผล: ${reason.trim()}`,
+          timestamp: serverTimestamp(),
+        })
+      } else {
+        await updateDoc(doc(db, COL.REFILL_REQUESTS, rfId), {
+          status: 'cancelled', cancelledBy: name, cancelReason: reason.trim(), cancelledAt: serverTimestamp(),
+        })
+        await addDoc(collection(db, COL.AUDIT_LOGS), {
+          action: 'refill_cancel', staffName: name, branchId: rf?.branchId || '',
+          detail: `ยกเลิกคำร้อง ${rfRef || rfId.slice(-8)} | เหตุผล: ${reason.trim()}`,
+          timestamp: serverTimestamp(),
+        })
+      }
       setRfDeleteId(null)
       setRfDeleteReason('')
-      setToast(`🗑️ ยกเลิกคำร้อง ${rfRef || ''} แล้ว`)
+      setToast(isPartial ? `🚫 ปิดใบ ${rfRef || ''} — ไม่ส่งส่วนที่ค้างแล้ว` : `🗑️ ยกเลิกคำร้อง ${rfRef || ''} แล้ว`)
     } catch(e) {
       console.error(e); setToast('❌ เกิดข้อผิดพลาด')
     } finally {
@@ -1057,6 +1389,7 @@ export default function Dashboard() {
         itemId: it.itemId, itemName: it.itemName, img: it.img,
         category: it.category || 'อื่นๆ',
         qty: parseFloat(it.qty), unit: it.unit,
+        lotPick: it.lotPick || null,   // §9.4 — LOT ที่เลือกส่ง (null = อัตโนมัติ FIFO)
       }))
       // เก็บ RF list ทั้งหมดบน TF เพื่อให้ confirmReceive update done ครบทุกใบ
       const allRfIds  = tfr._rfIds?.length ? tfr._rfIds : (tfr._rfId ? [tfr._rfId] : [])
@@ -1087,6 +1420,7 @@ export default function Dashboard() {
           body: `${fromName} → ${toName} — ${itemsPayload.length} รายการ · รอจัดส่ง`,
           tfRef: tfId, itemCount: itemsPayload.length,
           fromWarehouseId: tfr.fromWH, toWarehouseId: tfr.toWH,
+          notifyAppEditors: !!tfr.toWH,   // editor สาขาปลายทางได้ noti ด้วย · ไม่มีปลายทาง = owner/admin เท่านั้น (กัน branch หลุด)
           createdAt: serverTimestamp(),
           read: false, read_by: [],
         })
@@ -1094,6 +1428,7 @@ export default function Dashboard() {
       } catch {}
       await addDoc(collection(db, COL.AUDIT_LOGS), {
         action: 'transfer_create', staffName: name,
+        fromWarehouseId: tfr.fromWH || '', toWarehouseId: tfr.toWH || '',
         detail: `สร้างใบโอน ${tfId} (เตรียมสินค้า) จาก ${fromName} → ${toName} (${itemsPayload.length} รายการ)${rfRefs ? ' | RF: ' + rfRefs : ''}`,
         timestamp: serverTimestamp()
       })
@@ -1116,6 +1451,7 @@ export default function Dashboard() {
       const toName   = tf.toWarehouseName   || tf.toWarehouseId
       await updateDoc(doc(db, COL.TRANSFER_ORDERS, tf.id), {
         status: 'in_transit', departedBy: name, departedAt: serverTimestamp(),
+        loadedBy: name, loadedAt: serverTimestamp(),   // ✅ เช็คขึ้นรถครบโดยใคร/เมื่อไหร่
       })
       try {
         const nref = await addDoc(collection(db, 'hub_notifications'), {
@@ -1124,12 +1460,14 @@ export default function Dashboard() {
           body: `${fromName} → ${toName} — ${tf.items?.length || 0} รายการ · รอ${toName}ตรวจรับ`,
           tfRef: tf.tfRef || '', itemCount: tf.items?.length || 0,
           fromWarehouseId: tf.fromWarehouseId, toWarehouseId: tf.toWarehouseId,
+          notifyAppEditors: !!tf.toWarehouseId,   // editor สาขาปลายทาง · ไม่มีปลายทาง = owner/admin (กัน branch หลุด)
           createdAt: serverTimestamp(), read: false, read_by: [],
         })
         sendHubPush(nref.id)
       } catch {}
       await addDoc(collection(db, COL.AUDIT_LOGS), {
         action: 'transfer_dispatch', staffName: name,
+        fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
         detail: `ส่งสินค้า ${tf.tfRef || tf.id} จาก ${fromName} → ${toName} · คนนำส่ง: ${tf.driver || '-'}`,
         timestamp: serverTimestamp()
       })
@@ -1139,20 +1477,54 @@ export default function Dashboard() {
     }
   }
 
+  /** ↩️ ถอยใบเตรียมจัดส่ง (preparing) — ยังไม่ตัด stock → ยกเลิกได้เลย + คืน RF เป็น pending */
+  async function cancelPreparingTransfer(tf) {
+    if (!tf || tf.status !== 'preparing') return
+    if (!window.confirm(`↩️ ถอยใบเตรียม ${tf.tfRef || tf.id.slice(-6)}?\n\n• ยกเลิกใบนี้ (ยังไม่ตัด stock — ปลอดภัย)\n• ใบแจ้งเติมที่ผูกไว้กลับเป็น "รอดำเนินการ"`)) return
+    try {
+      const batch = writeBatch(db)
+      batch.update(doc(db, COL.TRANSFER_ORDERS, tf.id), {
+        status: 'cancelled', cancelReason: 'ถอยใบเตรียม (ก่อนส่ง)', cancelledBy: name, cancelledAt: serverTimestamp(),
+      })
+      // คืน RF ที่ผูกไว้ → pending
+      const rfIds = Array.isArray(tf.refillRequestIds) && tf.refillRequestIds.length
+        ? tf.refillRequestIds : (tf.refillRequestId ? [tf.refillRequestId] : [])
+      rfIds.forEach(id => { if (id) batch.update(doc(db, COL.REFILL_REQUESTS, id), { status: 'pending', transferOrderId: null, tfRef: null }) })
+      await batch.commit()
+      await addDoc(collection(db, COL.AUDIT_LOGS), {
+        action: 'transfer_cancel_prepare', staffName: name,
+        fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
+        detail: `ถอยใบเตรียม ${tf.tfRef || tf.id} (ยังไม่ส่ง)${rfIds.length ? ` · คืน RF ${rfIds.length} ใบ` : ''}`,
+        timestamp: serverTimestamp(),
+      })
+      setToast(`↩️ ถอยใบเตรียม ${tf.tfRef || ''} แล้ว`)
+    } catch (e) { console.error(e); setToast('❌ ถอยไม่สำเร็จ') }
+  }
+
   /** เปิด modal รับสินค้า */
   function openReceiveTransfer(tf) {
     setReceivingTF(tf)
     setReceivingChecked(new Set())
+    setReceivingQty({})
     setReceiveTransferOpen(true)
+  }
+
+  // ติ๊กรับ/ยกเลิกรายการ — ตอนติ๊กครั้งแรก default ยอดรับจริง = ยอดที่ส่งมา (แก้เป็น 0/ยอดอื่นได้)
+  function toggleReceiveItem(idx, plannedQty) {
+    const isOn = receivingChecked.has(idx)
+    setReceivingChecked(prev => { const n = new Set(prev); isOn ? n.delete(idx) : n.add(idx); return n })
+    if (!isOn) setReceivingQty(q => (q[idx] != null ? q : { ...q, [idx]: String(plannedQty ?? '') }))
   }
 
   /** ยืนยันรับสินค้า — ปรับ stock ทั้ง 2 ฝั่ง */
   async function confirmReceiveTransfer() {
     if (!receivingTF) return
     const tf = receivingTF
-    const allIndices = new Set((tf.items || []).map((_, i) => i))
-    const allChecked = [...allIndices].every(i => receivingChecked.has(i))
-    if (!allChecked) { setToast('⚠️ กรุณาติ๊กถูกทุกรายการก่อนยืนยัน'); return }
+    // ต้องติ๊กทุกรายการก่อนรับ — ของที่ไม่มาให้กรอก 0
+    const allChecked = (tf.items || []).every((_, i) => receivingChecked.has(i))
+    if (!allChecked) { setToast('⚠️ ติ๊กให้ครบทุกรายการ — ของที่ไม่มาให้กรอก 0'); return }
+    // ยอดรับจริงต่อ index = ยอดที่กรอก (default = ที่ส่งมา · กรอก 0 ได้)
+    const actualOf = (it, ix) => parseFloat(receivingQty[ix] ?? it.qty) || 0
     setReceivingSaving(true)
     try {
       const batch = writeBatch(db)
@@ -1160,15 +1532,14 @@ export default function Dashboard() {
       const toName   = tf.toWarehouseName   || tf.toWarehouseId
       // ปรับ stock + LOT ทั้ง 2 ฝั่ง — แปลงเป็น unitUse ก่อน (stock_balances + LOT เก็บใน unitUse)
       const lotTransfers = []   // เก็บ FIFO breakdown สำหรับ audit log
-      for (const it of (tf.items || [])) {
+      for (let _ix = 0; _ix < (tf.items || []).length; _ix++) {
+        const it = tf.items[_ix]
         const itemMeta = items.find(i => i.id === it.itemId)
-        const factor   = parseConvFactor(itemMeta?.unitConversion) || 1
         const unitUse  = itemMeta?.unitUse || it.unit || ''
-        // ถ้าหน่วยที่โอนเป็น unitBase → คูณ factor; ถ้าเป็น unitUse → ใช้ตรงๆ
-        const qtyIn    = parseFloat(it.qty) || 0
-        const addQtyUse = (it.unit && itemMeta?.unitBase && it.unit === itemMeta.unitBase)
-          ? qtyIn * factor
-          : qtyIn
+        // ยอดรับจริง — ติ๊ก=ตามที่กรอก · ไม่ติ๊ก=0 (ไม่ได้โอนมา) แปลงเป็น unitUse
+        const qtyIn    = actualOf(it, _ix)
+        const addQtyUse = qtyToUse(qtyIn, it.unit, itemMeta)
+        if (addQtyUse <= 0) continue   // รับ 0 / ไม่ติ๊ก → ไม่ขยับ stock/LOT (ส่วนที่ขาด → RF)
 
         // ── 1. STOCK_BALANCES ─────────────────────────────────────
         // เพิ่มที่ปลายทาง
@@ -1196,6 +1567,7 @@ export default function Dashboard() {
           qty: -addQtyUse, qtyUse: -addQtyUse,
           unit: unitUse, unitUse,
           staffPhone: window._bizSession?.phone || '', staffName: name,
+          createdByName: tf.createdBy || '', receivedByName: name,
           note: `${noteBase} → ${toName}`,
           transferTfId: tf.id, transferRef: tf.tfRef || '',
           timestamp: serverTimestamp(),
@@ -1207,6 +1579,7 @@ export default function Dashboard() {
           qty: addQtyUse, qtyUse: addQtyUse,
           unit: unitUse, unitUse,
           staffPhone: window._bizSession?.phone || '', staffName: name,
+          createdByName: tf.createdBy || '', receivedByName: name,
           note: `${noteBase} ← ${fromName}`,
           transferTfId: tf.id, transferRef: tf.tfRef || '',
           timestamp: serverTimestamp(),
@@ -1215,17 +1588,23 @@ export default function Dashboard() {
         // ── 2. LOT TRACKING (FIFO) — sync ทั้ง 2 ฝั่ง ─────────────
         //   ต้นทาง: หัก LOT ตาม FIFO (รับก่อนใช้ก่อน)
         //   ปลายทาง: สร้าง/เพิ่ม LOT ใหม่ ผูกกับ parentLotId เพื่อ traceability
-        const srcLots = sortLotsFIFO(
+        //   item ที่ปิดระบบ LOT (lotEnabled=false) → srcLots ว่าง = ข้ามทั้งหัก/สร้าง LOT
+        const srcLots = itemMeta?.lotEnabled === false ? [] : sortLotsFIFO(
           lots.filter(l => l.itemId === it.itemId
             && l.warehouseId === tf.fromWarehouseId
-            && (Number(l.inWarehouse) || 0) > 0
+            && getLotAvail(l, tf.fromWarehouseId) > 0
             && l.status !== 'split')
         )
+        // §9.4 — ถ้าผู้โอนเลือก LOT เจาะจง → ดันขึ้นหน้าสุด (ที่เหลือยัง FIFO)
+        if (it.lotPick) {
+          const pi = srcLots.findIndex(l => l.id === it.lotPick)
+          if (pi > 0) { const [pick] = srcLots.splice(pi, 1); srcLots.unshift(pick) }
+        }
         let remain = addQtyUse
         const allocations = []
         for (const lot of srcLots) {
           if (remain <= 0) break
-          const avail = Number(lot.inWarehouse) || 0
+          const avail = getLotAvail(lot, tf.fromWarehouseId)
           const take  = Math.min(avail, remain)
           if (take > 0) {
             allocations.push({ srcLot: lot, take })
@@ -1233,25 +1612,33 @@ export default function Dashboard() {
           }
         }
         // ถ้า LOT มีไม่พอ → log แต่ก็โอนตามที่กรอก (stock_balances ถูก deduct ไปแล้ว)
-        if (remain > 0) {
+        if (remain > 0 && itemMeta?.lotEnabled !== false) {
           console.warn('[transfer] LOT ไม่พอ — โอนต่อ', { itemName: it.itemName, shortage: remain })
         }
         // Apply allocations
         for (const a of allocations) {
-          // หัก src LOT
+          // หัก src LOT — รักษา 2 schema ให้ตรงกัน (inWarehouse + locationQty)
           const srcRef = doc(db, COL.LOT_TRACKING, a.srcLot.id)
-          batch.update(srcRef, {
-            inWarehouse: Math.max(0, (Number(a.srcLot.inWarehouse) || 0) - a.take),
-            lastUpdated: serverTimestamp(),
-          })
+          const srcUpd = { lastUpdated: serverTimestamp() }
+          if (a.srcLot.locationQty && typeof a.srcLot.locationQty === 'object') {
+            srcUpd[`locationQty.${tf.fromWarehouseId}`] = Math.max(0, (Number(a.srcLot.locationQty[tf.fromWarehouseId]) || 0) - a.take)
+          }
+          srcUpd.inWarehouse = Math.max(0, (Number(a.srcLot.inWarehouse) || 0) - a.take)
+          batch.update(srcRef, srcUpd)
           // สร้าง/upsert dest LOT (id = srcLotId__to__destWH เพื่อกัน collision)
           const destLotId = `${a.srcLot.id}__to__${tf.toWarehouseId}`
           const destRef   = doc(db, COL.LOT_TRACKING, destLotId)
           const destSnap  = await getDoc(destRef)
           if (destSnap.exists()) {
+            const dPrev = Number(destSnap.data().inWarehouse) || 0
+            const newTotalQty = (Number(destSnap.data().totalQty) || 0) + a.take
             batch.update(destRef, {
-              inWarehouse: (Number(destSnap.data().inWarehouse) || 0) + a.take,
-              totalQty:    (Number(destSnap.data().totalQty) || 0) + a.take,
+              inWarehouse: dPrev + a.take,
+              totalQty:    newTotalQty,
+              // qty ต้องเท่ากับ totalQty เสมอ (ยอดรับสะสมทั้งหมด) — ห้ามใช้ dPrev (=inWarehouse ที่ลดลงเมื่อถูกใช้ไปแล้ว)
+              // ไม่งั้นยอด "รวม" ที่การ์ด LOT โชว์จะต่ำกว่าความจริงทุกครั้งที่มีการโอนซ้ำเข้า lot เดิมหลังถูกใช้ไปบางส่วน
+              qty:         newTotalQty,
+              [`locationQty.${tf.toWarehouseId}`]: dPrev + a.take,
               lastUpdated: serverTimestamp(),
             })
           } else {
@@ -1266,6 +1653,8 @@ export default function Dashboard() {
               inWarehouse: a.take,
               inShop:      0,
               used:        0,
+              qty:         a.take,
+              locationQty: { [tf.toWarehouseId]: a.take },
               source:      a.srcLot.source || '',
               parentLotId: a.srcLot.id,            // ลิงก์กลับไป LOT แม่ที่คลังกลาง
               transferTfId: tf.id,
@@ -1282,9 +1671,14 @@ export default function Dashboard() {
           })
         }
       }
-      // อัปเดต TF
+      // อัปเดต TF — เก็บยอดรับจริงต่อรายการ (receivedQty) + ธงของมาไม่ครบ
+      const receivedItems = (tf.items || []).map((it, ix) => ({
+        ...it, receivedQty: actualOf(it, ix),
+      }))
+      const hasShortage = receivedItems.some(it => (it.receivedQty || 0) < (parseFloat(it.qty) || 0))
       batch.update(doc(db, COL.TRANSFER_ORDERS, tf.id), {
-        status: 'received', receivedBy: name, receivedAt: serverTimestamp()
+        status: 'received', receivedBy: name, receivedAt: serverTimestamp(),
+        items: receivedItems, ...(hasShortage ? { hadShortage: true } : {}),
       })
       // อัปเดต RF → done
       // อัพเดท RF ทั้งหมดที่ link กับ TF นี้ → done (รองรับทั้ง array ใหม่ + legacy)
@@ -1296,15 +1690,13 @@ export default function Dashboard() {
       // helper: แปลงจำนวน (ตามหน่วยที่บันทึก) → unitUse
       const toUse = (qty, unit, itemId) => {
         const master = items.find(i => i.id === itemId)
-        const factor = parseConvFactor(master?.unitConversion) || 1
-        const q = parseFloat(qty) || 0
-        return (unit && master?.unitBase && unit === master.unitBase) ? q * factor : q
+        return qtyToUse(parseFloat(qty) || 0, unit, master)   // รองรับหน่วยหลายชั้น
       }
-      // 1. ยอดรับจริงต่อ itemId (unitUse) จากใบโอนนี้
+      // 1. ยอดรับจริงต่อ itemId (unitUse) จากใบโอนนี้ — ใช้ยอดรับจริง (ของมาไม่ครบ → RF ค้างไว้รอบหน้า)
       const receivedPool = {}
-      for (const it of (tf.items || [])) {
-        receivedPool[it.itemId] = (receivedPool[it.itemId] || 0) + toUse(it.qty, it.unit, it.itemId)
-      }
+      ;(tf.items || []).forEach((it, ix) => {
+        receivedPool[it.itemId] = (receivedPool[it.itemId] || 0) + toUse(actualOf(it, ix), it.unit, it.itemId)
+      })
       // 2. กระจายให้รายการในแต่ละ RF ตามลำดับ — เติมยอดที่ยังค้างก่อน
       rfIdsToFinish.forEach(rfId => {
         if (!rfId) return
@@ -1326,12 +1718,35 @@ export default function Dashboard() {
           ...(allDone ? { completedAt: serverTimestamp() } : { partialAt: serverTimestamp() }),
         })
       })
+      // ── ส่วนที่ขาด → สร้างใบแจ้งเติม (RF) ใหม่ ให้สาขาปลายทาง ──
+      //   เฉพาะใบโอนที่ "ไม่ได้ผูก RF เดิม" · ใบที่ผูก RF อยู่แล้ว RF เดิมเป็น 'partial' ครอบให้แล้ว (กันสร้างซ้ำ)
+      let shortRfRef = ''
+      if (rfIdsToFinish.length === 0) {
+        const shortItems = receivedItems
+          .map(it => ({ it, short: (parseFloat(it.qty) || 0) - (it.receivedQty || 0) }))
+          .filter(x => x.short > 1e-9)
+          .map(({ it, short }) => ({
+            itemId: it.itemId, itemName: it.itemName, img: it.img || '📦',
+            category: it.category || 'อื่นๆ', unit: it.unit, qty: Number(short.toFixed(2)),
+          }))
+        if (shortItems.length) {
+          const _n = new Date()
+          shortRfRef = `RF-${String(_n.getMonth() + 1).padStart(2, '0')}.${String(_n.getFullYear()).slice(-2)}-${String(Date.now()).slice(-2)}`
+          batch.set(doc(collection(db, COL.REFILL_REQUESTS)), {
+            rfRef: shortRfRef, status: 'pending', items: shortItems,
+            branchId: tf.toWarehouseId, branchName: tf.toWarehouseName || toName || '',
+            requestedBy: name, requestedAt: serverTimestamp(),
+            fromTransferRef: tf.tfRef || tf.id,   // ลิงก์ย้อนกลับว่ามาจากใบโอนไหน
+          })
+        }
+      }
       await batch.commit()
       const lotSummary = lotTransfers.length
         ? ` · LOT: ${lotTransfers.map(t => `${t.itemName} ${t.from}→${t.to.slice(-5)} -${t.take}${t.unit}`).join(', ').slice(0, 200)}`
         : ''
       await addDoc(collection(db, COL.AUDIT_LOGS), {
         action: 'transfer_received', staffName: name,
+        fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
         detail: `รับสินค้า ${tf.tfRef || tf.id} จาก ${fromName} · คนนำส่ง: ${tf.driver || '-'} · รับโดย: ${name}${lotSummary}`,
         timestamp: serverTimestamp()
       })
@@ -1339,10 +1754,13 @@ export default function Dashboard() {
       try {
         const nref = await addDoc(collection(db, 'hub_notifications'), {
           app: 'inventory', type: 'transfer-received', tag: 'stock',
-          title: `📦 รับสินค้า ${tf.tfRef || tf.id?.slice(-6)} แล้ว`,
-          body: `${toName} ยืนยันรับครบ · จาก ${fromName} · โดย ${name}`,
+          title: `📦 รับสินค้า ${tf.tfRef || tf.id?.slice(-6)} ${hasShortage ? '(บางส่วน)' : 'แล้ว'}`,
+          body: hasShortage
+            ? `${toName} รับบางส่วน (ของมาไม่ครบ) · จาก ${fromName} · โดย ${name}${shortRfRef ? ` · ขาด → ${shortRfRef}` : ''}`
+            : `${toName} ยืนยันรับครบ · จาก ${fromName} · โดย ${name}`,
           tfRef: tf.tfRef || tf.id, itemCount: tf.items?.length || 0,
           fromWarehouseId: tf.fromWarehouseId, toWarehouseId: tf.toWarehouseId,
+          notifyAppEditors: !!tf.toWarehouseId,   // editor สาขาปลายทาง · ไม่มีปลายทาง = owner/admin (กัน branch หลุด)
           createdAt: serverTimestamp(),
           read: false, read_by: [],
         })
@@ -1350,7 +1768,11 @@ export default function Dashboard() {
       } catch {}
       setReceiveTransferOpen(false)
       setReceivingTF(null)
-      setToast(`✅ รับสินค้า ${tf.tfRef || ''} ครบถ้วน — stock + LOT อัปเดตทั้ง 2 คลัง`)
+      setToast(hasShortage
+        ? (shortRfRef
+            ? `✅ รับ ${tf.tfRef || ''} ตามจริง — ของที่ขาดสร้างใบแจ้งเติม ${shortRfRef} แล้ว`
+            : `✅ รับ ${tf.tfRef || ''} ตามจริง — ส่วนที่ขาดค้างที่ใบแจ้งเติมเดิม`)
+        : `✅ รับสินค้า ${tf.tfRef || ''} ครบถ้วน — stock + LOT อัปเดตทั้ง 2 คลัง`)
     } catch(e) {
       console.error(e); setToast('❌ เกิดข้อผิดพลาด')
     } finally {
@@ -1358,14 +1780,16 @@ export default function Dashboard() {
     }
   }
 
-  const todayStr = toThaiDate()
-
   // Bell alert count: unresolved low_stock_alerts + expiring lots
   const unresolvedAlerts = alerts.filter(a => a.resolved !== true)
   // live count: นับจาก balances (item × wh ที่ qty ≤ minQty) — รวมทุกคลัง
+  // ข้ามรายการที่ปิดแจ้งเตือนใน Master (alertEnabled=false) + ที่ไม่มีใน Master → ตรงกับ list กระดิ่ง
   const liveAlertCount = balances.filter(b => {
     const wh = warehouses.find(w => w.id === b.warehouseId)
     if (!wh || wh.active === false) return false
+    const item = items.find(i => i.id === b.itemId)
+    if (!item) return false
+    if (item.alertEnabled === false) return false
     return (b.minQty || 0) > 0 && (b.qty || 0) <= (b.minQty || 0)
   }).length
   const alertCount = liveAlertCount + expAlerts.length
@@ -1386,37 +1810,16 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Date bar (bell ย้ายไป topbar แล้ว) */}
-      <div style={{ padding: '10px 1rem 0' }}>
-        <div style={{ fontSize: 12, color: 'var(--txt3)', fontWeight: 500 }}>{todayStr}</div>
-      </div>
-
-      {/* Warehouse segment — สาขา ก่อน, แล้วคลังกลาง, ทุกร้านท้ายสุด */}
-      <div style={{ padding: '0 1rem' }}>
-        <div className="segment">
-          {[...warehouses]
-            .sort((a, b) => {
-              const ra = (a.type === 'main' || a.isMain) ? 1 : 0  // main → ทีหลัง
-              const rb = (b.type === 'main' || b.isMain) ? 1 : 0
-              return ra - rb
-            })
-            .map(w => (
-              <button key={w.id} className={`seg-btn${wh === w.id ? ' active' : ''}`} onClick={() => setWh(w.id)}>
-                {w.name}
-              </button>
-            ))}
-          <button className={`seg-btn${wh === 'all' ? ' active' : ''}`} onClick={() => setWh('all')}>ทุกร้าน</button>
-        </div>
-      </div>
+      {/* (ยุบแถบวันที่ออก — วันที่แสดงอยู่ใน hero card แล้ว · กระชับบนมือถือ) */}
 
       {/* ⚡ Action grid (ย้ายมาบนสุดให้กดได้ทันที ไม่ต้องเลื่อนลง) */}
       <div>
         <div className="section-label">⚡ ทำรายการ</div>
         <div style={{ padding: '0 1rem' }}>
           <div className="action-grid">
-            <button className="action-btn" onClick={() => isEditor() && setReceiveOpen(true)}>
-              <span className="action-icon">📥</span>
-              <span className="action-label">รับสินค้า</span>
+            <button className="action-btn" onClick={() => isEditor() && openPO()}>
+              <span className="action-icon">🛒</span>
+              <span className="action-label">สั่งซื้อ</span>
             </button>
             <button className="action-btn"
               onClick={() => isOwner() ? openTransferBlank() : setToast('⚠️ เฉพาะ Owner / Admin สร้างใบโอนได้')}>
@@ -1424,39 +1827,7 @@ export default function Dashboard() {
               <span className="action-label">โอนสินค้า</span>
             </button>
             <button className="action-btn" onClick={() => { setRefillStep('branch'); setRefillBranch(''); setRefillOpen(true) }}>
-              <span className="action-icon" style={{ position: 'relative' }}>
-                🧾
-                {(() => {
-                  const lowList = balances.filter(b => {
-                    const wh = warehouses.find(w => w.id === b.warehouseId)
-                    if (!wh || wh.active === false) return false
-                    if (wh.type === 'main' || wh.isMain) return false
-                    return (b.minQty || 0) > 0 && (b.qty || 0) <= (b.minQty || 0)
-                  })
-                  const lowCount = lowList.length
-                  if (lowCount === 0) return null
-                  const byBranch = {}
-                  lowList.forEach(b => {
-                    const wh = warehouses.find(w => w.id === b.warehouseId)
-                    const it = items.find(i => i.id === b.itemId)
-                    if (!wh || !it) return
-                    if (!byBranch[wh.name]) byBranch[wh.name] = []
-                    byBranch[wh.name].push(`${it.displayName || it.name} (เหลือ ${b.qty || 0}/ขั้นต่ำ ${b.minQty})`)
-                  })
-                  const tip = Object.entries(byBranch).map(([w, list]) =>
-                    `📍 ${w} (${list.length}):\n  • ${list.slice(0,5).join('\n  • ')}${list.length>5?`\n  • ...(+${list.length-5})`:''}`
-                  ).join('\n\n')
-                  return (
-                    <span title={`${lowCount} รายการที่ stock ≤ ขั้นต่ำ\n\n${tip}`}
-                      style={{
-                        position: 'absolute', top: -4, right: -4, background: 'var(--red)',
-                        color: '#fff', borderRadius: '50%', width: 14, height: 14,
-                        fontSize: 9, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        cursor: 'help',
-                      }}>{lowCount}</span>
-                  )
-                })()}
-              </span>
+              <span className="action-icon">🧾</span>
               <span className="action-label">แจ้งเติมของ</span>
             </button>
             <button className="action-btn" onClick={() => setWasteOpen(true)}>
@@ -1521,13 +1892,15 @@ export default function Dashboard() {
               }
               const dispName = item.displayName || item.name
               if (b.qty <= 0) {
-                outItems.push(`${dispName}${tag} — หมด${min > 0 ? ` · min ${minDisplay}` : ''}`)
+                outItems.push({ text: `${dispName}${tag} — หมด${min > 0 ? ` · MIN ${minDisplay}` : ''}`, level: 'out' })
               } else if (min > 0 && b.qty <= min) {
-                let status = ''
-                if (b.qty === min) status = '(พอดีขั้นต่ำ)'
-                else if (b.qty <= min * 0.3) status = `(วิกฤต — ขาด ${(min - b.qty).toFixed(0)} ${unit})`
-                else status = `(ขาด ${(min - b.qty).toFixed(0)} ${unit})`
-                lowItems.push(`${dispName}${tag} — เหลือ ${b.qty} ${unit} · min ${minDisplay} ${status}`)
+                if (b.qty === min) {
+                  lowItems.push({ text: `${dispName}${tag} — เหลือ ${b.qty} ${unit} · MIN ${minDisplay} (พอดีขั้นต่ำ)`, level: 'ok' })
+                } else if (b.qty <= min * 0.3) {
+                  lowItems.push({ text: `${dispName}${tag} — เหลือ ${b.qty} ${unit} · MIN ${minDisplay} (วิกฤต — ขาด ${(min - b.qty).toFixed(0)} ${unit})`, level: 'critical' })
+                } else {
+                  lowItems.push({ text: `${dispName}${tag} — เหลือ ${b.qty} ${unit} · MIN ${minDisplay} (ขาด ${(min - b.qty).toFixed(0)} ${unit})`, level: 'low' })
+                }
               }
             })
             // Card factory: เพิ่ม "i" icon + popover (hover desktop / tap mobile)
@@ -1544,9 +1917,9 @@ export default function Dashboard() {
               return (
                 <div className="kpi-card"
                   style={{ position: 'relative', cursor: hasItems ? 'pointer' : 'default' }}
-                  onMouseEnter={() => { if (hasItems) { cancelClose(); setKpiPop(key) } }}
+                  onMouseEnter={e => { if (hasItems) { cancelClose(); setKpiPopRect(e.currentTarget.getBoundingClientRect()); setKpiPop(key) } }}
                   onMouseLeave={scheduleClose}
-                  onClick={() => hasItems && setKpiPop(p => p === key ? null : key)}>
+                  onClick={e => { if (hasItems) { setKpiPopRect(e.currentTarget.getBoundingClientRect()); setKpiPop(p => p === key ? null : key) } }}>
                   {/* i icon มุมขวาบน */}
                   {hasItems && (
                     <span style={{ position: 'absolute', top: 6, right: 6,
@@ -1566,26 +1939,41 @@ export default function Dashboard() {
                     <div onClick={e => e.stopPropagation()}
                       onMouseEnter={cancelClose}
                       onMouseLeave={scheduleClose}
-                      style={{ position: 'absolute', top: '100%', right: 0, marginTop: 8,
+                      style={{ position: 'fixed',   // fixed = ไม่ขยาย document → หน้าไม่ขยับ
+                        top:    kpiPopRect && (window.innerHeight - kpiPopRect.bottom >= 320) ? kpiPopRect.bottom + 8 : undefined,
+                        bottom: kpiPopRect && (window.innerHeight - kpiPopRect.bottom <  320) ? (window.innerHeight - kpiPopRect.top + 8) : undefined,
+                        left: '50%', transform: 'translateX(-50%)',
+                        width: 'min(320px, calc(100vw - 24px))',
                         background: '#fff', border: `1.5px solid ${color}`,
-                        borderRadius: 12, padding: '10px 12px', minWidth: 240, maxWidth: 320,
-                        boxShadow: '0 8px 24px rgba(0,0,0,.15)', zIndex: 100,
+                        borderRadius: 12, padding: '10px 12px',
+                        boxShadow: '0 8px 24px rgba(0,0,0,.15)', zIndex: 9999,
                         fontSize: 11, animation: 'kpiPopIn .15s ease' }}>
-                      <style>{`@keyframes kpiPopIn { from {opacity:0;transform:translateY(-4px)} to {opacity:1;transform:translateY(0)} }`}</style>
+                      <style>{`@keyframes kpiPopIn { from {opacity:0;transform:translateX(-50%) translateY(-4px)} to {opacity:1;transform:translateX(-50%) translateY(0)} }`}</style>
                       <div style={{ fontWeight: 800, color, marginBottom: 6, display: 'flex',
                         justifyContent: 'space-between', alignItems: 'center' }}>
                         <span>{label} ({list.length})</span>
                         <button onClick={() => setKpiPop(null)}
                           style={{ border: 'none', background: 'transparent', cursor: 'pointer',
-                            fontSize: 14, color: '#9CA3AF', padding: 0, lineHeight: 1 }}>✕</button>
+                            fontSize: 14, color: '#9CA3AF', padding: 0, lineHeight: 1 }}>×</button>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 3,
                         maxHeight: 280, overflowY: 'auto' }}>
-                        {list.slice(0, 30).map((s, i) => (
-                          <div key={i} style={{ padding: '3px 0', borderBottom: i < list.length - 1 ? '1px solid #F3F4F6' : 'none', color: '#374151' }}>
-                            • {s}
-                          </div>
-                        ))}
+                        {list.slice(0, 30).map((item, i) => {
+                          const tc =
+                            item.level === 'ok'       ? '#D97706' :
+                            item.level === 'low'      ? '#DC2626' :
+                            item.level === 'critical' ? '#991B1B' :
+                            item.level === 'out'      ? '#DC2626' : '#374151'
+                          const sep = item.text.indexOf(' — ')
+                          const namePart   = sep >= 0 ? item.text.slice(0, sep) : item.text
+                          const detailPart = sep >= 0 ? item.text.slice(sep) : ''
+                          return (
+                            <div key={i} style={{ padding: '3px 0', borderBottom: i < list.length - 1 ? '1px solid #F3F4F6' : 'none' }}>
+                              • <span style={{ fontWeight: 700, color: '#1C1C1E' }}>{namePart}</span>
+                              <span style={{ color: tc, fontWeight: item.level === 'critical' ? 700 : 400 }}>{detailPart}</span>
+                            </div>
+                          )
+                        })}
                         {list.length > 30 && (
                           <div style={{ padding: '4px 0', color: '#9CA3AF', textAlign: 'center', fontSize: 10 }}>
                             ...(+{list.length - 30} รายการ)
@@ -1624,18 +2012,20 @@ export default function Dashboard() {
         // รวม items จาก todayCutLogs ทั้งหมด (สะสมยอด) — กรอง cancelled/deleted + staffFilter
         const accumulated = {}
         const staffSet = []
+        let cutCount = 0   // จำนวน "ครั้ง" (ใบตัด) ที่ผ่าน staffFilter
         todayCutLogs.forEach(log => {
           if (log.cancelled || log.deletedAt) return  // ข้าม log ที่ยกเลิกทั้งใบ
           const sn = log.staffName || log.staffPhone || '?'
           if (!staffSet.includes(sn)) staffSet.push(sn)
           if (staffFilter.size > 0 && !staffFilter.has(sn)) return   // 🔎 filter ตามคนตัด
+          cutCount++   // นับครั้งเฉพาะใบที่ผ่าน filter
           ;(log.items || []).forEach(it => {
             if (it.cancelled) return                   // ข้าม item ที่ยกเลิกราย-line
             const key = it.itemName || it.itemId
             const masterItem = items.find(i => i.id === it.itemId)
             if (accumulated[key]) accumulated[key].qty += (it.qtyUse || it.qty || 0)
             else accumulated[key] = {
-              name: it.itemName || key,
+              name: masterItem?.displayName || it.itemName || key,
               cat: masterItem?.category || 'อื่นๆ',
               sortOrder: masterItem?.sortOrder ?? 999,   // ใช้ sortOrder เรียงใน category
               qty: it.qtyUse || it.qty || 0,
@@ -1734,7 +2124,7 @@ export default function Dashboard() {
 
             {/* ── Popup ── */}
             {cutSummaryOpen && (
-              <div onClick={() => setCutSummaryOpen(false)}
+              <div onClick={() => { setCutSumXBounce(false); requestAnimationFrame(() => requestAnimationFrame(() => setCutSumXBounce(true))) }}
                 style={{
                   position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 200,
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1743,7 +2133,7 @@ export default function Dashboard() {
                 }}>
                 <div onClick={e => e.stopPropagation()}
                   style={{
-                    background: '#fff', borderRadius: 20,
+                    background: '#fff', borderRadius: 20, overflow: 'hidden',  /* clip เนื้อหาให้มุมมนครบ 4 ด้าน */
                     width: 'min(560px, 92vw)',                /* PC กว้างขึ้น */
                     maxHeight: 'min(78vh, 720px)',             /* PC สูงขึ้น */
                     minHeight: 280, display: 'flex', flexDirection: 'column',
@@ -1757,9 +2147,11 @@ export default function Dashboard() {
                     padding: '12px 16px 10px', borderBottom: '1px solid var(--border)', flexShrink: 0
                   }}>
                     <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--txt1)' }}>📋 สรุปตัดสต็อกวันนี้</div>
-                    <button onClick={() => setCutSummaryOpen(false)}
-                      style={{ border: 'none', background: '#F3F4F6', borderRadius: '50%', width: 28, height: 28,
-                        fontSize: 13, cursor: 'pointer', color: '#555', display:'flex', alignItems:'center', justifyContent:'center' }}>✕</button>
+                    <button onClick={() => setCutSummaryOpen(false)} aria-label="ปิด"
+                      onAnimationEnd={() => setCutSumXBounce(false)}
+                      style={{ border: '1.5px solid #FCA5A5', background: '#FEE2E2', borderRadius: '50%', width: 30, height: 30,
+                        fontSize: 14, fontWeight: 800, cursor: 'pointer', color: '#DC2626', display:'flex', alignItems:'center', justifyContent:'center',
+                        animation: cutSumXBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
                   </div>
 
                   <div style={{ overflowY: 'auto', flex: 1, WebkitOverflowScrolling: 'touch' }}>
@@ -1827,16 +2219,17 @@ export default function Dashboard() {
                         </div>
                         {bycat[cat].map((it, idx) => (
                           <div key={it.name} style={{
-                            display: 'flex', alignItems: 'center', gap: 8,
+                            display: 'flex', alignItems: 'center', gap: 6,
                             padding: '7px 16px 7px 36px', borderTop: '1px solid var(--bg)',
                             animation: 'rowIn .3s ease both',
                             animationDelay: `${ci * 40 + (idx + 1) * 35}ms`
                           }}>
-                            <span style={{ flex: 1, fontSize: 13, color: 'var(--txt1)', fontWeight: 600 }}>{it.name}</span>
-                            <div style={{ flex: 1, borderBottom: '1.5px dotted #E5E7EB', margin: '0 6px',
-                              alignSelf: 'flex-end', marginBottom: 4, maxWidth: 60 }} />
-                            <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--red)', whiteSpace: 'nowrap' }}>{it.qty}</span>
-                            <span style={{ fontSize: 11, color: 'var(--txt3)', fontWeight: 600, whiteSpace: 'nowrap' }}>{it.unit}</span>
+                            <span style={{ flex: 1, fontSize: 13, color: 'var(--txt1)', fontWeight: 600, minWidth: 0 }}>{it.name}</span>
+                            <div style={{ flex: 1, borderBottom: '1.5px dotted #E5E7EB', alignSelf: 'flex-end', marginBottom: 4 }} />
+                            <span style={{ width: 36, textAlign: 'right', fontSize: 13, fontWeight: 800, color: 'var(--red)', flexShrink: 0 }}>
+                              {Number.isInteger(it.qty) ? it.qty : parseFloat(it.qty.toFixed(2))}
+                            </span>
+                            <span style={{ width: 36, fontSize: 11, color: 'var(--txt3)', fontWeight: 600, flexShrink: 0 }}>{it.unit}</span>
                           </div>
                         ))}
                       </div>
@@ -1850,7 +2243,7 @@ export default function Dashboard() {
                     }}>
                       <span style={{ fontSize: 12, color: 'var(--txt3)', fontWeight: 600 }}>รวมทั้งหมด</span>
                       <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--txt1)' }}>
-                        {allItems.length} รายการ · {kpi.cuts} ครั้ง
+                        {allItems.length} รายการ · {cutCount} ครั้ง
                       </span>
                     </div>
                   </div>
@@ -1863,10 +2256,29 @@ export default function Dashboard() {
 
       {/* ── Flow Status Cards ── */}
       {(() => {
-        const rfPending    = refillRequests.filter(r => r.status === 'pending')
-        const lowAlerts    = alerts.filter(a => a.resolved !== true)
-        // หมายเหตุ: สถานะใบโอน (เตรียม/นำส่ง) ย้ายไปแสดงเป็น section เต็มด้านล่างแล้ว (ไม่ซ้ำ)
-        const hasAny = rfPending.length || lowAlerts.length || expAlerts.length
+        // 🏪 กรองตามสาขาที่เลือก ('' หรือ 'all' = ทุกสาขา)
+        const whAll    = !wh || wh === 'all'
+        const inBranch = (id) => whAll || id === wh
+        const rfPending    = refillRequests.filter(r => r.status === 'pending' && (whAll || r.branchId === wh))
+        const pendingLots  = lots.filter(l => l.pendingInfo && ((l.inWarehouse || 0) + (l.inShop || 0)) > 0 && inBranch(l.warehouseId)
+          && items.find(m => m.id === l.itemId)?.lotEnabled !== false)   // 🔕 item ปิด LOT → ไม่ทวงข้อมูล
+        // EXP เฉพาะสาขาที่เลือก — recompute จาก lots (กรองสาขา → dedup 1 chip/สินค้า) กัน LOT แม่+ลูกข้ามคลัง
+        const _in7 = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+        const _byItem = {}
+        lots.forEach(lot => {
+          if (!inBranch(lot.warehouseId)) return
+          if (items.find(m => m.id === lot.itemId)?.lotEnabled === false) return   // 🔕 item ปิด LOT → ไม่เตือน EXP
+          const qty = (lot.inWarehouse || 0) + (lot.inShop || 0)
+          if (qty <= 0 || !lot.expDate) return
+          const exp = new Date(lot.expDate)
+          if (exp > _in7) return
+          const daysLeft = Math.ceil((exp - new Date()) / (1000 * 60 * 60 * 24))
+          const k = lot.itemId || lot.itemName
+          if (!_byItem[k] || daysLeft < _byItem[k].daysLeft) _byItem[k] = { ...lot, daysLeft }
+        })
+        const branchExpAlerts = Object.values(_byItem)
+        // low/out stock → ดูที่ 🔔 กระดิ่ง (คำนวณสด) · ใบโอน → section ด้านล่าง · ที่นี่เหลือ RF + EXP + LOT รอข้อมูล
+        const hasAny = rfPending.length || branchExpAlerts.length || pendingLots.length
 
         const FlowCard = ({ icon, title, sub, badge, badgeColor, badgeBg, borderColor, bg, onClick }) => (
           <div onClick={onClick}
@@ -1904,30 +2316,24 @@ export default function Dashboard() {
                 />
               )}
 
-              {/* Low stock */}
-              {lowAlerts.length > 0 && (
-                <div>
-                  <div style={{ display: 'flex', gap: 6, overflowX: 'auto',
-                    scrollbarWidth: 'none', paddingBottom: 2 }}>
-                    {lowAlerts.map(a => (
-                      <div key={a.id} style={{ flexShrink: 0, borderRadius: 20, padding: '5px 12px',
-                        fontSize: 11, fontWeight: 700,
-                        background: a.currentQty <= 0 ? '#FEE2E2' : '#FFF7ED',
-                        border: `1px solid ${a.currentQty <= 0 ? '#FCA5A5' : '#FDE68A'}`,
-                        color: a.currentQty <= 0 ? '#DC2626' : '#92600A' }}>
-                        {a.currentQty <= 0 ? '🔴' : '🟡'} {a.itemName}
-                        <span style={{ opacity: 0.7, marginLeft: 4 }}>เหลือ {a.currentQty} {a.unit||''}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+              {/* 📅 LOT รอเพิ่มข้อมูล (วันหมดอายุ) — รับสินค้าแล้วแต่ยังไม่ใส่ exp */}
+              {pendingLots.length > 0 && (
+                <FlowCard
+                  icon="📅" bg="#F0F9FF" borderColor="#7DD3FC"
+                  title="สินค้ารับแล้ว · รอเพิ่มข้อมูล LOT"
+                  sub={`มี ${pendingLots.length} รายการรอใส่วันหมดอายุ — กดเพื่อเพิ่มข้อมูล`}
+                  badge={pendingLots.length} badgeBg="#E0F2FE" badgeColor="#0284C7"
+                  onClick={() => { setLotInfoData({}); setLotInfoWh(wh); setLotInfoOpen(true) }}
+                />
               )}
 
+              {/* Low/out stock chips — ลบออกแล้ว (ซ้ำกับ 🔔 กระดิ่งที่คำนวณสดจาก balance) */}
+
               {/* EXP alerts */}
-              {expAlerts.length > 0 && (
+              {branchExpAlerts.length > 0 && (
                 <div style={{ display: 'flex', gap: 6, overflowX: 'auto',
                   scrollbarWidth: 'none', paddingBottom: 2 }}>
-                  {expAlerts.map(lot => (
+                  {branchExpAlerts.map(lot => (
                     <div key={lot.id} style={{ flexShrink: 0, borderRadius: 20, padding: '5px 12px',
                       fontSize: 11, fontWeight: 700,
                       background: lot.daysLeft <= 0 ? '#FEE2E2' : '#FFFBEB',
@@ -1957,8 +2363,8 @@ export default function Dashboard() {
 
       {/* ── Section: ใบแจ้งเติมของรอดำเนินการ ──
            editor เห็นทุกใบ + ลบได้ · สร้างใบโอนรวม (กระทบ stock) = Owner เท่านั้น */}
-      {isEditor() && refillRequests.filter(r => r.status === 'pending' || r.status === 'partial').length > 0 && (() => {
-        const pendingRFs = refillRequests.filter(r => r.status === 'pending' || r.status === 'partial')
+      {isEditor() && refillRequests.filter(r => (r.status === 'pending' || r.status === 'partial') && (!wh || wh === 'all' || r.branchId === wh)).length > 0 && (() => {
+        const pendingRFs = refillRequests.filter(r => (r.status === 'pending' || r.status === 'partial') && (!wh || wh === 'all' || r.branchId === wh))
           .sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0)) // เก่าสุดขึ้นก่อน
         const allSelected  = pendingRFs.every(r => rfSelectedIds.has(r.id))
         const someSelected = rfSelectedIds.size > 0
@@ -1986,8 +2392,8 @@ export default function Dashboard() {
                 borderRadius: 10, padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
                 {pendingRFs.length} ใบ
               </span>
-              {/* เลือกทั้งหมด — Owner เท่านั้น (ใช้เลือกไปสร้างใบโอนรวม) */}
-              {isOwner() && !someSelected && (
+              {/* เลือกทั้งหมด — ทุก editor (ใช้เลือกไปสร้างใบโอนรวม) */}
+              {isEditor() && !someSelected && (
                 <button onClick={toggleAll}
                   style={{ fontSize: 11, fontWeight: 600, color: '#6B7280',
                     background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px' }}>
@@ -1995,14 +2401,14 @@ export default function Dashboard() {
                 </button>
               )}
               {/* ปุ่มสร้างใบโอนรวม — เล็ก อยู่ที่ header (แทนแถบแดงใหญ่) */}
-              {isOwner() && someSelected && (
+              {isEditor() && someSelected && (
                 <button onClick={() => setRfSelectedIds(new Set())}
                   style={{ fontSize: 11, fontWeight: 600, color: '#9CA3AF',
                     background: 'none', border: 'none', cursor: 'pointer', padding: '2px 2px', flexShrink: 0 }}>
                   ✗
                 </button>
               )}
-              {isOwner() && someSelected && (
+              {isEditor() && someSelected && (
                 <button onClick={e => { e.stopPropagation(); openTransferFromRFs(selectedRFs) }}
                   style={{ fontSize: 11, fontWeight: 700, color: '#fff',
                     background: 'linear-gradient(135deg,#DC2626,#B91C1C)', border: 'none',
@@ -2025,32 +2431,44 @@ export default function Dashboard() {
                 const timeStr = ts
                   ? `${ts.getDate()}/${ts.getMonth()+1} เวลา ${String(ts.getHours()).padStart(2,'0')}:${String(ts.getMinutes()).padStart(2,'0')} น.`
                   : ''
-                const canSelect = isOwner()  // เลือกเพื่อสร้างใบโอนรวม = Owner เท่านั้น
+                const canSelect = isEditor()  // เลือกเพื่อสร้างใบโอนรวม = ทุก editor
+                const isPartial = rf.status === 'partial'
+                // ธีมการ์ด: ส่งไม่ครบ (partial) = แดง · รอดำเนินการ (pending) = เหลือง
+                const theme = isPartial
+                  ? { selBg:'#FEE2E2', bg:'#FEF2F2', selBd:'#EF4444', bd:'#FCA5A5', shadow:'rgba(239,68,68,0.18)' }
+                  : { selBg:'#FFFBEB', bg:'#fff',    selBd:'#F59E0B', bd:'#FDE68A', shadow:'rgba(245,158,11,0.15)' }
                 return (
                   <div key={rf.id}
-                    onClick={() => canSelect && toggleRF(rf.id)}
-                    style={{ background: sel ? '#FFFBEB' : '#fff', borderRadius: 14,
-                      border: `2px solid ${sel ? '#F59E0B' : '#FDE68A'}`,
-                      boxShadow: sel ? '0 0 0 3px rgba(245,158,11,0.15)' : '0 1px 4px rgba(0,0,0,0.05)',
-                      padding: 14, cursor: canSelect ? 'pointer' : 'default', transition: 'all 0.15s' }}>
+                    onClick={() => setCardDetail({ type: 'rf', data: rf })}
+                    style={{ background: sel ? theme.selBg : theme.bg, borderRadius: 14,
+                      border: `2px solid ${sel ? theme.selBd : theme.bd}`,
+                      boxShadow: sel ? `0 0 0 3px ${theme.shadow}` : '0 1px 4px rgba(0,0,0,0.05)',
+                      padding: 14, cursor: 'pointer', transition: 'all 0.15s' }}>
 
                     {/* Row 1: Checkbox + Ref + Badge + 🗑️ */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
                       {/* Checkbox custom — Owner เท่านั้น (ใช้เลือกไปสร้างใบโอน) */}
                       {canSelect && (
-                        <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${sel ? '#F59E0B' : '#D1D5DB'}`,
-                          background: sel ? '#F59E0B' : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          flexShrink: 0, transition: 'all 0.15s' }}>
+                        <div onClick={e => { e.stopPropagation(); toggleRF(rf.id) }}
+                          style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${sel ? theme.selBd : '#D1D5DB'}`,
+                            background: sel ? theme.selBd : '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            flexShrink: 0, transition: 'all 0.15s', cursor: 'pointer' }}>
                           {sel && <span style={{ color: '#fff', fontSize: 13, fontWeight: 900 }}>✓</span>}
                         </div>
                       )}
-                      <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, flex: 1 }}>
-                        {rf.rfRef || rf.id.slice(-8)}
-                      </span>
-                      {rf.status === 'partial' ? (
-                        <span style={{ fontSize: 10, background: '#FFEDD5', color: '#C2410C',
-                          border: '1px solid #FED7AA', borderRadius: 6, padding: '2px 7px', fontWeight: 700 }}>
-                          🟠 ส่งบางส่วน · ค้างส่ง
+                      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 8, overflow: 'hidden' }}>
+                        <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, flexShrink: 0 }}>
+                          {rf.rfRef || rf.id.slice(-8)}
+                        </span>
+                        <span style={{ fontSize: 11.5, color: '#374151', fontWeight: 600, whiteSpace: 'nowrap',
+                          overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          👤 {rf.requestedBy || 'ไม่ระบุ'}{timeStr ? ` · 🕐 ${timeStr}` : ''}
+                        </span>
+                      </div>
+                      {isPartial ? (
+                        <span style={{ fontSize: 10, background: '#FEE2E2', color: '#DC2626',
+                          border: '1px solid #FCA5A5', borderRadius: 6, padding: '2px 7px', fontWeight: 800 }}>
+                          🔴 ส่งไม่ครบ · เหลือเฉพาะที่ค้าง
                         </span>
                       ) : (
                         <span style={{ fontSize: 10, background: '#FFF7ED', color: '#D97706',
@@ -2058,64 +2476,60 @@ export default function Dashboard() {
                           🟡 รอดำเนินการ
                         </span>
                       )}
-                      {/* ปุ่มแก้ไข (editor ทุกคน) */}
-                      <button
-                        onClick={e => { e.stopPropagation(); openEditRF(rf) }}
-                        title="แก้ไขใบแจ้งเติม"
-                        style={{ width: 28, height: 28, border: 'none', borderRadius: 8, cursor: 'pointer',
-                          background: '#EFF6FF', color: '#2563EB',
-                          fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          flexShrink: 0, transition: 'all 0.15s' }}>
-                        ✏️
-                      </button>
-                      {/* ปุ่มลบ */}
+                      {/* ปุ่มแก้ไข — เฉพาะใบที่ยังไม่ส่ง (pending) · ใบ partial แก้ไม่ได้ (กันยอดเพี้ยน) */}
+                      {!isPartial && (
+                        <button
+                          onClick={e => { e.stopPropagation(); openEditRF(rf) }}
+                          title="แก้ไขใบแจ้งเติม"
+                          style={{ width: 28, height: 28, border: 'none', borderRadius: 8, cursor: 'pointer',
+                            background: '#EFF6FF', color: '#2563EB',
+                            fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            flexShrink: 0, transition: 'all 0.15s' }}>
+                          ✏️
+                        </button>
+                      )}
+                      {/* ปุ่มเดียวฉลาด — partial: ปิดใบ(🚫) · pending: ยกเลิก(🗑️) */}
                       <button
                         onClick={e => { e.stopPropagation()
                           setRfDeleteId(rfDeleteId === rf.id ? null : rf.id)
                           setRfDeleteReason('')
                         }}
+                        title={isPartial ? 'ไม่ส่งส่วนที่ค้าง · ปิดใบ' : 'ยกเลิกคำร้อง'}
                         style={{ width: 28, height: 28, border: 'none', borderRadius: 8, cursor: 'pointer',
                           background: rfDeleteId === rf.id ? '#FEE2E2' : '#F3F4F6',
                           color: rfDeleteId === rf.id ? '#DC2626' : '#9CA3AF',
                           fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
                           flexShrink: 0, transition: 'all 0.15s' }}>
-                        🗑️
+                        {isPartial ? '🚫' : '🗑️'}
                       </button>
                     </div>
 
-                    {/* Row 2: แจ้งโดย + เวลา */}
-                    <div style={{ display: 'flex', gap: 8, marginBottom: 8, marginLeft: 32 }}>
-                      <span style={{ fontSize: 11, color: '#374151', fontWeight: 600 }}>
-                        👤 {rf.requestedBy || 'ไม่ระบุ'}
-                      </span>
-                      {timeStr && (
-                        <span style={{ fontSize: 11, color: '#6B7280' }}>· 🕐 {timeStr}</span>
-                      )}
-                    </div>
-
-                    {/* Row 3: รายการ chips */}
+                    {/* รายการ chips */}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: 32, marginBottom: rfDeleteId === rf.id ? 10 : 0 }}>
-                      {(rf.items || []).map((it, i) => {
-                        // ยอดค้าง (เฉพาะใบ partial): ขอ - ส่งแล้ว (เทียบใน unitUse)
+                      {sortByMaster(rf.items, { items, catOrder }).map((it, i) => {
                         const master = items.find(m => m.id === it.itemId)
-                        const factor = parseConvFactor(master?.unitConversion) || 1
-                        const reqUse = (it.unit && master?.unitBase && it.unit === master.unitBase) ? (parseFloat(it.qty)||0)*factor : (parseFloat(it.qty)||0)
+                        const reqUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, master)
                         const fulfilled = Number(it.fulfilledQtyUse) || 0
-                        const isPartialItem = rf.status === 'partial' && fulfilled + 1e-6 < reqUse
+                        const remainUse = reqUse - fulfilled
+                        if (isPartial) {
+                          // 🔴 ส่งไม่ครบ → แสดงเฉพาะ "ที่ยังค้าง" (รายการที่ส่งครบแล้วซ่อน · ไม่โชว์ยอดที่ขอเดิม)
+                          if (remainUse <= 1e-6 || !master) return null
+                          return (
+                            <span key={i} style={{ fontSize: 11, background: '#FEF2F2',
+                              borderRadius: 6, padding: '3px 8px', border: '1px solid #FCA5A5' }}>
+                              {it.img} {master?.displayName || it.itemName}
+                              <span style={{ color: '#DC2626', fontWeight: 800 }}> ค้าง {formatStockQty(remainUse, master)}</span>
+                            </span>
+                          )
+                        }
+                        // 🟡 รอดำเนินการ → แสดงยอดที่ขอเต็ม
                         return (
-                          <span key={i} style={{ fontSize: 11,
-                            background: isPartialItem ? '#FFF7ED' : '#F3F4F6',
-                            borderRadius: 6, padding: '3px 8px',
-                            border: `1px solid ${isPartialItem ? '#FED7AA' : '#E5E7EB'}` }}>
-                            {it.img} {it.itemName}
+                          <span key={i} style={{ fontSize: 11, background: '#F3F4F6',
+                            borderRadius: 6, padding: '3px 8px', border: '1px solid #E5E7EB' }}>
+                            {it.img} {master?.displayName || it.itemName}
                             {it.qty > 0
                               ? <span style={{ color: '#D97706', fontWeight: 700 }}> ×{it.qty} {it.unit}</span>
                               : null}
-                            {isPartialItem && master && (
-                              <span style={{ color: '#C2410C', fontWeight: 700 }}>
-                                {' '}· ค้าง {formatStockQty(reqUse - fulfilled, master)}
-                              </span>
-                            )}
                           </span>
                         )
                       })}
@@ -2127,7 +2541,9 @@ export default function Dashboard() {
                         style={{ marginTop: 4, padding: '10px 12px', background: '#FEF2F2',
                           borderRadius: 10, border: '1px solid #FECACA' }}>
                         <div style={{ fontSize: 12, fontWeight: 700, color: '#DC2626', marginBottom: 6 }}>
-                          🗑️ ยืนยันยกเลิกคำร้อง {rf.rfRef}?
+                          {isPartial
+                            ? `🚫 ปิดใบ — ไม่ส่งส่วนที่ค้าง ${rf.rfRef}? (ของที่ส่งแล้วยังอยู่)`
+                            : `🗑️ ยืนยันยกเลิกคำร้อง ${rf.rfRef}?`}
                         </div>
                         <input
                           value={rfDeleteReason}
@@ -2151,7 +2567,7 @@ export default function Dashboard() {
                               background: rfDeleteReason.trim().length < 3 ? '#FCA5A5' : '#DC2626',
                               color: '#fff', fontSize: 12, fontWeight: 700, cursor: 'pointer',
                               opacity: rfDeleting ? 0.6 : 1 }}>
-                            {rfDeleting ? 'กำลังลบ...' : '🗑️ ยืนยันลบ + บันทึก Log'}
+                            {rfDeleting ? 'กำลังบันทึก...' : (isPartial ? '🚫 ปิดใบ + บันทึก Log' : '🗑️ ยืนยันยกเลิก + บันทึก Log')}
                           </button>
                         </div>
                       </div>
@@ -2166,22 +2582,119 @@ export default function Dashboard() {
         )
       })()}
 
+      {/* ── Section: ใบสั่งซื้อรอรับของ (ordered/partial) + รับแล้ววันนี้ (ถอนได้) ── */}
+      {(() => {
+        const recvTodayKey = poToday()
+        // 🛒 PO = สั่งซื้อเข้า "คลังกลาง" เท่านั้น → โชว์เฉพาะตอนดูคลังกลาง/ทุกร้าน (สาขาอื่นไม่เกี่ยว)
+        const _w = warehouses.find(x => x.id === wh)
+        const isMainView = !wh || wh === 'all' || _w?.type === 'main' || _w?.isMain
+        const visiblePOs = !isMainView ? [] : purchaseOrders.filter(po => {
+          if (po.status === 'ordered' || po.status === 'partial') return true
+          // received → แสดงเฉพาะที่รับวันนี้ (เผื่อถอน)
+          if (po.status === 'received') {
+            const ts = po.receivedAt
+            const k = ts?.seconds ? new Date(ts.seconds * 1000).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' }) : null
+            return k === recvTodayKey
+          }
+          return false
+        })
+        if (visiblePOs.length === 0) return null
+        return (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 1rem' }}>
+            <div className="section-label" style={{ padding: 0, marginBottom: 0, flex: 1 }}>🛒 รอรับของ (สั่งซื้อ)</div>
+            <span style={{ background: '#FEF3C7', color: '#B45309', borderRadius: 10,
+              padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>{visiblePOs.length}</span>
+          </div>
+          <div style={{ padding: '8px 1rem 0', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {[...visiblePOs].sort((a,b)=>(a.createdAt?.seconds||0)-(b.createdAt?.seconds||0)).map(po => {
+              const isPartial  = po.status === 'partial'
+              const isReceived = po.status === 'received'
+              const badge = isReceived ? { t: '✅ รับแล้ววันนี้', bg: '#DCFCE7', c: '#16A34A', border: '#86EFAC' }
+                : isPartial ? { t: '🟠 รับบางส่วน · ค้าง', bg: '#FFEDD5', c: '#C2410C', border: '#FED7AA' }
+                : { t: '🚚 ระหว่างขนส่ง', bg: '#FEF9C3', c: '#92400E', border: '#FDE68A' }
+              return (
+                <div key={po.id} onClick={() => setCardDetail({ type: 'po', data: po })}
+                  style={{ background: '#fff', borderRadius: 14, cursor: 'pointer',
+                  border: `1px solid ${badge.border}`, boxShadow: '0 1px 4px rgba(0,0,0,0.05)', padding: 14 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                    <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, flex: 1 }}>{po.poRef || po.id.slice(-6)}</span>
+                    {/* ✏️ แก้ไข + 🗑️ ยกเลิก — เฉพาะ ordered (ยังไม่รับ) */}
+                    {isEditor() && po.status === 'ordered' && (
+                      <>
+                        <button onClick={(e) => { e.stopPropagation(); openEditPO(po) }}
+                          style={{ border: '1px solid #FCD34D', background: '#FFFBEB', color: '#B45309',
+                            borderRadius: 7, padding: '3px 9px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                          ✏️ แก้ไข
+                        </button>
+                        <button onClick={(e) => { e.stopPropagation(); cancelPO(po) }}
+                          style={{ border: '1px solid #FCA5A5', background: '#FEF2F2', color: '#DC2626',
+                            borderRadius: 7, padding: '3px 9px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                          🗑️ ยกเลิก
+                        </button>
+                      </>
+                    )}
+                    <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 6, padding: '2px 7px',
+                      background: badge.bg, color: badge.c }}>{badge.t}</span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--txt2)', marginBottom: 6 }}>
+                    🏭 {po.supplier || 'supplier'} → คลังกลาง
+                    {po.shipper ? <span style={{ color: '#6B7280' }}> · 🚚 {po.shipper}</span> : null}
+                    {po.orderDate ? <span style={{ color: '#9CA3AF' }}> · สั่ง {po.orderDate}</span> : null}
+                    {po.expectedDate ? <span style={{ color: '#9CA3AF' }}> · คาดถึง {po.expectedDate}</span> : null}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 10 }}>
+                    <strong>{po.items?.length || 0} รายการ</strong>
+                    {sortByMaster(po.items, { items, catOrder }).slice(0, 3).map((it, i) => (
+                      <span key={i} style={{ marginLeft: 6 }}>{it.img}{it.itemName} ×{it.qty}</span>
+                    ))}
+                    {(po.items?.length || 0) > 3 && <span> +{po.items.length - 3}</span>}
+                  </div>
+                  {isEditor() && (
+                    <div style={{ display: 'flex', gap: 8 }} onClick={(e) => e.stopPropagation()}>
+                      {!isReceived && (
+                        <button onClick={() => openReceivePO(po)}
+                          style={{ flex: 1, background: '#D97706', color: '#fff', border: 'none',
+                            borderRadius: 10, padding: '10px 0', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+                          📋 ตรวจรับของ
+                        </button>
+                      )}
+                      {/* ↩️ ถอนการรับของ — partial หรือ received (ภายในวัน) */}
+                      {(isPartial || isReceived) && (
+                        <button onClick={() => undoReceivePO(po)}
+                          style={{ flex: isReceived ? 1 : '0 0 auto', background: '#fff', color: '#B45309',
+                            border: '1.5px solid #FCD34D', borderRadius: 10, padding: '10px 14px',
+                            fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+                          ↩️ ถอนการรับของ
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+        )
+      })()}
+
       {/* ── Section: ใบโอนเตรียมจัดส่ง (preparing) — เฟส 1 ── */}
-      {transfers.filter(t => t.status === 'preparing').length > 0 && (
+      {transfers.filter(t => t.status === 'preparing' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).length > 0 && (
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 1rem' }}>
             <div className="section-label" style={{ padding: 0, marginBottom: 0, flex: 1 }}>📦 เตรียมจัดส่ง</div>
             <span style={{ background: '#DBEAFE', color: '#1D4ED8', borderRadius: 10,
               padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
-              {transfers.filter(t => t.status === 'preparing').length}
+              {transfers.filter(t => t.status === 'preparing' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).length}
             </span>
           </div>
           <div style={{ padding: '8px 1rem 0', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {transfers.filter(t => t.status === 'preparing').map(tf => {
+            {transfers.filter(t => t.status === 'preparing' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).map(tf => {
               const fromName = warehouses.find(w => w.id === tf.fromWarehouseId)?.name || tf.fromWarehouseName || 'คลัง'
               const toName   = warehouses.find(w => w.id === tf.toWarehouseId)?.name   || tf.toWarehouseName   || 'ร้าน'
               return (
-                <div key={tf.id} style={{ background: '#fff', borderRadius: 14,
+                <div key={tf.id} onClick={() => setCardDetail({ type: 'tf', data: tf })}
+                  style={{ background: '#fff', borderRadius: 14, cursor: 'pointer',
                   border: '1px solid #BFDBFE', boxShadow: '0 1px 4px rgba(0,0,0,0.05)', padding: 14 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                     <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13 }}>{tf.tfRef || tf.id.slice(-6)}</span>
@@ -2194,17 +2707,24 @@ export default function Dashboard() {
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 10 }}>
                     {tf.items?.length || 0} รายการ
-                    {tf.items?.slice(0, 3).map((it, i) => (
+                    {sortByMaster(tf.items, { items, catOrder }).slice(0, 3).map((it, i) => (
                       <span key={i} style={{ marginLeft: 6 }}>{it.img}{it.itemName}</span>
                     ))}
                     {(tf.items?.length || 0) > 3 && <span> +{tf.items.length - 3}</span>}
                   </div>
                   {isOwner() && (
-                    <button onClick={() => dispatchTransfer(tf)}
-                      style={{ width: '100%', background: '#1D4ED8', color: '#fff', border: 'none',
-                        borderRadius: 10, padding: '10px 0', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
-                      🚚 ส่งสินค้า (เริ่มนำส่ง)
-                    </button>
+                    <div style={{ display: 'flex', gap: 8 }} onClick={(e) => e.stopPropagation()}>
+                      <button onClick={() => cancelPreparingTransfer(tf)}
+                        style={{ flex: '0 0 auto', border: '1.5px solid #FCA5A5', background: '#FEF2F2', color: '#DC2626',
+                          borderRadius: 10, padding: '11px 14px', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+                        ↩️ ถอย
+                      </button>
+                      <button onClick={() => dispatchTransfer(tf)}
+                        style={{ flex: 1, background: '#1D4ED8', color: '#fff', border: 'none',
+                          borderRadius: 10, padding: '11px 0', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+                        🚚 ส่งสินค้า
+                      </button>
+                    </div>
                   )}
                 </div>
               )
@@ -2214,21 +2734,22 @@ export default function Dashboard() {
       )}
 
       {/* ── Section: ใบโอนกำลังนำส่ง (in_transit) — เฟส 2 ── */}
-      {transfers.filter(t => t.status === 'in_transit').length > 0 && (
+      {transfers.filter(t => t.status === 'in_transit' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).length > 0 && (
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 1rem' }}>
             <div className="section-label" style={{ padding: 0, marginBottom: 0, flex: 1 }}>🚚 กำลังนำส่ง</div>
             <span style={{ background: '#DCFCE7', color: '#16A34A', borderRadius: 10,
               padding: '2px 8px', fontSize: 11, fontWeight: 700 }}>
-              {transfers.filter(t => t.status === 'in_transit').length}
+              {transfers.filter(t => t.status === 'in_transit' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).length}
             </span>
           </div>
           <div style={{ padding: '8px 1rem 0', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {transfers.filter(t => t.status === 'in_transit').map(tf => {
+            {transfers.filter(t => t.status === 'in_transit' && (!wh || wh === 'all' || t.fromWarehouseId === wh || t.toWarehouseId === wh)).map(tf => {
               const fromName = warehouses.find(w => w.id === tf.fromWarehouseId)?.name || tf.fromWarehouseName || 'คลัง'
               const toName   = warehouses.find(w => w.id === tf.toWarehouseId)?.name   || tf.toWarehouseName   || 'ร้าน'
               return (
-                <div key={tf.id} style={{ background: '#fff', borderRadius: 14,
+                <div key={tf.id} onClick={() => setCardDetail({ type: 'tf', data: tf })}
+                  style={{ background: '#fff', borderRadius: 14, cursor: 'pointer',
                   border: '1px solid #BBF7D0', boxShadow: '0 1px 4px rgba(0,0,0,0.05)', padding: 14 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                     <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13 }}>{tf.tfRef || tf.id.slice(-6)}</span>
@@ -2241,13 +2762,14 @@ export default function Dashboard() {
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--txt3)', marginBottom: 10 }}>
                     {tf.items?.length || 0} รายการ
-                    {tf.items?.slice(0, 3).map((it, i) => (
+                    {sortByMaster(tf.items, { items, catOrder }).slice(0, 3).map((it, i) => (
                       <span key={i} style={{ marginLeft: 6 }}>{it.img}{it.itemName}</span>
                     ))}
                     {(tf.items?.length || 0) > 3 && <span> +{tf.items.length - 3}</span>}
+                    {tf.loadedBy && <div style={{ marginTop: 3, color: '#16A34A', fontWeight: 600 }}>✅ เช็คขึ้นรถครบ · {tf.loadedBy}</div>}
                   </div>
                   {isEditor() && (
-                    <button onClick={() => openReceiveTransfer(tf)}
+                    <button onClick={(e) => { e.stopPropagation(); openReceiveTransfer(tf) }}
                       style={{ width: '100%', background: '#16A34A', color: '#fff', border: 'none',
                         borderRadius: 10, padding: '10px 0', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
                       📋 ตรวจรับสินค้า
@@ -2260,69 +2782,534 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Modal: รับสินค้า */}
-      <Modal open={receiveOpen} onClose={() => setReceiveOpen(false)} title="รับสินค้าเข้าคลัง"
-        lockClose={true}
-        footer={rcv.itemId && <button className="btn-primary" onClick={submitReceive} disabled={receiveSaving}>{receiveSaving ? 'กำลังบันทึก...' : '✅ บันทึกรับสินค้า'}</button>}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {/* Item Picker — แสดงยอดของคลังกลาง (เพราะรับสินค้าเข้าคลังกลางเสมอ) */}
-          <ItemPickerGrid items={items} balances={balances}
-            warehouseId={warehouses.find(w => w.type === 'main' || w.isMain)?.id || null}
-            selectedId={rcv.itemId}
-            onSelect={item => setRcv(r => ({ ...r, itemId: item.id, unit: item.unitBuy || item.unitBase || '' }))} />
-          {/* Form — แสดงเมื่อเลือกแล้ว */}
-          {rcv.itemId && (() => {
-            const item = items.find(i => i.id === rcv.itemId)
-            return (
-              <div style={{ background: 'var(--bg)', borderRadius: 12, padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
-                <div style={{ fontSize: 13, fontWeight: 700 }}>{item?.img} {item?.name}</div>
-                {/* หน่วย chips */}
-                <div>
-                  <label className="fi-label">หน่วย</label>
-                  <UnitChips
-                    opts={getUnitOptions(items.find(i => i.id === rcv.itemId))}
-                    selected={rcv.unit}
-                    onChange={u => setRcv(r => ({ ...r, unit: u }))}
-                  />
+      {/* ══ Popup: รายละเอียดการ์ด (PO / TF) — กดการ์ดเพื่อดูรายการเต็ม ══ */}
+      <Modal open={!!cardDetail} onClose={() => setCardDetail(null)}
+        title={cardDetail ? (cardDetail.type === 'po'
+          ? `🛒 ${cardDetail.data.poRef || cardDetail.data.id?.slice(-6)}`
+          : cardDetail.type === 'rf'
+          ? `📋 ${cardDetail.data.rfRef || cardDetail.data.id?.slice(-8)}`
+          : `🚚 ${cardDetail.data.tfRef || cardDetail.data.id?.slice(-6)}`) : ''}>
+        {cardDetail && (() => {
+          const d = cardDetail.data
+          const isPO = cardDetail.type === 'po'
+          const isRF = cardDetail.type === 'rf'
+          const fromTo = isPO
+            ? `🏭 ${d.supplier || '-'} → คลังกลาง${d.shipper ? ` · 🚚 ${d.shipper}` : ''}`
+            : isRF
+            ? `📍 ${warehouses.find(w => w.id === d.branchId)?.name || d.branchName || 'สาขา'} · 👤 ${d.requestedBy || 'ไม่ระบุ'}`
+            : `${warehouses.find(w => w.id === d.fromWarehouseId)?.name || d.fromWarehouseName || 'คลัง'} → ${warehouses.find(w => w.id === d.toWarehouseId)?.name || d.toWarehouseName || 'ร้าน'}${d.driver ? ` · 🧑 ${d.driver}` : ''}`
+          const ORDER = catOrder.length > 0 ? catOrder : CAT_ORDER
+          const rows = (d.items || []).map(it => {
+            const m = items.find(x => x.id === it.itemId)
+            const ci = ORDER.indexOf(m?.category)
+            return { it, m, _cat: ci < 0 ? 999 : ci, _sort: m?.sortOrder ?? 999 }
+          }).sort((a, b) => (a._cat - b._cat) || (a._sort - b._sort))
+          const totalU = Number((d.items || []).reduce((s, it) => s + (parseFloat(it.qty) || 0), 0).toFixed(2))
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ fontSize: 12, color: '#92400E', background: '#FFF7ED', borderRadius: 9,
+                padding: '7px 11px', border: '1px solid #FDE68A' }}>{fromTo}</div>
+              {isPO ? (
+                <div style={{ fontSize: 11, color: 'var(--txt3)' }}>
+                  📅 สั่ง {d.orderDate || '-'}{d.expectedDate ? ` · คาดถึง ${d.expectedDate}` : ''}
+                  {d.receivedBy ? ` · รับโดย ${d.receivedBy}` : ''}
                 </div>
-                {/* จำนวน + วันที่รับ side-by-side */}
-                <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+              ) : isRF ? (
+                <div style={{ fontSize: 11, fontWeight: 700,
+                  color: d.status === 'partial' ? '#C2410C' : '#D97706' }}>
+                  {d.status === 'partial' ? '🟠 ส่งบางส่วน · ค้างส่ง' : '🟡 รอดำเนินการ'}
+                </div>
+              ) : (d.loadedBy && <div style={{ fontSize: 11, color: '#16A34A', fontWeight: 600 }}>✅ เช็คขึ้นรถครบ · {d.loadedBy}</div>)}
+              {!isPO && !isRF && d.hadShortage && (
+                <div style={{ fontSize: 11, fontWeight: 700, color: '#D97706', background: '#FFFBEB',
+                  border: '1px solid #FDE68A', borderRadius: 9, padding: '6px 10px' }}>
+                  ⚠️ รับไม่ครบ — รับตามยอดจริง · ส่วนที่ขาดสร้างใบแจ้งเติมไว้แล้ว
+                </div>
+              )}
+              <div style={{ fontSize: 12, fontWeight: 700 }}>📋 รายการ ({d.items?.length || 0}) · {totalU} หน่วย</div>
+              {isRF && d.status === 'partial' ? (() => {
+                // 🔴 ค้างส่ง / 🟢 ส่งแล้ว — แยกกลุ่มจาก fulfilledQtyUse
+                const enrich = (d.items || []).map(it => {
+                  const m = items.find(x => x.id === it.itemId)
+                  const reqUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, m)
+                  const fulfilled = Number(it.fulfilledQtyUse) || 0
+                  const ci = ORDER.indexOf(m?.category)
+                  return { it, m, fulfilled, remainUse: reqUse - fulfilled, _cat: ci < 0 ? 999 : ci, _sort: m?.sortOrder ?? 999 }
+                }).sort((a, b) => (a._cat - b._cat) || (a._sort - b._sort))
+                const pend = enrich.filter(x => x.remainUse > 1e-6)
+                const sent = enrich.filter(x => x.fulfilled > 1e-6)
+                const grp = (title, color, bg, bd, list, qtyOf) => list.length > 0 && (
                   <div>
-                    <label className="fi-label">จำนวน</label>
-                    <PosQty
-                      value={parseFloat(rcv.qty) || 0}
-                      onChange={v => setRcv(r => ({ ...r, qty: String(v) }))}
-                    />
+                    <div style={{ fontSize: 11.5, fontWeight: 800, color, marginBottom: 5 }}>{title} ({list.length})</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {list.map((x, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 9, background: bg,
+                          borderRadius: 9, border: `1px solid ${bd}`, padding: '7px 10px' }}>
+                          <span style={{ fontSize: 16, flexShrink: 0 }}>{x.it.img}</span>
+                          <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, fontWeight: 600, color,
+                            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{x.m?.displayName || x.it.itemName}</span>
+                          <span style={{ fontSize: 12.5, fontWeight: 800, color, flexShrink: 0 }}>{qtyOf(x)}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <label className="fi-label">วันที่รับ</label>
-                    <input className="fi" type="date" value={rcv.receiveDate}
-                      onChange={e => setRcv(r => ({ ...r, receiveDate: e.target.value }))} />
+                )
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {grp('🔴 ค้างส่ง', '#DC2626', '#FEF2F2', '#FCA5A5', pend, x => x.m ? formatStockQty(x.remainUse, x.m) : '')}
+                    {grp('🟢 ส่งแล้ว', '#16A34A', '#F0FDF4', '#BBF7D0', sent, x => x.m ? formatStockQty(x.fulfilled, x.m) : '')}
                   </div>
+                )
+              })() : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {rows.map(({ it, m }, i) => {
+                  const recv = isPO && Number(it.fulfilledQtyUse) > 0
+                  const isRecvTF = !isPO && !isRF && d.status === 'received' && it.receivedQty != null
+                  const planned  = parseFloat(it.qty) || 0
+                  const got      = Number(it.receivedQty) || 0
+                  const short    = isRecvTF && got < planned
+                  return (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 9,
+                      background: short ? '#FFFBEB' : '#fff',
+                      borderRadius: 9, border: `1px solid ${short ? '#FDE68A' : 'var(--border)'}`, padding: '7px 10px' }}>
+                      <span style={{ fontSize: 16, flexShrink: 0 }}>{it.img}</span>
+                      <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, fontWeight: 600, whiteSpace: 'nowrap',
+                        overflow: 'hidden', textOverflow: 'ellipsis' }}>{m?.displayName || it.itemName}</span>
+                      {recv && <span style={{ fontSize: 10, color: '#16A34A', fontWeight: 700 }}>รับแล้ว</span>}
+                      {isRecvTF ? (
+                        <span style={{ fontSize: 12.5, fontWeight: 700, flexShrink: 0 }}>
+                          {short && <span style={{ color: 'var(--txt3)', textDecoration: 'line-through', fontWeight: 600, marginRight: 5 }}>{planned}</span>}
+                          <span style={{ color: short ? '#D97706' : '#16A34A' }}>{got} {it.unit}</span>
+                          {short && ' ⚠️'}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--txt2)', flexShrink: 0 }}>{it.qty} {it.unit}</span>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              )}
+            </div>
+          )
+        })()}
+      </Modal>
+
+      {/* ══ Modal: สั่งซื้อ (Step 1) — Supplier → คลังกลาง ══ */}
+      <Modal open={poOpen}
+        onClose={() => { setPoOpen(false); setPoItems([]); setPoStep('pick'); setPoEditId(null) }}
+        lockClose={true}
+        title={(() => {
+          const totalU = Number(poItems.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0).toFixed(2))
+          const lead = poEditId ? '✏️ แก้ใบสั่งซื้อ' : '🛒 สั่งซื้อ'
+          return poStep === 'pick'
+            ? `${lead} · เลือกวัตถุดิบ (${poItems.length})`
+            : `${lead} · ${poItems.length} รายการ · ${totalU} หน่วย`
+        })()}
+        footer={(() => {
+          if (poStep === 'pick') {
+            const canNext = poForm.supplier && poItems.length > 0
+            return (
+              <button className="btn-primary" disabled={!canNext} style={{ opacity: canNext ? 1 : 0.5 }}
+                onClick={() => setPoStep('qty')}>
+                ถัดไป → จำนวน ({poItems.length})
+              </button>
+            )
+          }
+          const allQty = poItems.every(it => parseFloat(it.qty) > 0)
+          return (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setPoStep('pick')}>← ย้อนกลับ</button>
+              <button className="btn-primary" style={{ flex: 2, opacity: (poSaving || !allQty) ? 0.5 : 1 }}
+                disabled={poSaving || !allQty} onClick={submitPO}>
+                {poSaving ? 'กำลังบันทึก...' : poEditId ? `💾 บันทึกการแก้ไข (${poItems.length})` : `🛒 ยืนยันสั่งซื้อ (${poItems.length})`}
+              </button>
+            </div>
+          )
+        })()}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {/* แหล่งที่มา + วันที่ */}
+          <div style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 8,
+            background: 'var(--bg)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11.5, color: 'var(--txt2)', fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>🏭</span>
+              <select className="fi" value={poForm.supplier} style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
+                onChange={e => setPoForm(f => ({ ...f, supplier: e.target.value }))}>
+                {sources.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <span style={{ fontSize: 11.5, whiteSpace: 'nowrap', flexShrink: 0 }}>🚚</span>
+              <input className="fi" type="text" value={poForm.shipper} placeholder="ขนส่ง"
+                style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
+                onChange={e => setPoForm(f => ({ ...f, shipper: e.target.value }))} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11.5, color: 'var(--txt2)', fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>📅 สั่ง</span>
+              <input className="fi" type="date" value={poForm.orderDate} style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
+                onChange={e => setPoForm(f => ({ ...f, orderDate: e.target.value }))} />
+              <span style={{ fontSize: 11, color: 'var(--txt3)', whiteSpace: 'nowrap' }}>คาดถึง</span>
+              <input className="fi" type="date" value={poForm.expectedDate} style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
+                onChange={e => setPoForm(f => ({ ...f, expectedDate: e.target.value }))} />
+            </div>
+          </div>
+
+          {poStep === 'pick' ? (
+            <div>
+              <label className="fi-label" style={{ fontSize: 11 }}>📦 วัตถุดิบ — กดเพื่อเลือก/ยกเลิก</label>
+              <div style={{ marginTop: 4, border: '1px solid var(--border)', borderRadius: 10, padding: 4, background: 'var(--bg)' }}>
+                <ItemPickerGrid items={items} balances={balances}
+                  warehouseId={warehouses.find(w => w.type === 'main' || w.isMain)?.id || null}
+                  selectedIds={new Set(poItems.map(t => t.itemId))} filterFn={() => true}
+                  onSelect={item => {
+                    const exists = poItems.find(t => t.itemId === item.id)
+                    if (exists) { setPoItems(prev => prev.filter(t => t.itemId !== item.id)); return }
+                    const unitOpts = unitOptionsOf(item)   // รองรับหลายชั้น (ลัง/มัด/ใบ)
+                    setPoItems(prev => [...prev, {
+                      itemId: item.id, itemName: item.name, img: item.img || '📦',
+                      category: item.category || 'อื่นๆ', qty: '1',
+                      unit: unitOpts[0] || '', unitOpts,
+                    }])
+                  }} />
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {[...poItems].sort((a, b) => {
+                const ORDER = catOrder.length > 0 ? catOrder : CAT_ORDER
+                const ma = items.find(m => m.id === a.itemId), mb = items.find(m => m.id === b.itemId)
+                const ca = ORDER.indexOf(ma?.category), cb = ORDER.indexOf(mb?.category)
+                const ia = ca < 0 ? 999 : ca, ib = cb < 0 ? 999 : cb
+                if (ia !== ib) return ia - ib
+                return (ma?.sortOrder ?? 999) - (mb?.sortOrder ?? 999)
+              }).map(it => {
+                const master = items.find(m => m.id === it.itemId)
+                return (
+                <div key={it.itemId} style={{ background: '#fff', borderRadius: 9,
+                  border: '1px solid var(--border)', padding: '5px 8px', display: 'flex',
+                  alignItems: 'center', gap: 7 }}>
+                  <span style={{ fontSize: 16, flexShrink: 0 }}>{it.img}</span>
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap',
+                    overflow: 'hidden', textOverflow: 'ellipsis' }}>{master?.displayName || it.itemName}</span>
+                  {it.unitOpts?.length > 1 && (
+                    <UnitChips opts={it.unitOpts.map(u => ({ value: u, label: u, sub: '' }))} selected={it.unit}
+                      onChange={u => setPoItems(prev => prev.map(p => p.itemId === it.itemId ? { ...p, unit: u } : p))} />
+                  )}
+                  {it.unitOpts?.length === 1 && (
+                    <span style={{ fontSize: 11, color: 'var(--txt3)', flexShrink: 0 }}>{it.unit}</span>
+                  )}
+                  <PosQty value={parseFloat(it.qty) || 0}
+                    onChange={v => setPoItems(prev => prev.map(p => p.itemId === it.itemId ? { ...p, qty: String(v) } : p))} />
+                  <button onClick={() => setPoItems(prev => prev.filter(p => p.itemId !== it.itemId))}
+                    style={{ border: 'none', background: 'transparent', color: '#9CA3AF', borderRadius: 6,
+                      width: 20, height: 20, fontSize: 12, cursor: 'pointer', flexShrink: 0 }}>×</button>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <div style={{ flex: 1 }}>
-                    <label className="fi-label">MFG</label>
-                    <input className="fi" type="date" value={rcv.mfgDate}
-                      onChange={e => setRcv(r => ({ ...r, mfgDate: e.target.value }))} />
+                )
+              })}
+              {/* ➕ เพิ่มวัตถุดิบที่ลืม — กลับไปหน้าเลือก (รายการเดิมยังอยู่) */}
+              <button onClick={() => setPoStep('pick')}
+                style={{ marginTop: 2, border: '1.5px dashed #FDBA74', background: '#FFF7ED', color: '#C2410C',
+                  borderRadius: 10, padding: '9px 0', fontWeight: 700, fontSize: 12.5, cursor: 'pointer' }}>
+                ➕ เพิ่มวัตถุดิบ
+              </button>
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* ══ Modal: ตรวจรับของ (Step 2) — checklist เทียบที่สั่ง ══ */}
+      <Modal open={poRcvOpen} onClose={() => { setPoRcvOpen(false); setPoRcv(null) }}
+        lockClose={true}
+        title={poRcv ? `📋 ตรวจรับ ${poRcv.poRef || ''}` : 'ตรวจรับของ'}
+        footer={(() => {
+          // นับเฉพาะรายการที่ยัง "ค้างรับ" (ยังไม่รับครบ) → ต้องตรวจให้ครบทุกตัว
+          let total = 0, reviewed = 0
+          ;(poRcv?.items || []).forEach((it, i) => {
+            const m = items.find(x => x.id === it.itemId)
+            const reqUse = qtyToUse(it.qty, it.unit, m)
+            const remainUse = Math.max(0, reqUse - (Number(it.fulfilledQtyUse) || 0))
+            if (useToQty(remainUse, it.unit, m) <= 0) return  // รับครบแล้ว — ข้าม
+            total++
+            if (poRcvChecked[i]?.checked) reviewed++
+          })
+          const allReviewed = total > 0 && reviewed === total
+          const canSubmit = allReviewed && !poRcvSaving
+          return (
+            <button onClick={submitReceivePO} disabled={!canSubmit}
+              style={{ width: '100%', border: 'none', borderRadius: 12, padding: '13px 0',
+                fontWeight: 700, fontSize: 14, cursor: canSubmit ? 'pointer' : 'not-allowed',
+                color: '#fff', background: canSubmit ? '#16A34A' : '#FCD34D',
+                opacity: poRcvSaving ? 0.6 : 1, transition: 'background .2s' }}>
+              {poRcvSaving ? 'กำลังบันทึก...'
+                : allReviewed ? `✅ ยืนยันรับของ (${reviewed}/${total})`
+                : `ตรวจสอบให้ครบก่อน (${reviewed}/${total})`}
+            </button>
+          )
+        })()}>
+        {poRcv && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontSize: 11.5, color: '#92400E', background: '#FFF7ED', borderRadius: 9,
+              padding: '7px 11px', border: '1px solid #FDE68A' }}>
+              🏭 {poRcv.supplier} → คลังกลาง{poRcv.shipper ? ` · 🚚 ${poRcv.shipper}` : ''} · ติ๊ก ✓ = รับตรงที่สั่ง · กด “ไม่ตรง” ถ้าจำนวนไม่ตรง
+            </div>
+            {/* 📅 วันที่รับ — ย้อนได้ ≤ 3 วัน (เผื่อลงข้อมูลย้อนหลังตามวันที่มาส่งจริง) */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'var(--bg)',
+              border: '1px solid var(--border)', borderRadius: 10, padding: '7px 10px' }}>
+              <span style={{ fontSize: 12, color: 'var(--txt2)', fontWeight: 700, whiteSpace: 'nowrap', flexShrink: 0 }}>📅 วันที่รับ</span>
+              <input className="fi" type="date" value={poRcvDate}
+                min={new Date(Date.now() - 3 * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })}
+                max={poToday()}
+                style={{ flex: 1, height: 34, padding: '0 9px', fontSize: 13 }}
+                onChange={e => setPoRcvDate(e.target.value)} />
+              {poRcvDate !== poToday() && (
+                <span style={{ fontSize: 10.5, fontWeight: 700, color: '#C2410C', background: '#FFEDD5',
+                  borderRadius: 6, padding: '3px 7px', whiteSpace: 'nowrap', flexShrink: 0 }}>ย้อนหลัง</span>
+              )}
+            </div>
+            {(poRcv.items || [])
+              .map((it, i) => {
+                const m = items.find(x => x.id === it.itemId)
+                const ORDER = catOrder.length > 0 ? catOrder : CAT_ORDER
+                const ci = ORDER.indexOf(m?.category)
+                return { it, i, _cat: ci < 0 ? 999 : ci, _sort: m?.sortOrder ?? 999 }
+              })
+              .sort((a, b) => (a._cat - b._cat) || (a._sort - b._sort))
+              .map(({ it, i }) => {
+              const chk = poRcvChecked[i] || { checked: false, qty: '0', mismatch: false, reason: '' }
+              const master = items.find(m => m.id === it.itemId)
+              const reqUse = qtyToUse(it.qty, it.unit, master)
+              const remainUse = Math.max(0, reqUse - (Number(it.fulfilledQtyUse) || 0))
+              const remainInUnit = useToQty(remainUse, it.unit, master)
+              const done = remainInUnit <= 0
+              const recvQty = parseFloat(chk.qty) || 0
+              return (
+                <div key={i} style={{ background: chk.checked ? (chk.mismatch ? '#FFF7ED' : '#F0FDF4') : '#fff',
+                  borderRadius: 11,
+                  border: `1.5px solid ${chk.checked ? (chk.mismatch ? '#FDBA74' : '#86EFAC') : 'var(--border)'}`,
+                  padding: '8px 10px', opacity: done ? 0.55 : 1, display: 'flex', alignItems: 'center', gap: 9 }}>
+                  {/* checkbox */}
+                  <div onClick={() => !done && setPoRcvChecked(c => ({ ...c, [i]: { ...chk, checked: !chk.checked, qty: chk.mismatch ? chk.qty : String(remainInUnit || 0) } }))}
+                    style={{ width: 24, height: 24, borderRadius: 7, flexShrink: 0, cursor: done ? 'default' : 'pointer',
+                      border: `2px solid ${chk.checked ? '#16A34A' : '#D1D5DB'}`,
+                      background: chk.checked ? '#16A34A' : '#fff', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center' }}>
+                    {chk.checked && <span style={{ color: '#fff', fontSize: 14, fontWeight: 900 }}>✓</span>}
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <label className="fi-label">EXP</label>
-                    <input className="fi" type="date" value={rcv.expDate}
-                      onChange={e => setRcv(r => ({ ...r, expDate: e.target.value }))} />
+                  <span style={{ fontSize: 18, flexShrink: 0 }}>{it.img}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 700, whiteSpace: 'nowrap',
+                      overflow: 'hidden', textOverflow: 'ellipsis' }}>{master?.displayName || it.itemName}</div>
+                    <div style={{ fontSize: 10.5, color: '#6B7280' }}>
+                      📦 สั่ง <strong>{Number(remainInUnit.toFixed(2))} {it.unit}</strong>
+                      {chk.checked && chk.mismatch && <span style={{ color: '#EA580C', fontWeight: 700 }}> · รับจริง {recvQty} {it.unit}</span>}
+                      {chk.checked && chk.mismatch && chk.reason && <span style={{ color: '#9CA3AF' }}> · {chk.reason}</span>}
+                      {done && ' · ✓ รับครบแล้ว'}
+                    </div>
                   </div>
+                  {/* ปุ่ม "ไม่ตรง" → popup */}
+                  {chk.checked && !done && (
+                    <button onClick={() => setPoMismatch({ idx: i, itemName: master?.displayName || it.itemName,
+                      img: it.img, orderedQty: Number(remainInUnit.toFixed(2)), unit: it.unit,
+                      qty: String(recvQty || remainInUnit || 0), reason: chk.reason || '' })}
+                      style={{ flexShrink: 0, border: `1px solid ${chk.mismatch ? '#EA580C' : '#D1D5DB'}`,
+                        background: chk.mismatch ? '#FFEDD5' : '#fff', color: chk.mismatch ? '#EA580C' : '#6B7280',
+                        borderRadius: 8, padding: '5px 9px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                      {chk.mismatch ? '✏️ แก้' : 'ไม่ตรง'}
+                    </button>
+                  )}
                 </div>
-                <div>
-                  <label className="fi-label">แหล่งที่มา</label>
-                  <select className="fi" value={rcv.source} onChange={e => setRcv(r => ({ ...r, source: e.target.value }))}>
-                    {sources.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                </div>
+              )
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* ══ Popup: รับไม่ตรง — ระบุจำนวนจริง + สาเหตุ ══ */}
+      <Modal open={!!poMismatch} onClose={() => setPoMismatch(null)}
+        title="⚠️ รับไม่ตรงที่สั่ง"
+        footer={poMismatch && (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn-secondary" style={{ flex: 1 }} onClick={() => setPoMismatch(null)}>ยกเลิก</button>
+            <button className="btn-primary" style={{ flex: 2 }}
+              disabled={!(parseFloat(poMismatch.qty) >= 0) || !poMismatch.reason.trim()}
+              onClick={() => {
+                const m = poMismatch
+                setPoRcvChecked(c => ({ ...c, [m.idx]: { ...(c[m.idx] || {}), checked: true,
+                  mismatch: true, qty: String(parseFloat(m.qty) || 0), reason: m.reason.trim() } }))
+                setPoMismatch(null)
+              }}>ยืนยันจำนวนจริง</button>
+          </div>
+        )}>
+        {poMismatch && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#F9FAFB',
+              borderRadius: 11, padding: '10px 12px', border: '1px solid var(--border)' }}>
+              <span style={{ fontSize: 22 }}>{poMismatch.img}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>{poMismatch.itemName}</div>
+                <div style={{ fontSize: 11, color: '#6B7280' }}>📦 สั่ง {poMismatch.orderedQty} {poMismatch.unit}</div>
+              </div>
+            </div>
+            <div>
+              <label className="fi-label" style={{ fontSize: 11.5 }}>รับจริงเท่าไหร่ ({poMismatch.unit})</label>
+              <div style={{ marginTop: 5 }}>
+                <PosQty value={parseFloat(poMismatch.qty) || 0}
+                  onChange={v => setPoMismatch(m => ({ ...m, qty: String(v) }))} />
+              </div>
+            </div>
+            <div>
+              <label className="fi-label" style={{ fontSize: 11.5 }}>สาเหตุที่ไม่ตรง <span style={{ color: '#DC2626' }}>*</span></label>
+              <input className="fi" type="text" value={poMismatch.reason} autoFocus
+                placeholder="เช่น ของขาด, แตกเสียหาย, ส่งเกิน, ส่งมาไม่ครบ"
+                style={{ marginTop: 5, width: '100%', height: 38, padding: '0 11px', fontSize: 13 }}
+                onFocus={e => { const t = e.target; setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 80) }}
+                onChange={e => setPoMismatch(m => ({ ...m, reason: e.target.value }))} />
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* ══ Popup: เพิ่มข้อมูล LOT (วันหมดอายุ) — รับแล้วแต่ยังไม่ใส่ exp ══ */}
+      <Modal open={lotInfoOpen} onClose={() => { setLotInfoOpen(false); setLotInfoData({}) }}
+        title="📅 เพิ่มข้อมูล LOT — วันที่รับ / วันหมดอายุ"
+        footer={
+          <button className="btn-primary" onClick={saveLotInfo} disabled={lotInfoSaving}
+            style={{ opacity: lotInfoSaving ? 0.5 : 1 }}>
+            {lotInfoSaving ? 'กำลังบันทึก...' : '💾 บันทึกข้อมูล LOT'}
+          </button>}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ fontSize: 10.5, color: '#0369A1', background: '#F0F9FF', borderRadius: 8,
+            padding: '6px 9px', border: '1px solid #BAE6FD' }}>
+            ℹ️ กรอก <strong>วันที่รับ · วันผลิต · วันหมดอายุ</strong> — หมดอายุเลือก “ใส่เอง” หรือ “คำนวณจากวันผลิต” ก็ได้ (กรอกทีหลังได้)
+          </div>
+          {(() => {
+            const ORDER = catOrder.length > 0 ? catOrder : CAT_ORDER
+            const pend = lots
+              .filter(l => l.pendingInfo && ((l.inWarehouse || 0) + (l.inShop || 0)) > 0 && (!lotInfoWh || lotInfoWh === 'all' || l.warehouseId === lotInfoWh)
+                && items.find(m => m.id === l.itemId)?.lotEnabled !== false)   // 🔕 item ปิด LOT → ไม่ทวงข้อมูล
+              .map(l => {
+                const m = items.find(x => x.id === l.itemId)
+                const ci = ORDER.indexOf(m?.category)
+                return { ...l, _cat: ci < 0 ? 999 : ci, _sort: m?.sortOrder ?? 999 }
+              })
+              .sort((a, b) => (a._cat - b._cat) || (a._sort - b._sort))
+            if (pend.length === 0) return (
+              <div style={{ padding: '14px', textAlign: 'center', fontSize: 12, color: 'var(--txt3)' }}>
+                ✅ ไม่มี LOT ที่ค้างข้อมูล
               </div>
             )
+            return pend.map(l => {
+              const master = items.find(m => m.id === l.itemId)
+              const u = master?.unitUse || ''
+              const qty = (l.inWarehouse || 0) + (l.inShop || 0)
+              const v = lotInfoData[l.id] || {}
+              const mode = v.expMode || 'date'   // 'date'=ใส่เอง · 'duration'=คำนวณจากวันผลิต
+              const upd = (patch) => setLotInfoData(d => ({ ...d, [l.id]: { ...(d[l.id] || {}), ...patch } }))
+              const computedExp   = addDateDuration(v.mfgDate, v.shelfValue, v.shelfUnit || 'day')
+              const directExp     = v.expDate || ''
+              const shelfFromDate = daysBetween(v.mfgDate, directExp)
+              const IH = 30
+              const fld = { width: '100%', height: IH, padding: '0 6px', fontSize: 10.5, marginTop: 1 }
+              // สีพื้นหลังต่อช่อง: รับ=ฟ้า · ผลิต=เขียว · หมดอายุ=แดง (อ่อน)
+              const tint = (bg, bd) => ({ ...fld, background: bg, border: `1px solid ${bd}` })
+              const C_BLUE = ['#EFF6FF', '#BFDBFE'], C_GREEN = ['#F0FDF4', '#BBF7D0'], C_RED = ['#FFF1F2', '#FECDD3']
+              const lbl = { flex: 1, fontSize: 9.5, color: 'var(--txt3)', minWidth: 0 }
+              const segBtn = (m, label) => (
+                <button key={m} type="button" onClick={() => upd({ expMode: m })}
+                  style={{ flex: 1, border: 'none', borderRadius: 5, padding: '3px 4px', fontSize: 10.5, fontWeight: 700,
+                    cursor: 'pointer', background: mode === m ? 'var(--surf)' : 'transparent',
+                    color: mode === m ? 'var(--txt)' : 'var(--txt3)',
+                    boxShadow: mode === m ? '0 1px 2px rgba(0,0,0,.12)' : 'none' }}>{label}</button>
+              )
+              const autoBox = (text, ok, bg = '#F9FAFB', bd = '#EEEEEE') => (
+                <div style={{ height: IH, lineHeight: `${IH}px`, padding: '0 6px', fontSize: 10.5, fontWeight: 700,
+                  color: ok ? 'var(--txt)' : 'var(--txt3)', background: bg, border: `1px solid ${bd}`, borderRadius: 7, marginTop: 1,
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{text}</div>
+              )
+              return (
+                <div key={l.id} style={{ background: '#fff', borderRadius: 9, border: '1px solid var(--border)', padding: '6px 8px' }}>
+                  {/* header — บรรทัดเดียว: ชื่อ + จำนวนรับ */}
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 }}>
+                    <span style={{ fontSize: 16, flexShrink: 0 }}>{master?.img || '📦'}</span>
+                    <span style={{ fontSize: 13.5, fontWeight: 800, whiteSpace: 'nowrap', overflow: 'hidden',
+                      textOverflow: 'ellipsis', flex: 1, minWidth: 0 }}>{master?.displayName || l.itemName}</span>
+                    <span style={{ fontSize: 10, color: '#9CA3AF', flexShrink: 0 }}>รับ {Number(qty.toFixed(2))} {u}</span>
+                  </div>
+                  {/* 💡 คัดลอกจาก LOT อื่นของ item เดียวกันที่มี EXP แล้ว (เช่น คลังกลาง) — จัด LOT ย้อนหลังไวขึ้น
+                      เคสของเข้าสาขาด้วย "ปรับยอด(+)" ระบบไม่รู้ว่ามาจากล็อตไหน จึงถาม — แต่ถ้าคลังอื่นมีข้อมูลอยู่ กดเดียวจบ */}
+                  {(() => {
+                    const ref = lots
+                      .filter(x => x.itemId === l.itemId && x.id !== l.id && x.status !== 'split' && x.expDate)
+                      .sort((a, b) => (b.receiveDate || '').localeCompare(a.receiveDate || ''))[0]
+                    if (!ref) return null
+                    const refWh = warehouses.find(w => w.id === ref.warehouseId)?.name || 'คลังอื่น'
+                    return (
+                      <button type="button"
+                        onClick={() => upd({ expDate: ref.expDate, mfgDate: (v.mfgDate ?? l.mfgDate) || ref.mfgDate || '', expMode: 'date' })}
+                        style={{ marginTop: 5, width: '100%', border: '1px dashed #93C5FD', background: '#EFF6FF',
+                          color: '#1D4ED8', borderRadius: 7, padding: '4px 8px', fontSize: 10.5, fontWeight: 700,
+                          cursor: 'pointer', textAlign: 'left' }}>
+                        📋 ใช้ EXP จาก LOT {refWh}: {formatDateDDMMYY(ref.expDate)}{ref.mfgDate ? ` · MFG ${formatDateDDMMYY(ref.mfgDate)}` : ''} — กดเพื่อเติม
+                      </button>
+                    )
+                  })()}
+                  {/* รับ + ผลิต */}
+                  <div style={{ display: 'flex', gap: 6, marginTop: 5 }}>
+                    <label style={lbl}>📥 รับ
+                      <input className="fi" type="date" value={v.receiveDate ?? (l.receiveDate || '')} style={tint(...C_BLUE)}
+                        onChange={e => upd({ receiveDate: e.target.value })} />
+                    </label>
+                    <label style={lbl}>🏭 ผลิต
+                      <input className="fi" type="date" value={v.mfgDate ?? (l.mfgDate || '')} style={tint(...C_GREEN)}
+                        onChange={e => upd({ mfgDate: e.target.value })} />
+                    </label>
+                  </div>
+                  {/* โหมดวันหมดอายุ */}
+                  <div style={{ display: 'flex', background: '#F2F2F7', borderRadius: 6, padding: 2, marginTop: 5 }}>
+                    {segBtn('date', 'ใส่เอง')}
+                    {segBtn('duration', 'คำนวณ')}
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end', marginTop: 5 }}>
+                    {mode === 'duration' ? (
+                      <>
+                        <div style={{ flex: 1.15, minWidth: 0 }}>
+                          <div style={{ fontSize: 9.5, color: 'var(--txt3)' }}>อายุสินค้า</div>
+                          <div style={{ display: 'flex', gap: 4, marginTop: 1 }}>
+                            <input className="fi" type="number" min="0" inputMode="numeric" placeholder="0" value={v.shelfValue ?? ''}
+                              style={{ flex: 1, minWidth: 0, height: IH, padding: '0 6px', fontSize: 11.5 }}
+                              onChange={e => upd({ shelfValue: e.target.value })} />
+                            <select className="fi" value={v.shelfUnit || 'day'}
+                              style={{ width: 62, flexShrink: 0, height: IH, padding: '0 4px', fontSize: 11.5 }}
+                              onChange={e => upd({ shelfUnit: e.target.value })}>
+                              <option value="day">วัน</option>
+                              <option value="month">เดือน</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 9.5, color: 'var(--txt3)' }}>📅 หมดอายุ</div>
+                          {autoBox(computedExp || '— ผลิต+อายุ', !!computedExp, ...C_RED)}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 9.5, color: 'var(--txt3)' }}>📅 หมดอายุ</div>
+                          <input className="fi" type="date" value={directExp} style={tint(...C_RED)}
+                            onChange={e => upd({ expDate: e.target.value })} />
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 9.5, color: 'var(--txt3)' }}>อายุ</div>
+                          {autoBox(shelfFromDate != null ? `${shelfFromDate} วัน` : '— ใส่ผลิต', shelfFromDate != null)}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )
+            })
           })()}
         </div>
       </Modal>
+
 
       {/* ══ Modal: แจ้งเติมของ — Step 1: เลือกสาขา / Step 2: เลือก item ══ */}
       <Modal open={refillOpen}
@@ -2375,6 +3362,7 @@ export default function Dashboard() {
               .map(wh => {
               const selected = refillBranch === wh.id
               const lowCount = items.filter(item => {
+                if (item.alertEnabled === false) return false   // 🔕 ปิดแจ้งเตือน → ไม่นับ
                 const bal = balances.find(b => b.itemId === item.id && b.warehouseId === wh.id)
                 const qty = bal?.qty || 0
                 const min = bal?.minQty || 0
@@ -2433,15 +3421,20 @@ export default function Dashboard() {
             const sortBySortOrder = (a, b) =>
               (a.sortOrder ?? 999) - (b.sortOrder ?? 999) ||
               (a.name || '').localeCompare(b.name || '', 'th')
-            const allItems = items.filter(item => {
+            // 🙈 ซ่อน item ที่ถูกตั้งซ่อนจากคลังสาขานี้ (Master Data: visibleIn[branch] === false)
+            const visItems = items.filter(item => item.visibleIn?.[refillBranch] !== false)
+            const allItems = visItems.filter(item => {
+              if (item.alertEnabled === false) return false   // 🔕 ปิดแจ้งเตือน → ไม่ขึ้น auto-list ต่ำ/หมด (ยังเลือกผ่านหมวดได้)
               const qty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               return qty <= getMin(item.id)
             }).sort(sortBySortOrder)
-            const others = items.filter(item => {
+            const others = visItems.filter(item => {
               const qty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               return qty > getMin(item.id)
             }).sort(sortBySortOrder)
-            const mainWh = warehouses.find(w => w.type === 'main' || w.isMain)
+            // ⚠️ ใช้ mainWarehouse prop (คลังกลางเก็บแยก) — warehouses ถูก filter เหลือสาขาเดียวสำหรับ staff
+            //    ถ้า find จาก warehouses ที่ filter แล้ว → undefined → mainQty=0 ทุกรายการ (bug เดิม)
+            const mainWh = mainWarehouse || warehouses.find(w => w.type === 'main' || w.isMain)
             const renderItem = (item) => {
               const stockQty = branchBal.filter(b => b.itemId === item.id).reduce((s,b) => s+(b.qty||0),0)
               const mainQty  = mainWh
@@ -2462,9 +3455,8 @@ export default function Dashboard() {
               // default: หน่วยที่ใหญ่ที่สุด (ลัง) — สั่งซื้อทีละลัง
               const selectedUnit = refillUnits[item.id] || u1 || unitOpts[0] || ''
 
-              // จำนวนที่ขอ → แปลงเป็นหน่วยเล็ก (unitUse) เพื่อเทียบกับสต็อกคลังกลาง (เก็บใน unitUse)
-              const _factor = parseConvFactor(item.unitConversion) || 1
-              const reqInUse = (selectedUnit === u1 && _factor > 1) ? currentQty * _factor : currentQty
+              // จำนวนที่ขอ → แปลงเป็นหน่วยเล็ก (unitUse) เพื่อเทียบกับสต็อกคลังกลาง — รองรับหน่วยหลายชั้น
+              const reqInUse = qtyToUse(currentQty, selectedUnit, item)
               const overMain = checked && currentQty > 0 && reqInUse > mainQty
 
               function toggleCheck(e) {
@@ -2588,9 +3580,9 @@ export default function Dashboard() {
               )
             }
             // หมวดหมู่ที่มีใน items ทั้งหมด — ใช้ catOrder จาก Settings ก่อน
-            const FALLBACK_CATS = ['ผลไม้','แยม','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
+            const FALLBACK_CATS = ['ผลไม้','แยม','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','ขนม','บรรจุภัณฑ์','อื่นๆ']
             const ORDER = catOrder.length > 0 ? catOrder : FALLBACK_CATS
-            const CAT_EMOJI = { ผลไม้:'🍋', แยม:'🍓', ไซรัป:'🍯', ท็อปปิ้ง:'💎', วัตถุดิบ:'🥛', บรรจุภัณฑ์:'🥤', อื่นๆ:'🔖' }
+            const CAT_EMOJI = { ผลไม้:'🍋', แยม:'🍓', ไซรัป:'🍯', ท็อปปิ้ง:'💎', วัตถุดิบ:'🥛', ขนม:'🍪', บรรจุภัณฑ์:'🥤', อื่นๆ:'🔖' }
             // 'selected' = แท็บรวมทุกรายการที่เลือกจะแจ้งเติม (โผล่เฉพาะตอนมีของเลือก)
             const availableCats = ['low',
               ...(refillSelected.size > 0 ? ['selected'] : []),
@@ -2601,8 +3593,8 @@ export default function Dashboard() {
             const displayItems = refillCat === 'low'
               ? allItems                                             // stock ต่ำ/หมด (sort แล้ว)
               : refillCat === 'selected'
-                ? items.filter(i => refillSelected.has(i.id)).sort(sortBySortOrder)  // ทั้งหมดที่เลือก
-                : items.filter(i => (i.category || 'อื่นๆ') === refillCat).sort(sortBySortOrder)
+                ? visItems.filter(i => refillSelected.has(i.id)).sort(sortBySortOrder)  // ทั้งหมดที่เลือก
+                : visItems.filter(i => (i.category || 'อื่นๆ') === refillCat).sort(sortBySortOrder)
 
             // นับ selected ต่อ cat
             function selCount(cat) {
@@ -2694,9 +3686,7 @@ export default function Dashboard() {
             const master = items.find(i => i.id === ti.itemId)
             const stockUse = balances.filter(b => b.itemId === ti.itemId && b.warehouseId === tfr.fromWH)
               .reduce((s, b) => s + (b.qty || 0), 0)
-            const factor = parseConvFactor(master?.unitConversion) || 1
-            const qtyIn = parseFloat(ti.qty) || 0
-            const qtyUseOut = (ti.unit && master?.unitBase && ti.unit === master.unitBase) ? qtyIn * factor : qtyIn
+            const qtyUseOut = qtyToUse(parseFloat(ti.qty) || 0, ti.unit, master)
             return qtyUseOut > stockUse
           })
           // Step 1 footer = "ถัดไป"
@@ -2719,7 +3709,7 @@ export default function Dashboard() {
                 onClick={() => setTfStep('pick')}>← ย้อนกลับ</button>
               <button className="btn-primary" style={{ flex: 2, opacity: disabled ? 0.5 : 1 }}
                 disabled={disabled}
-                onClick={() => setTfStep('confirm')}>
+                onClick={() => { setTfConfirmChecks({}); setTfStep('confirm') }}>
                 {hasOutItem ? '⚠️ Stock หมด' : hasOverItem ? '⚠️ จำนวนเกินสต็อก' : !allHasQty ? 'กรอกจำนวนให้ครบ' : 'ตรวจสอบ → ยืนยัน'}
               </button>
             </div>
@@ -2727,8 +3717,10 @@ export default function Dashboard() {
         })()}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
 
-          {/* ── RF Import Picker ── */}
+          {/* ── RF Import Picker ── (เฉพาะโอน คลังกลาง → สาขา · RF = สาขาขอเติมจากคลัง) */}
           {(() => {
+            const mainId = warehouses.find(w => w.type === 'main' || w.isMain)?.id || ''
+            if (tfr.fromWH !== mainId) return null   // โอนกลับคลัง (สาขา→คลัง) ไม่มี RF
             const pendingRFs = refillRequests.filter(r => r.status === 'pending' || r.status === 'partial')
             if (pendingRFs.length === 0) return null
             return (
@@ -2823,30 +3815,53 @@ export default function Dashboard() {
           })()}
 
           {/* ควบรวม: คลังต้นทาง(ล็อก) → สาขา + คนนำส่ง ในการ์ดเดียว */}
-          <div style={{ border: '1px solid var(--border)', borderRadius: 11, padding: 9,
-            background: 'var(--bg)', display: 'flex', flexDirection: 'column', gap: 7 }}>
-            {/* แถวคลัง: 🏭 กลาง → สาขา */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '7px 9px',
-                borderRadius: 8, background: '#F3F4F6', fontSize: 12.5, fontWeight: 700,
-                color: '#6B7280', whiteSpace: 'nowrap', flexShrink: 0 }}>
-                🏭 {warehouses.find(w => w.id === tfr.fromWH)?.name || 'คลังกลาง'} 🔒
-              </span>
-              <span style={{ fontSize: 15, color: '#9CA3AF', flexShrink: 0 }}>→</span>
-              <select className="fi" value={tfr.toWH} style={{ flex: 1, height: 36, padding: '0 10px' }}
-                onChange={e => setTfr(t => ({ ...t, toWH: e.target.value }))}>
-                <option value="">เลือกสาขาปลายทาง</option>
-                {warehouses
-                  .filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
-                  .map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
-              </select>
-            </div>
+          <div style={{ border: '1px solid #FBD5D5', borderRadius: 10, padding: 8,
+            background: '#FFF8F8', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {/* แถวคลัง: ต้นทาง → ปลายทาง · กดปุ่ม ⇄ เพื่อสลับทิศ (คลัง↔สาขา) */}
+            {(() => {
+              const mainId = warehouses.find(w => w.type === 'main' || w.isMain)?.id || ''
+              const fromIsMain = tfr.fromWH === mainId
+              const branchField = fromIsMain ? 'toWH' : 'fromWH'   // ฝั่งที่เป็น "สาขา" (เลือกได้)
+              const MainBadge = (
+                <span style={{ display: 'flex', alignItems: 'center', gap: 3, padding: '6px 8px',
+                  borderRadius: 7, background: '#FEECEC', fontSize: 11.5, fontWeight: 700,
+                  color: '#B91C1C', whiteSpace: 'nowrap', flexShrink: 0 }}>
+                  🏭 {warehouses.find(w => w.id === mainId)?.name || 'คลังกลาง'} 🔒
+                </span>
+              )
+              const BranchSelect = (
+                <select className="fi" value={tfr[branchField]}
+                  style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
+                  onChange={e => setTfr(t => ({ ...t, [branchField]: e.target.value }))}>
+                  <option value="">เลือกสาขา{fromIsMain ? 'ปลายทาง' : 'ต้นทาง'}</option>
+                  {warehouses
+                    .filter(w => w.active !== false && !(w.type === 'main' || w.isMain))
+                    .map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+                </select>
+              )
+              return (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {fromIsMain ? MainBadge : BranchSelect}
+                  {/* ปุ่มสลับทิศ — วงกลมมีลูกศร 2 ทาง ดูออกว่ากดได้ */}
+                  <button type="button" aria-label="สลับทิศทางการโอน"
+                    title="สลับทิศทางการโอน (คลัง ↔ สาขา)"
+                    onClick={() => setTfr(t => ({ ...t, fromWH: t.toWH, toWH: t.fromWH }))}
+                    style={{ flexShrink: 0, width: 30, height: 30, borderRadius: '50%',
+                      border: '1.5px solid #F87171', background: '#fff', color: '#DC2626',
+                      fontSize: 15, fontWeight: 800, lineHeight: 1, cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontFamily: "-apple-system, system-ui, 'Segoe UI Symbol', sans-serif",
+                      boxShadow: '0 1px 3px rgba(220,38,38,.25)' }}>⇄</button>
+                  {fromIsMain ? BranchSelect : MainBadge}
+                </div>
+              )
+            })()}
             {/* แถวคนนำส่ง */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontSize: 12, color: 'var(--txt2)', fontWeight: 600,
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11.5, color: 'var(--txt2)', fontWeight: 600,
                 whiteSpace: 'nowrap', flexShrink: 0 }}>🛵 คนนำส่ง</span>
               <input className="fi" placeholder="ระบุชื่อ (ถ้ามี)" value={tfr.driver}
-                style={{ flex: 1, height: 36, padding: '0 10px' }}
+                style={{ flex: 1, height: 32, padding: '0 8px', fontSize: 12.5 }}
                 onChange={e => setTfr(t => ({ ...t, driver: e.target.value }))} />
             </div>
           </div>
@@ -2906,15 +3921,11 @@ export default function Dashboard() {
                 }).map((it, idx) => {
                   // หา unitOpts จาก item master หรือที่เก็บไว้ใน it.unitOpts
                   const master   = items.find(i => i.id === it.itemId)
-                  const unitOpts = it.unitOpts?.length
-                    ? it.unitOpts
-                    : (() => {
-                        const opts = []
-                        if (master?.unitUse)  opts.push(master.unitUse)
-                        if (master?.unitBase && !opts.includes(master.unitBase)) opts.push(master.unitBase)
-                        if (opts.length === 0 && it.unit) opts.push(it.unit)
-                        return opts
-                      })()
+                  // หน่วยให้เลือก — รองรับหลายชั้น (ลัง/มัด/ใบ) จาก unitLevels
+                  const masterOpts = unitOptionsOf(master)
+                  const unitOpts = masterOpts.length
+                    ? masterOpts
+                    : (it.unitOpts?.length ? it.unitOpts : (it.unit ? [it.unit] : []))
                   // V2: ดึง main warehouse stock — sum ทุก balance doc กัน duplicate ที่อาจค้างจาก legacy
                   const matchingBals = tfr.fromWH
                     ? balances.filter(b => b.itemId === it.itemId && b.warehouseId === tfr.fromWH)
@@ -2929,13 +3940,13 @@ export default function Dashboard() {
                   }
                   const stockTone = stockStatus ? stockColors[stockStatus] : null
                   return (
-                    <div key={idx} style={{ background: '#F9FAFB', borderRadius: 12,
-                      border: '1px solid var(--border)', padding: '10px 12px' }}>
+                    <div key={idx} style={{ background: '#FFF8F8', borderRadius: 10,
+                      border: '1px solid #FBD5D5', padding: '7px 9px' }}>
                       {/* Row 1: emoji + ชื่อ + ลบ */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-                        <span style={{ fontSize: 22, flexShrink: 0 }}>{it.img}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                        <span style={{ fontSize: 17, flexShrink: 0 }}>{it.img}</span>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 13, fontWeight: 700 }}>{it.itemName}</div>
+                          <div style={{ fontSize: 12.5, fontWeight: 700 }}>{master?.displayName || it.itemName}</div>
                           {stockTone && master && (
                             <div style={{ fontSize: 10, marginTop: 2, display: 'flex',
                               alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -2948,11 +3959,9 @@ export default function Dashboard() {
                               </span>
                               {(() => {
                                 // คำนวณยอดหลังโอน + FIFO LOT breakdown
-                                const factor = parseConvFactor(master?.unitConversion) || 1
                                 const qtyIn  = parseFloat(it.qty) || 0
                                 if (!qtyIn) return null
-                                const qtyUseOut = (it.unit && master?.unitBase && it.unit === master.unitBase)
-                                  ? qtyIn * factor : qtyIn
+                                const qtyUseOut = qtyToUse(qtyIn, it.unit, master)
                                 const after = stockInFrom - qtyUseOut
                                 return (
                                   <span style={{ color: after < 0 ? '#DC2626' : '#9CA3AF', fontSize: 10 }}>
@@ -2966,9 +3975,7 @@ export default function Dashboard() {
                           {tfr.fromWH && master && (() => {
                             const qtyIn = parseFloat(it.qty) || 0
                             if (!qtyIn) return null
-                            const factor = parseConvFactor(master?.unitConversion) || 1
-                            const qtyUseOut = (it.unit && master?.unitBase && it.unit === master.unitBase)
-                              ? qtyIn * factor : qtyIn
+                            const qtyUseOut = qtyToUse(qtyIn, it.unit, master)
                             // เลือก LOT ของคลังต้นทาง ที่ยังเหลือ
                             const availLots = sortLotsFIFO(
                               lots.filter(l => l.itemId === it.itemId
@@ -3009,37 +4016,73 @@ export default function Dashboard() {
                               </div>
                             )
                           })()}
+                          {/* §9.4 — เลือก LOT ที่จะส่ง (default FIFO) เพื่อให้คลังกลาง monitor EXP ได้ */}
+                          {tfr.fromWH && master && (() => {
+                            const availLots = sortLotsFIFO(lots.filter(l => l.itemId === it.itemId
+                              && l.warehouseId === tfr.fromWH && getLotAvail(l, tfr.fromWH) > 0 && l.status !== 'split'))
+                            if (availLots.length <= 1) return null  // มีล็อตเดียว/ไม่มี → ไม่ต้องเลือก
+                            return (
+                              <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                                <span style={{ fontSize: 10, color: '#6B7280', whiteSpace: 'nowrap' }}>เลือก LOT:</span>
+                                <select value={it.lotPick || ''}
+                                  onChange={e => setTransferItems(prev => prev.map(p => p.itemId === it.itemId ? { ...p, lotPick: e.target.value || null } : p))}
+                                  style={{ flex: 1, minWidth: 0, fontSize: 10.5, height: 28, borderRadius: 6,
+                                    border: `1px solid ${it.lotPick ? '#FDBA74' : 'var(--border)'}`,
+                                    background: it.lotPick ? '#FFF7ED' : '#fff', padding: '0 6px' }}>
+                                  <option value="">อัตโนมัติ (FIFO — เก่าสุดก่อน)</option>
+                                  {availLots.map(l => {
+                                    const d = l.receiveDate ? l.receiveDate.slice(5).replace('-', '/') : '-'
+                                    const ex = l.expDate ? ` · EXP ${l.expDate.slice(5).replace('-', '/')}` : ''
+                                    return <option key={l.id} value={l.id}>รับ {d} · เหลือ {Number(getLotAvail(l, tfr.fromWH).toFixed(2))} {master.unitUse}{ex}</option>
+                                  })}
+                                </select>
+                              </div>
+                            )
+                          })()}
                           {stockStatus === 'out' && (
                             <div style={{ marginTop: 6, fontSize: 10, color: '#991B1B',
                               background: '#FEE2E2', borderRadius: 8, padding: '6px 10px',
                               display: 'flex', alignItems: 'center', gap: 8 }}>
                               <span>ให้เตรียมสั่งของจากซัพพลายเออร์ค่ะ</span>
-                              <button onClick={async () => {
-                                const ownerPhone = window._bizSession?.phone || 'owner'
-                                await addDoc(collection(db, COL.PUSH_QUEUE), {
-                                  title: `Stock หมด — ${it.itemName}`,
-                                  body:  `คลังกลางหมด ขอเตรียมสั่งซื้อ`,
-                                  read: false, tag: 'stock_out',
-                                  recipient: ownerPhone, createdAt: serverTimestamp(),
-                                })
-                                setToast('📣 แจ้ง Owner แล้ว')
-                              }}
-                                style={{ marginLeft: 'auto', border: 'none',
-                                  background: '#DC2626', color: '#fff', borderRadius: 6,
-                                  padding: '3px 10px', fontSize: 10, fontWeight: 700,
-                                  cursor: 'pointer', whiteSpace: 'nowrap' }}>
-                                📣 แจ้ง Owner
-                              </button>
+                              {(() => {
+                                const sentAlready = ownerNotified.has(it.itemId)
+                                return (
+                                <button disabled={sentAlready}
+                                  onClick={async () => {
+                                    if (sentAlready) return
+                                    const branchName = warehouses.find(w => w.id === tfr.toWH)?.name || ''
+                                    try {
+                                      // ส่งผ่าน path หลัก → เด้งกระดิ่ง Hub + FCM ถึง Owner/Admin จริง
+                                      const nref = await addDoc(collection(db, 'hub_notifications'), {
+                                        app: 'inventory', type: 'stock-out', tag: 'stock',
+                                        title: `🔴 คลังกลางหมด — ${it.itemName}`,
+                                        body: `${it.itemName} หมดที่คลังกลาง · ${branchName ? `สาขา ${branchName} ` : ''}ขอเตรียมสั่งซื้อจากซัพพลายเออร์ · โดย ${name || '-'}`,
+                                        itemId: it.itemId, itemName: it.itemName,
+                                        createdAt: serverTimestamp(), read: false, read_by: [],
+                                      })
+                                      sendHubPush(nref.id)
+                                      setOwnerNotified(prev => new Set(prev).add(it.itemId))
+                                      setToast(`📣 แจ้ง Owner แล้ว — ${it.itemName}`)
+                                    } catch (e) { console.error(e); setToast('❌ แจ้ง Owner ไม่สำเร็จ') }
+                                  }}
+                                  style={{ marginLeft: 'auto', border: 'none',
+                                    background: sentAlready ? '#9CA3AF' : '#DC2626', color: '#fff', borderRadius: 6,
+                                    padding: '3px 10px', fontSize: 10, fontWeight: 700,
+                                    cursor: sentAlready ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
+                                  {sentAlready ? '✓ แจ้งแล้ว' : '📣 แจ้ง Owner'}
+                                </button>
+                                )
+                              })()}
                             </div>
                           )}
                         </div>
                         <button onClick={() => setTransferItems(prev => prev.filter(p => p.itemId !== it.itemId))}
-                          style={{ border: 'none', background: '#FEE2E2', color: '#DC2626',
-                            borderRadius: 8, width: 30, height: 30, fontSize: 15, cursor: 'pointer',
-                            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>✕</button>
+                          style={{ border: 'none', background: 'transparent', color: '#F87171',
+                            borderRadius: 6, width: 22, height: 22, fontSize: 13, cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>×</button>
                       </div>
                       {/* Row 2: unit chips + POS stepper */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                         {unitOpts.length > 0 && (
                           <UnitChips
                             opts={unitOpts.map(u => ({ value: u, label: u, sub: '' }))}
@@ -3049,10 +4092,8 @@ export default function Dashboard() {
                           />
                         )}
                         {(() => {
-                          // 🔒 Block กรอกเกินสต็อกคลังกลาง — cap ตามหน่วยที่เลือก
-                          const _f = parseConvFactor(master?.unitConversion) || 1
-                          const _isBase = it.unit && master?.unitBase && it.unit === master.unitBase
-                          const maxInUnit = _isBase ? Math.floor(stockInFrom / _f) : Math.floor(stockInFrom)
+                          // 🔒 Block กรอกเกินสต็อกคลังกลาง — cap ตามหน่วยที่เลือก (รองรับหน่วยหลายชั้น)
+                          const maxInUnit = Math.floor(useToQty(stockInFrom, it.unit, master))
                           return (
                             <PosQty
                               value={parseFloat(it.qty) || 0}
@@ -3075,20 +4116,23 @@ export default function Dashboard() {
         </div>
       </Modal>
 
-      {/* ══ Confirm popup สร้างใบโอน ══ */}
+      {/* ══ Confirm popup สร้างใบโอน — กดพื้นหลังไม่ปิด (กันติ๊กหาย) ต้องกด "แก้ไข" ══ */}
       {tfStep === 'confirm' && transferOpen && (
-        <div onClick={() => setTfStep('qty')}
+        <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 300,
             display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
           <div onClick={e => e.stopPropagation()}
-            style={{ background: '#fff', borderRadius: 20, width: 'min(480px, 92vw)',
+            style={{ background: '#fff', borderRadius: 20, overflow: 'hidden', width: 'min(480px, 92vw)',
               maxHeight: '85vh', display: 'flex', flexDirection: 'column',
               boxShadow: '0 10px 50px rgba(0,0,0,.3)' }}>
             <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
-              <div style={{ fontSize: 16, fontWeight: 800 }}>🚚 ยืนยันสร้างใบโอน</div>
+              <div style={{ fontSize: 16, fontWeight: 800 }}>📦 ตรวจสอบก่อนนำส่ง</div>
               <div style={{ fontSize: 11, color: 'var(--txt3)', marginTop: 2 }}>
                 {warehouses.find(w => w.id === tfr.fromWH)?.name} → {warehouses.find(w => w.id === tfr.toWH)?.name}
                 {tfr.driver ? ` · คนนำส่ง: ${tfr.driver}` : ''}
+              </div>
+              <div style={{ fontSize: 10.5, color: '#1D4ED8', fontWeight: 700, marginTop: 5 }}>
+                🛒 หยิบของออกจากคลังแล้วติ๊กทีละรายการ
               </div>
             </div>
             <div style={{ overflowY: 'auto', flex: 1, padding: '8px 16px' }}>
@@ -3100,20 +4144,29 @@ export default function Dashboard() {
                 const ma = items.find(i => i.id === a.itemId)?.sortOrder ?? 999
                 const mb = items.find(i => i.id === b.itemId)?.sortOrder ?? 999
                 return ma - mb
-              }).map((it, i) => {
+              }).map((it) => {
                 const master = items.find(m => m.id === it.itemId)
-                const factor = parseConvFactor(master?.unitConversion) || 1
-                const qtyUse = (it.unit === master?.unitBase) ? (parseFloat(it.qty) || 0) * factor : (parseFloat(it.qty) || 0)
+                const qtyUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, master)
+                const on = !!tfConfirmChecks[it.itemId]
                 return (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '8px 0', borderTop: i > 0 ? '1px solid var(--bg)' : 'none' }}>
+                  <div key={it.itemId} onClick={() => setTfConfirmChecks(c => ({ ...c, [it.itemId]: !on }))}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer',
+                      padding: '8px 9px', marginTop: 6, borderRadius: 9,
+                      background: on ? '#F0FDF4' : '#fff',
+                      border: `1.5px solid ${on ? '#86EFAC' : 'var(--border)'}` }}>
+                    <div style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0,
+                      border: `2px solid ${on ? '#16A34A' : '#D1D5DB'}`, background: on ? '#16A34A' : '#fff',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      {on && <span style={{ color: '#fff', fontSize: 13, fontWeight: 900 }}>✓</span>}
+                    </div>
                     <span style={{ fontSize: 18 }}>{it.img}</span>
-                    <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{it.itemName}</span>
-                    <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--red)' }}>
+                    <span style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
+                      overflow: 'hidden', textOverflow: 'ellipsis' }}>{master?.displayName || it.itemName}</span>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--red)', flexShrink: 0 }}>
                       {it.qty} {it.unit}
                     </span>
-                    {it.unit === master?.unitBase && factor > 1 && (
-                      <span style={{ fontSize: 10, color: 'var(--txt3)' }}>
+                    {master?.unitUse && it.unit !== master.unitUse && qtyUse !== (parseFloat(it.qty) || 0) && (
+                      <span style={{ fontSize: 10, color: 'var(--txt3)', flexShrink: 0 }}>
                         (= {qtyUse} {master?.unitUse})
                       </span>
                     )}
@@ -3121,21 +4174,30 @@ export default function Dashboard() {
                 )
               })}
             </div>
-            <div style={{ padding: 14, borderTop: '1px solid var(--border)',
-              background: 'var(--bg)', borderRadius: '0 0 20px 20px' }}>
-              <div style={{ fontSize: 12, color: 'var(--txt3)', marginBottom: 10, textAlign: 'center' }}>
-                รวม <strong style={{ color: 'var(--txt1)' }}>{transferItems.length}</strong> รายการ — ตรวจสอบก่อนยืนยัน
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button className="btn-secondary" style={{ flex: 1 }}
-                  onClick={() => setTfStep('qty')}>← แก้ไข</button>
-                <button className="btn-primary" style={{ flex: 2 }}
-                  disabled={transferSaving}
-                  onClick={async () => { await submitTransfer(); setTfStep('pick') }}>
-                  {transferSaving ? 'กำลังบันทึก...' : '✅ ยืนยันสร้าง + นำส่ง'}
-                </button>
-              </div>
-            </div>
+            {(() => {
+              const checked = transferItems.filter(it => tfConfirmChecks[it.itemId]).length
+              const allChecked = transferItems.length > 0 && checked === transferItems.length
+              return (
+                <div style={{ padding: 14, borderTop: '1px solid var(--border)',
+                  background: 'var(--bg)', borderRadius: '0 0 20px 20px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--txt3)', marginBottom: 10, textAlign: 'center' }}>
+                    ตรวจแล้ว <strong style={{ color: allChecked ? '#16A34A' : 'var(--red)' }}>{checked}/{transferItems.length}</strong> รายการ
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="btn-secondary" style={{ flex: 1 }}
+                      onClick={() => setTfStep('qty')}>← แก้ไข</button>
+                    <button style={{ flex: 2, border: 'none', borderRadius: 12, padding: '13px 0',
+                      fontWeight: 700, fontSize: 14, color: '#fff',
+                      cursor: (allChecked && !transferSaving) ? 'pointer' : 'not-allowed',
+                      background: (allChecked && !transferSaving) ? 'var(--red)' : '#FCD34D' }}
+                      disabled={!allChecked || transferSaving}
+                      onClick={async () => { await submitTransfer(); setTfStep('pick'); setTfConfirmChecks({}) }}>
+                      {transferSaving ? 'กำลังบันทึก...' : allChecked ? '✅ ยืนยันสร้าง + นำส่ง' : `ติ๊กให้ครบก่อน (${checked}/${transferItems.length})`}
+                    </button>
+                  </div>
+                </div>
+              )
+            })()}
           </div>
         </div>
       )}
@@ -3169,7 +4231,7 @@ export default function Dashboard() {
                 <div style={{ fontSize: 11, color: '#6B7280' }}>คนนำส่ง: {receivingTF.driver}</div>
               )}
               <div style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
-                ติ๊กถูก {receivingChecked.size}/{receivingTF.items?.length || 0} รายการ
+                ติ๊กถูก {receivingChecked.size}/{receivingTF.items?.length || 0} รายการ · <span style={{ color: '#D97706', fontWeight: 600 }}>ของไม่มา → ติ๊กแล้วกรอก 0</span>
               </div>
             </div>
 
@@ -3189,7 +4251,7 @@ export default function Dashboard() {
                 if (!grouped[cat]) grouped[cat] = []
                 grouped[cat].push({ ...it, _idx: idx })
               })
-              const ORDER = catOrder.length > 0 ? catOrder : ['ผลไม้','แยม','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
+              const ORDER = catOrder.length > 0 ? catOrder : ['ผลไม้','แยม','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','ขนม','บรรจุภัณฑ์','อื่นๆ']
               const sortedCats = Object.keys(grouped).sort((a,b) =>
                 (ORDER.indexOf(a) === -1 ? 99 : ORDER.indexOf(a)) -
                 (ORDER.indexOf(b) === -1 ? 99 : ORDER.indexOf(b)))
@@ -3207,37 +4269,54 @@ export default function Dashboard() {
                     {cat.toUpperCase()}
                   </div>
                   {grouped[cat].map(it => {
-                    const ticked = receivingChecked.has(it._idx)
+                    const ticked  = receivingChecked.has(it._idx)
+                    const planned = parseFloat(it.qty) || 0
+                    const actStr  = receivingQty[it._idx] ?? String(it.qty ?? '')
+                    const actNum  = parseFloat(actStr) || 0
+                    const mismatch = ticked && actNum !== planned
+                    const accent = !ticked ? null : (mismatch ? '#D97706' : '#16A34A')
                     return (
                       <div key={it._idx}
-                        onClick={() => setReceivingChecked(prev => {
-                          const n = new Set(prev); ticked ? n.delete(it._idx) : n.add(it._idx); return n
-                        })}
+                        onClick={() => toggleReceiveItem(it._idx, it.qty)}
                         style={{ display: 'flex', alignItems: 'center', gap: 12,
-                          background: ticked ? '#F0FDF4' : '#fff',
-                          border: `2px solid ${ticked ? '#86EFAC' : 'var(--border)'}`,
-                          borderRadius: 12, padding: '11px 14px', marginBottom: 7,
+                          background: ticked ? (mismatch ? '#FFFBEB' : '#F0FDF4') : '#fff',
+                          border: `2px solid ${ticked ? (mismatch ? '#FCD34D' : '#86EFAC') : 'var(--border)'}`,
+                          borderRadius: 12, padding: '10px 12px', marginBottom: 7,
                           cursor: 'pointer', transition: 'all .15s' }}>
                         {/* Tick circle */}
                         <div style={{ width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
-                          border: `2px solid ${ticked ? '#16A34A' : 'var(--border2)'}`,
-                          background: ticked ? '#16A34A' : '#fff',
+                          border: `2px solid ${ticked ? accent : 'var(--border2)'}`,
+                          background: ticked ? accent : '#fff',
                           display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           {ticked && <span style={{ color: '#fff', fontSize: 14, fontWeight: 700 }}>✓</span>}
                         </div>
                         <span style={{ fontSize: 22, flexShrink: 0 }}>{it.img || '📦'}</span>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: 13, fontWeight: 700,
-                            color: ticked ? '#16A34A' : 'var(--txt)',
-                            textDecoration: ticked ? 'none' : 'none' }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: ticked ? accent : 'var(--txt)' }}>
                             {it.itemName}
                           </div>
-                          <div style={{ fontSize: 12, color: ticked ? '#16A34A' : 'var(--txt2)',
-                            fontWeight: 700, marginTop: 1 }}>
-                            {it.qty} {it.unit}
-                          </div>
+                          {ticked ? (
+                            // กรอกยอดรับจริง (0 หรือยอดอื่น) — กรณีของมาไม่ครบ
+                            <div onClick={e => e.stopPropagation()}
+                              style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3 }}>
+                              <span style={{ fontSize: 10.5, color: 'var(--txt3)', flexShrink: 0 }}>รับจริง</span>
+                              <input type="number" min="0" inputMode="decimal" value={actStr}
+                                onChange={e => setReceivingQty(q => ({ ...q, [it._idx]: e.target.value }))}
+                                style={{ width: 66, height: 30, padding: '0 6px', fontSize: 13, fontWeight: 800,
+                                  textAlign: 'center', borderRadius: 8, border: `1.5px solid ${mismatch ? '#FCD34D' : '#86EFAC'}`,
+                                  color: accent, background: '#fff' }} />
+                              <span style={{ fontSize: 11.5, color: 'var(--txt2)', fontWeight: 700, flexShrink: 0 }}>{it.unit}</span>
+                              <span style={{ fontSize: 10.5, color: mismatch ? '#D97706' : 'var(--txt3)', flexShrink: 0 }}>
+                                / ส่งมา {planned}
+                              </span>
+                            </div>
+                          ) : (
+                            <div style={{ fontSize: 12, color: 'var(--txt2)', fontWeight: 700, marginTop: 1 }}>
+                              {it.qty} {it.unit}
+                            </div>
+                          )}
                         </div>
-                        {ticked && <span style={{ fontSize: 18, flexShrink: 0 }}>✅</span>}
+                        {ticked && <span style={{ fontSize: 17, flexShrink: 0 }}>{mismatch ? '⚠️' : '✅'}</span>}
                       </div>
                     )
                   })}
@@ -3254,7 +4333,7 @@ export default function Dashboard() {
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.55)', zIndex: 400,
             display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
           <div onClick={e => e.stopPropagation()}
-            style={{ background: '#fff', borderRadius: 20, width: 'min(480px, 92vw)',
+            style={{ background: '#fff', borderRadius: 20, overflow: 'hidden', width: 'min(480px, 92vw)',
               maxHeight: '85vh', display: 'flex', flexDirection: 'column',
               boxShadow: '0 10px 50px rgba(0,0,0,.3)' }}>
             <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)' }}>
@@ -3265,26 +4344,37 @@ export default function Dashboard() {
               </div>
             </div>
             <div style={{ overflowY: 'auto', flex: 1, padding: '8px 16px' }}>
-              <div style={{ fontSize: 11, color: '#16A34A', fontWeight: 700, padding: '6px 0' }}>
-                ✓ ติ๊กถูกครบ {receivingTF.items?.length || 0} รายการ — stock จะอัพเดทเมื่อกดยืนยัน
-              </div>
-              {(receivingTF.items || []).map((it, i) => {
-                const master = items.find(m => m.id === it.itemId)
-                const factor = parseConvFactor(master?.unitConversion) || 1
-                const qtyUse = (it.unit === master?.unitBase) ? (parseFloat(it.qty) || 0) * factor : (parseFloat(it.qty) || 0)
+              {(() => {
+                const shortN = (receivingTF.items || []).filter((it, ix) =>
+                  (parseFloat(receivingQty[ix] ?? it.qty) || 0) < (parseFloat(it.qty) || 0)).length
+                return (
+                  <div style={{ fontSize: 11, fontWeight: 700, padding: '6px 0',
+                    color: shortN ? '#D97706' : '#16A34A' }}>
+                    {shortN
+                      ? `⚠️ มี ${shortN} รายการรับไม่ครบ — รับตามที่กรอก · ส่วนที่ขาดจะกลายเป็นใบแจ้งเติม`
+                      : `✓ รับครบทุกรายการ — stock จะอัพเดทเมื่อกดยืนยัน`}
+                  </div>
+                )
+              })()}
+              {sortByMaster(receivingTF.items, { items, catOrder }).map((it, i) => {
+                const ix       = receivingTF.items.indexOf(it)
+                const planned  = parseFloat(it.qty) || 0
+                const actNum   = parseFloat(receivingQty[ix] ?? it.qty) || 0
+                const short    = actNum < planned
                 return (
                   <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '8px 0', borderTop: i > 0 ? '1px solid var(--bg)' : '1px solid var(--bg)' }}>
+                    padding: '8px 0', borderTop: '1px solid var(--bg)' }}>
                     <span style={{ fontSize: 18 }}>{it.img || '📦'}</span>
                     <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{it.itemName}</span>
-                    <span style={{ fontSize: 13, fontWeight: 800, color: '#16A34A' }}>
-                      +{it.qty} {it.unit}
-                    </span>
-                    {it.unit === master?.unitBase && factor > 1 && (
-                      <span style={{ fontSize: 10, color: 'var(--txt3)' }}>
-                        (= {qtyUse} {master?.unitUse})
+                    {short && (
+                      <span style={{ fontSize: 11, color: 'var(--txt3)', textDecoration: 'line-through' }}>
+                        {planned}
                       </span>
                     )}
+                    <span style={{ fontSize: 13, fontWeight: 800, color: short ? '#D97706' : '#16A34A' }}>
+                      +{actNum} {it.unit}
+                    </span>
+                    {short && <span style={{ fontSize: 13 }}>⚠️</span>}
                   </div>
                 )
               })}
@@ -3658,7 +4748,7 @@ export default function Dashboard() {
                         </span>
                         <button onClick={() => setWasteCart(prev => { const n = { ...prev }; delete n[itemId]; return n })}
                           style={{ border: 'none', background: '#FEE2E2', color: '#DC2626',
-                            borderRadius: 6, width: 24, height: 24, fontSize: 12, cursor: 'pointer' }}>✕</button>
+                            borderRadius: 6, width: 24, height: 24, fontSize: 12, cursor: 'pointer' }}>×</button>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                         {unitOpts.map(opt => {

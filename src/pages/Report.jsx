@@ -1,11 +1,16 @@
 import { useState, useEffect, useRef } from 'react'
 import { db, sendHubPush } from '../firebase'
-import { collection, query, where, onSnapshot, orderBy, doc, getDocs,
+import { collection, query, where, onSnapshot, orderBy, limit, Timestamp, doc, getDocs,
          updateDoc, addDoc, serverTimestamp, getDoc, writeBatch, increment, documentId } from 'firebase/firestore'
 import { useSession } from '../hooks/useSession'
+import { useItems } from '../hooks/useItems'
 import { toDateKey, toThaiDate, toThaiShort, toThaiTime } from '../utils/formatDate'
 import { COL } from '../constants/collections'
-import { parseConvFactor, balanceId } from '../utils/unit'
+import { parseConvFactor, balanceId, qtyToUse, useToQty } from '../utils/unit'
+import { saveOrShareFile } from '../utils/download'
+import { sortByMaster } from '../utils/sortItems'
+import { defaultWarehouseId } from '../utils/warehouses'
+import { fetchLotsForWarehouse, restoreLotFifo } from '../utils/lotFifo'
 
 /* ── helpers ──────────────────────────────────────────────────────────── */
 function calcWasteCostFromCM(wasteLog, items, cmCosts) {
@@ -94,23 +99,34 @@ function calcItemCost(it, items, cmCosts) {
   return q * (cm.costPerUse || 0)
 }
 
-function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestoreItem }) {
+const CUTLOG_LOCK_DAYS = 3   // เกิน N วัน → ล็อกแก้ไข (Owner/Admin ข้ามได้)
+
+function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestoreItem, canEditOld }) {
   const [open, setOpen] = useState(false)
 
-  // คำนวณต้นทุนรายชิ้น
-  const itemsWithCost = (log.items || []).map(it => {
+  // 🔒 ล็อกแก้ไข cut log เก่าเกิน 3 วัน (กันยกเลิกผิดย้อนหลัง) — Owner/Admin ข้ามได้
+  const daysSince = log.date
+    ? Math.floor((Date.now() - new Date(log.date + 'T00:00:00').getTime()) / 86400000)
+    : 0
+  const locked = daysSince > CUTLOG_LOCK_DAYS && !canEditOld
+
+  // คำนวณต้นทุนรายชิ้น — เก็บ _origIdx (ตำแหน่งใน log.items เดิม) ไว้ใช้ตอน cancel/restore
+  // ⚠️ สำคัญ: รายการแสดงผลถูกเรียงตาม Master Data → ห้ามใช้ index ของลิสต์ที่เรียงไปลบ log.items
+  const itemsWithCost = (log.items || []).map((it, idx) => {
     const invItem = items.find(i => i.id === it.itemId || i.name === it.itemName)
     return {
       ...it,
+      _origIdx: idx,
       qty:  it.qtyUse  ?? it.qty  ?? 0,
       unit: it.unitUse ?? it.unit ?? '',
       cost: it.costTotal > 0 ? it.costTotal : calcItemCost(it, items, cmCosts),
       displayLabel: invItem?.displayName || it.itemName,
     }
   })
-  const totalCost = log.totalCost > 0
+  // เชื่อ totalCost ที่บันทึก (exclude cancelled แล้ว · รวมกรณี =0) · ห้ามใช้ `> 0` (0 ที่ถูกต้องจะโดน recompute)
+  const totalCost = typeof log.totalCost === 'number'
     ? log.totalCost
-    : itemsWithCost.reduce((s, it) => s + it.cost, 0)
+    : itemsWithCost.filter(it => !it.cancelled).reduce((s, it) => s + it.cost, 0)
 
   return (
     <div style={{ background: '#fff', borderRadius: 10, marginBottom: 4, overflow: 'hidden',
@@ -140,13 +156,13 @@ function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestor
           transform: open ? 'rotate(180deg)' : 'rotate(0deg)', display: 'inline-block', flexShrink: 0 }}>▾</span>
       </div>
 
-      {/* Expanded: รายการ compact */}
+      {/* Expanded: รายการ compact — เรียงตาม Master Data (catOrder ไม่มีใน scope → fallback CAT_ORDER) */}
       {open && (
         <div style={{ padding: '4px 14px 10px 14px', borderTop: '1px solid #F0F4FF', background: '#FAFBFF' }}>
-          {itemsWithCost.map((it, i) => {
+          {sortByMaster(itemsWithCost, { items }).map((it, i) => {
             const isCancelled = it.cancelled
             return (
-              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4,
+              <div key={it._origIdx} style={{ display: 'flex', alignItems: 'center', gap: 4,
                 padding: '4px 0', borderBottom: i < itemsWithCost.length - 1 ? '1px solid #F0F0F0' : 'none',
                 opacity: isCancelled ? 0.45 : 1,
                 textDecoration: isCancelled ? 'line-through' : 'none' }}>
@@ -173,13 +189,13 @@ function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestor
                   )}
                 </span>
                 {/* per-item cancel */}
-                {!isCancelled && onCancelItem && (
-                  <button onClick={e => { e.stopPropagation(); onCancelItem(log, i, it) }}
+                {!isCancelled && onCancelItem && !locked && (
+                  <button onClick={e => { e.stopPropagation(); onCancelItem(log, it._origIdx, it) }}
                     title="ยกเลิกรายการนี้ + คืน stock"
                     style={{ width: 22, height: 22, borderRadius: 5, border: 'none',
                       background: '#FEE2E2', color: '#DC2626', cursor: 'pointer',
                       fontSize: 10, fontWeight: 700, marginLeft: 4, flexShrink: 0 }}>
-                    ✕
+                    ×
                   </button>
                 )}
                 {isCancelled && it.cancelReason && (
@@ -191,11 +207,17 @@ function CutLogCard({ log, seq, items, cmCosts, onCancel, onCancelItem, onRestor
             )
           })}
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
-            <button onClick={e => { e.stopPropagation(); onCancel(log) }}
-              style={{ border: 'none', background: '#FEF2F2', color: '#DC2626', borderRadius: 8,
-                padding: '4px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
-              ยกเลิก
-            </button>
+            {locked ? (
+              <span style={{ fontSize: 10.5, color: '#9CA3AF', fontWeight: 600 }}>
+                🔒 เกิน {CUTLOG_LOCK_DAYS} วัน — แก้ผ่าน "ปรับยอด"
+              </span>
+            ) : (
+              <button onClick={e => { e.stopPropagation(); onCancel(log) }}
+                style={{ border: 'none', background: '#FEF2F2', color: '#DC2626', borderRadius: 8,
+                  padding: '4px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                ยกเลิก
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -228,7 +250,7 @@ function CancelSheet({ entry, label, onClose, onConfirm }) {
         <div className="sheet-handle" />
         <div className="sheet-header">
           <span className="sheet-title">ยกเลิก{label}</span>
-          <button className="sheet-close" onClick={onClose}>✕</button>
+          <button className="sheet-close" onClick={onClose}>×</button>
         </div>
         <div className="sheet-body">
           <div style={{ background: '#FDF2F8', borderRadius: 10, padding: 12, marginBottom: 12, fontSize: 12 }}>
@@ -259,6 +281,10 @@ const ACTION_MAP = {
   receive:           { icon: '📥', label: 'รับสินค้า',      color: '#16A34A', bg: '#DCFCE7' },
   cancel:            { icon: '↩️', label: 'ยกเลิก',         color: '#DC2626', bg: '#FEE2E2' },
   cancel_waste:      { icon: '↩️', label: 'ยกเลิกของเสีย',  color: '#DC2626', bg: '#FEE2E2' },
+  cancel_cut:        { icon: '↩️', label: 'ยกเลิกตัดสต็อก (ทั้งใบ)', color: '#DC2626', bg: '#FEE2E2' },
+  cancel_cut_item:   { icon: '↩️', label: 'ยกเลิกตัดสต็อก (รายการ)', color: '#DC2626', bg: '#FEE2E2' },
+  restore_cut_item:  { icon: '↪️', label: 'คืนสต็อก (manual)', color: '#16A34A', bg: '#DCFCE7' },
+  cancel_transfer:   { icon: '↩️', label: 'ยกเลิกใบโอน',    color: '#DC2626', bg: '#FEE2E2' },
   delete_log:        { icon: '🗑️', label: 'ลบ Log',         color: '#DC2626', bg: '#FEE2E2' },
   cut_stock:         { icon: '✂️', label: 'ตัดสต็อก',       color: '#DB2777', bg: '#FDF2F8' },
   waste:             { icon: '🗑️', label: 'ของเสีย',        color: '#D97706', bg: '#FFF7ED' },
@@ -270,9 +296,17 @@ const ACTION_MAP = {
   default:           { icon: '📝', label: 'บันทึก',          color: '#6B7280', bg: '#F3F4F6' },
 }
 
-function LogRow({ l }) {
+function whLabel(warehouses, id) {
+  if (!id) return ''
+  const w = warehouses.find(w => w.id === id)
+  return w?.name || id
+}
+
+function LogRow({ l, warehouses = [] }) {
   const [open, setOpen] = useState(false)
   const meta = ACTION_MAP[l.action] || ACTION_MAP.default
+  const d = l.timestamp?.toDate ? l.timestamp.toDate() : (l.timestamp ? new Date(l.timestamp) : null)
+  const fullTimeStr = d ? `${toThaiDate(d)} · ${toThaiTime(l.timestamp)} น.` : '-'
   return (
     <div style={{ borderTop: '1px solid #F3F4F6' }}>
       <div onClick={() => setOpen(o => !o)}
@@ -307,12 +341,16 @@ function LogRow({ l }) {
         <div style={{ background: '#F9FAFB', padding: '10px 14px 12px 54px',
           borderTop: '1px solid #F3F4F6', display: 'flex', flexDirection: 'column', gap: 4 }}>
           <div style={{ fontSize: 11 }}>
+            <span style={{ color: '#9CA3AF', fontWeight: 700 }}>เวลา: </span>
+            <span style={{ color: '#374151' }}>{fullTimeStr}</span>
+          </div>
+          <div style={{ fontSize: 11 }}>
             <span style={{ color: '#9CA3AF', fontWeight: 700 }}>บันทึกโดย: </span>
             <span style={{ color: '#374151' }}>{l.staffName || '-'}</span>
           </div>
           <div style={{ fontSize: 11 }}>
-            <span style={{ color: '#9CA3AF', fontWeight: 700 }}>Action: </span>
-            <span style={{ color: '#374151' }}>{l.action}</span>
+            <span style={{ color: '#9CA3AF', fontWeight: 700 }}>งาน: </span>
+            <span style={{ color: '#374151' }}>{meta.label}</span>
           </div>
           <div style={{ fontSize: 11 }}>
             <span style={{ color: '#9CA3AF', fontWeight: 700 }}>รายละเอียด: </span>
@@ -321,7 +359,15 @@ function LogRow({ l }) {
           {l.warehouseId && (
             <div style={{ fontSize: 11 }}>
               <span style={{ color: '#9CA3AF', fontWeight: 700 }}>คลัง: </span>
-              <span style={{ color: '#374151' }}>{l.warehouseId}</span>
+              <span style={{ color: '#374151' }}>{whLabel(warehouses, l.warehouseId)}</span>
+            </div>
+          )}
+          {!l.warehouseId && (l.fromWarehouseId || l.toWarehouseId) && (
+            <div style={{ fontSize: 11 }}>
+              <span style={{ color: '#9CA3AF', fontWeight: 700 }}>คลัง: </span>
+              <span style={{ color: '#374151' }}>
+                {whLabel(warehouses, l.fromWarehouseId) || '-'} → {whLabel(warehouses, l.toWarehouseId) || '-'}
+              </span>
             </div>
           )}
           {l.cancelled && (
@@ -395,14 +441,17 @@ function TransferDetailModal({ tf, onClose, items = [], catOrder = [] }) {
           padding: '14px 16px', borderBottom: '1px solid #F3F4F6',
           background: '#fff', position: 'sticky', top: 0, zIndex: 2, flexShrink: 0 }}>
           <span style={{ fontSize: 18 }}>🚚</span>
-          <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, flex: 1 }}>
+          <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, flex: 1, minWidth: 0 }}>
             ใบโอน {tf.tfRef || `#${tf.id?.slice(-6) || tf.id}`}
+            {tf.hadShortage && (
+              <span style={{ color: '#DC2626', fontWeight: 800, fontSize: 12.5, marginLeft: 6 }}>(รับบางส่วน)</span>
+            )}
           </span>
           <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 6, padding: '2px 8px',
             background: st.bg, color: st.color }}>{st.label}</span>
           <button onClick={onClose} aria-label="ปิด" className="popup-x-btn"
             onAnimationEnd={() => setXBounce(false)}
-            style={{ marginLeft: 4, animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>✕</button>
+            style={{ marginLeft: 4, animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
         </div>
         {/* scrollable body */}
         <div style={{ padding: 16, overflow: 'auto', flex: 1 }}>
@@ -454,6 +503,175 @@ function TransferDetailModal({ tf, onClose, items = [], catOrder = [] }) {
         <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
           📋 รายการ ({tf.items?.length || 0})
         </div>
+        {tf.hadShortage && (
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#D97706', background: '#FFFBEB',
+            border: '1px solid #FDE68A', borderRadius: 9, padding: '6px 10px', marginBottom: 8 }}>
+            ⚠️ รับไม่ครบ — แสดงยอดรับจริง · ส่วนที่ขาดสร้างใบแจ้งเติมไว้แล้ว
+          </div>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {cats.map(catName => (
+            <div key={catName} style={{ background: '#FAFBFF', borderRadius: 12,
+              border: '1px solid #F0F4FF', overflow: 'hidden' }}>
+              <div style={{ padding: '6px 12px', background: '#EFF2FF',
+                fontSize: 11, fontWeight: 700, color: '#4338CA',
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>🏷️ {catName}</span>
+                <span style={{ background: '#fff', borderRadius: 8, padding: '1px 8px',
+                  color: '#4338CA', fontSize: 10 }}>{groups[catName].length}</span>
+              </div>
+              <div style={{ padding: '4px 12px 8px' }}>
+                {groups[catName].map((it, i) => {
+                  const isRecv  = tf.status === 'received' && it.receivedQty != null
+                  const planned = parseFloat(it.qty) || 0
+                  const got     = Number(it.receivedQty) || 0
+                  const short   = isRecv && got < planned
+                  return (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between',
+                    gap: 8, padding: '5px 0',
+                    borderBottom: i < groups[catName].length - 1 ? '1px solid #EEF2FF' : 'none' }}>
+                    <span style={{ fontSize: 12, color: short ? '#DC2626' : '#374151', fontWeight: short ? 700 : 400,
+                      flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {it._img} {it._displayName}
+                    </span>
+                    {isRecv ? (
+                      <span style={{ fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
+                        {short && <span style={{ color: '#9CA3AF', textDecoration: 'line-through', fontWeight: 600, marginRight: 5 }}>{planned}</span>}
+                        <span style={{ color: short ? '#DC2626' : '#16A34A' }}>{got} {it.unit}</span>
+                        {short && ' ⚠️'}
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: 12, fontWeight: 700, color: '#1C1C1E', flexShrink: 0 }}>
+                        {it.qty} {it.unit}
+                      </span>
+                    )}
+                  </div>
+                  )
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ── PODetailModal — รายละเอียดใบสั่งซื้อ / รับสินค้า (คลังกลาง) ── */
+function PODetailModal({ po, onClose, items = [], catOrder = [] }) {
+  const [xBounce, setXBounce] = useState(false)
+  function bounceX(e) {
+    if (e) { e.stopPropagation(); e.preventDefault() }
+    setXBounce(false)
+    requestAnimationFrame(() => requestAnimationFrame(() => setXBounce(true)))
+  }
+  if (!po) return null
+  const itemMap = {}
+  items.forEach(it => { itemMap[it.id] = it })
+  const enriched = (po.items || []).map(it => {
+    const m = itemMap[it.itemId] || {}
+    const orderedUse = qtyToUse(it.qty, it.unit, m)
+    const recvUse = Number(it.fulfilledQtyUse) || 0
+    const recvInUnit = useToQty(recvUse, it.unit, m)
+    return {
+      ...it,
+      _cat:  m.category || 'อื่นๆ',
+      _sort: typeof m.sortOrder === 'number' ? m.sortOrder : 9999,
+      _img:  m.img || it.img || '📦',
+      _displayName: m.displayName || it.itemName,
+      _recvInUnit: Number(recvInUnit.toFixed(2)),
+      _full: recvUse + 1e-6 >= orderedUse,
+    }
+  })
+  const groups = {}
+  enriched.forEach(it => { (groups[it._cat] = groups[it._cat] || []).push(it) })
+  Object.values(groups).forEach(arr => arr.sort((a, b) => a._sort - b._sort))
+  const orderIdx = {}
+  catOrder.forEach((name, i) => { orderIdx[name] = i })
+  const cats = Object.keys(groups).sort((a, b) => {
+    const ia = orderIdx[a] != null ? orderIdx[a] : 9999
+    const ib = orderIdx[b] != null ? orderIdx[b] : 9999
+    if (ia !== ib) return ia - ib
+    return a.localeCompare(b, 'th')
+  })
+  const stMap = {
+    received: { label: '✅ รับครบแล้ว', color: '#16A34A', bg: '#DCFCE7' },
+    partial:  { label: '🟠 รับบางส่วน', color: '#EA580C', bg: '#FFEDD5' },
+    ordered:  { label: '🛒 ระหว่างขนส่ง', color: '#0284C7', bg: '#E0F2FE' },
+    cancelled:{ label: '❌ ยกเลิก',      color: '#DC2626', bg: '#FEE2E2' },
+  }
+  const st = stMap[po.status] || stMap.ordered
+  return (
+    <div onClick={bounceX} onTouchStart={bounceX} onPointerDown={bounceX}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 9999,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '16px 16px calc(86px + env(safe-area-inset-bottom)) 16px' }}>
+      <div onClick={e => e.stopPropagation()}
+        onTouchStart={e => e.stopPropagation()} onPointerDown={e => e.stopPropagation()}
+        style={{ background: '#fff', borderRadius: 22, width: '100%', maxWidth: 460,
+          maxHeight: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column',
+          border: '1.5px solid rgba(227,30,36,.35)',
+          boxShadow: '0 12px 40px rgba(0,0,0,.22), 0 0 0 4px rgba(227,30,36,.06)' }}>
+        {/* sticky header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8,
+          padding: '14px 16px', borderBottom: '1px solid #F3F4F6',
+          background: '#fff', position: 'sticky', top: 0, zIndex: 2, flexShrink: 0 }}>
+          <span style={{ fontSize: 18 }}>🛒</span>
+          <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 15, flex: 1 }}>
+            {po.poRef || `#${po.id?.slice(-6) || po.id}`}
+          </span>
+          <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 6, padding: '2px 8px',
+            background: st.bg, color: st.color }}>{st.label}</span>
+          <button onClick={onClose} aria-label="ปิด" className="popup-x-btn"
+            onAnimationEnd={() => setXBounce(false)}
+            style={{ marginLeft: 4, animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
+        </div>
+        {/* scrollable body */}
+        <div style={{ padding: 16, overflow: 'auto', flex: 1 }}>
+
+        {/* Supplier → คลังกลาง */}
+        <div style={{ background: '#F9FAFB', borderRadius: 12, padding: '10px 12px',
+          marginBottom: 10, fontSize: 12, color: '#374151', fontWeight: 600 }}>
+          🏭 {po.supplier || '-'} <span style={{ color: '#9CA3AF' }}>→</span> คลังกลาง
+          {po.shipper && <div style={{ fontSize: 11, color: '#6B7280', fontWeight: 500, marginTop: 3 }}>🚚 ขนส่ง: {po.shipper}</div>}
+        </div>
+
+        {/* timeline */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+            <span style={{ fontSize: 14 }}>🛒</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: '#9CA3AF' }}>สั่งโดย</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{po.orderedBy || po.createdBy || '-'}</div>
+              <div style={{ fontSize: 11, color: '#6B7280' }}>
+                📅 สั่ง {po.orderDate || '-'}{po.expectedDate ? ` · คาดถึง ${po.expectedDate}` : ''}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+            <span style={{ fontSize: 14 }}>📥</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: '#9CA3AF' }}>ผู้รับเข้าคลัง</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>
+                {po.receivedBy || (po.status === 'received' ? '-' : '— ยังไม่ได้รับ')}
+              </div>
+              {po.receivedAt && (
+                <div style={{ fontSize: 11, color: '#6B7280' }}>
+                  🕐 {toThaiDate(po.receivedAt?.toDate ? po.receivedAt.toDate() : po.receivedAt)} {toThaiTime(po.receivedAt)}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* items list — grouped by category */}
+        <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
+          📋 รายการ ({po.items?.length || 0})
+          <span style={{ fontWeight: 600, fontSize: 12, color: '#6B7280' }}>
+            {' : '}{Number((po.items || []).reduce((s, it) => s + (parseFloat(it.qty) || 0), 0).toFixed(2))} หน่วย
+          </span>
+        </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {cats.map(catName => (
             <div key={catName} style={{ background: '#FAFBFF', borderRadius: 12,
@@ -468,14 +686,17 @@ function TransferDetailModal({ tf, onClose, items = [], catOrder = [] }) {
               <div style={{ padding: '4px 12px 8px' }}>
                 {groups[catName].map((it, i) => (
                   <div key={i} style={{ display: 'flex', justifyContent: 'space-between',
-                    gap: 8, padding: '5px 0',
+                    gap: 8, padding: '5px 0', alignItems: 'center',
                     borderBottom: i < groups[catName].length - 1 ? '1px solid #EEF2FF' : 'none' }}>
                     <span style={{ fontSize: 12, color: '#374151', flex: 1, minWidth: 0,
                       whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {it._img} {it._displayName}
                     </span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: '#1C1C1E', flexShrink: 0 }}>
-                      {it.qty} {it.unit}
+                    <span style={{ fontSize: 11, fontWeight: 700, flexShrink: 0,
+                      color: it._full ? '#16A34A' : it._recvInUnit > 0 ? '#EA580C' : '#9CA3AF' }}>
+                      {po.status === 'ordered'
+                        ? `สั่ง ${it.qty} ${it.unit}`
+                        : `${it._recvInUnit}/${it.qty} ${it.unit}${it._full ? ' ✓' : ''}`}
                     </span>
                   </div>
                 ))}
@@ -537,7 +758,7 @@ function CutSummaryPopup({ cutLogs = [], items = [], catOrder = [], onClose }) {
 
   // Cat emoji fallback
   const CAT_EMOJI = { 'แยม':'🍓','ผลไม้':'🍋','ไซรัป':'🍯','ท็อปปิ้ง':'💎',
-    'วัตถุดิบ':'🥛','บรรจุภัณฑ์':'🥤','อื่นๆ':'🔖' }
+    'วัตถุดิบ':'🥛','ขนม':'🍪','บรรจุภัณฑ์':'🥤','อื่นๆ':'🔖' }
 
   return (
     <div onClick={bounceX} onTouchStart={bounceX} onPointerDown={bounceX}
@@ -565,7 +786,7 @@ function CutSummaryPopup({ cutLogs = [], items = [], catOrder = [], onClose }) {
           </div>
           <button onClick={onClose} aria-label="ปิด" className="popup-x-btn"
             onAnimationEnd={() => setXBounce(false)}
-            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>✕</button>
+            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
         </div>
         {/* Body */}
         <div style={{ overflow: 'auto', flex: 1, padding: 12 }}>
@@ -653,7 +874,7 @@ function EventDetailPopup({ detail, items = [], catOrder = [], onClose }) {
           </div>
           <button onClick={onClose} aria-label="ปิด" className="popup-x-btn"
             onAnimationEnd={() => setXBounce(false)}
-            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>✕</button>
+            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
         </div>
 
         {/* Body */}
@@ -780,9 +1001,7 @@ function EventDetailPopup({ detail, items = [], catOrder = [], onClose }) {
                               )}
                               {rf.status === 'partial' && (() => {
                                 const m = it._master || {}
-                                const factor = parseConvFactor(m.unitConversion) || 1
-                                const isBase = it.unit && m.unitBase && it.unit === m.unitBase
-                                const reqUse = isBase ? (parseFloat(it.qty)||0)*factor : (parseFloat(it.qty)||0)
+                                const reqUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, m)
                                 const remain = Math.max(0, reqUse - (Number(it.fulfilledQtyUse)||0))
                                 return remain < 1e-6
                                   ? <span style={{ fontSize: 10, fontWeight: 700, color: '#16A34A', marginLeft: 5 }}>✓ ครบ</span>
@@ -824,21 +1043,22 @@ function DetailRow({ label, value, multiline, valColor, valBg }) {
 /* ══════════════════════════════════════════════════════════════════════
    DailyTab — 7 กลุ่มข้อมูล
    ══════════════════════════════════════════════════════════════════════ */
-function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, auditLogs,
+function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, dailyPOs = [], transfers, auditLogs,
                     items, catOrder = [], cmCosts, openCancel, cancelCutLog, cancelCutLogItem, restoreCutLogItem,
-                    cancelWasteLog, cancelAuditEntry, cancelTransfer, dailyRFs }) {
+                    cancelWasteLog, cancelAuditEntry, cancelTransfer, dailyRFs, canEditOld, warehouses = [] }) {
 
   /* KPI values */
   const activeCut   = cutLogs.filter(l => !l.cancelled && !l.deletedAt)
   const activeWaste = [...fruitWaste, ...closingWaste].filter(l => !l.cancelled)
   const totalCutCost = activeCut.reduce((s, l) => {
-    if (l.totalCost > 0) return s + l.totalCost
-    const sum = (l.items || []).reduce((ss, it) => ss + calcItemCost(it, items, cmCosts), 0)
+    // เชื่อ totalCost ที่บันทึก (exclude cancelled แล้ว · รวมกรณี =0) · ห้ามใช้ `> 0`
+    if (typeof l.totalCost === 'number') return s + l.totalCost
+    const sum = (l.items || []).filter(it => !it.cancelled).reduce((ss, it) => ss + calcItemCost(it, items, cmCosts), 0)
     return s + sum
   }, 0)
   const totalWasteCost = activeWaste.reduce((s, l) => s + calcWasteCostFromCM(l, items, cmCosts), 0)
-  const pendingTf = transfers.filter(t => t.status === 'in_transit')
   const [tfDetail, setTfDetail] = useState(null)
+  const [poDetail, setPoDetail] = useState(null)
   const [detail, setDetail] = useState(null)   // {type, data} สำหรับ Refill / Receive / Waste
   const [cutSumOpen, setCutSumOpen] = useState(false)   // popup สรุปตัดสต็อกของวันที่เลือก
 
@@ -872,7 +1092,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
           border: '1px solid #F3F4F6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}>
           <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>📦 ใบโอนสินค้า</div>
           <div style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 20, color: '#0369A1' }}>
-            {pendingTf.length}
+            {transfers.filter(t => t.status !== 'cancelled').length}
           </div>
         </div>
       </div>
@@ -891,7 +1111,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
         {activeCut.length === 0 && cutLogs.filter(l => l.cancelled || l.deletedAt).length === 0
           ? <EmptyState msg="ยังไม่มีการตัดสต็อก" />
           : [...activeCut].sort((a,b) => (b.timestamp?.seconds||0) - (a.timestamp?.seconds||0)).map((log, i, arr) => (
-            <CutLogCard key={log.id} log={log} seq={arr.length - i} items={items} cmCosts={cmCosts}
+            <CutLogCard key={log.id} log={log} seq={arr.length - i} items={items} cmCosts={cmCosts} canEditOld={canEditOld}
               onCancel={log => openCancel({ ...log,
                 _desc: `ตัดสต็อก ${log.items?.length || 0} รายการ`,
                 _staff: log.staffName }, 'ตัดสต็อก', cancelCutLog)}
@@ -985,35 +1205,47 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
         ))}
       </DataSection>
 
-      {/* ═══ Group 4: 📥 รับสินค้า ═══ */}
-      <DataSection icon="📥" label="รับสินค้า" count={receiveLogs.filter(l => !l.cancelled).length}>
-        {receiveLogs.length === 0
-          ? <EmptyState msg="ไม่มีการรับสินค้าวันนี้" />
-          : receiveLogs.filter(l => !l.cancelled).map(l => (
-            <div key={l.id} onClick={() => setDetail({ type: 'receive', data: l })}
-              style={{ background: '#fff', borderRadius: 12, border: '1px solid #F3F4F6',
-                padding: '11px 14px', marginBottom: 8, cursor: 'pointer',
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 700 }}>
-                  {l.detail?.replace('รับ ', '') || l.itemName || '-'}
+      {/* ═══ Group 4: 🛒 สั่งซื้อ / รับสินค้า (คลังกลาง) ═══ */}
+      <DataSection icon="🛒" label="สั่งซื้อ / รับสินค้า" count={dailyPOs.length}>
+        {dailyPOs.length === 0
+          ? <EmptyState msg="ไม่มีรายการสั่งซื้อ/รับของวันนี้" />
+          : dailyPOs.map(({ po, receivedToday, partialToday }) => {
+            // สถานะที่จะแสดง: รับครบ > รับบางส่วน > สั่งซื้อ(ระหว่างขนส่ง)
+            const badge = (receivedToday && po.status === 'received')
+              ? { t: '✅ รับครบแล้ว', c: '#16A34A', bg: '#DCFCE7' }
+              : (partialToday || po.status === 'partial')
+              ? { t: '🟠 รับบางส่วน', c: '#EA580C', bg: '#FFEDD5' }
+              : { t: '🛒 สั่งซื้อ · ระหว่างขนส่ง', c: '#0284C7', bg: '#E0F2FE' }
+            const its = po.items || []
+            const recvCount = its.filter(it => Number(it.fulfilledQtyUse) > 0).length
+            const when = receivedToday ? po.receivedAt : partialToday ? po.partialAt : po.createdAt
+            return (
+              <div key={po.id} onClick={() => setPoDetail(po)}
+                style={{ background: '#fff', borderRadius: 12, border: '1px solid #F3F4F6',
+                  padding: '11px 14px', marginBottom: 8, cursor: 'pointer' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 13 }}>{po.poRef || `#${po.id?.slice(-6)}`}</span>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, borderRadius: 20, padding: '3px 9px',
+                    color: badge.c, background: badge.bg }}>{badge.t}</span>
                 </div>
-                <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>
-                  {toThaiTime(l.timestamp)} · {l.staffName}
+                <div style={{ fontSize: 11.5, color: '#6B7280' }}>
+                  🏭 {po.supplier || '-'} → คลังกลาง{po.shipper ? ` · 🚚 ${po.shipper}` : ''}
+                </div>
+                <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 3 }}>
+                  📦 {its.length} รายการ{(receivedToday || partialToday) ? ` · รับแล้ว ${recvCount}/${its.length}` : ''}
+                  {when ? ` · ${toThaiTime(when)}` : ''}
+                  {(po.receivedBy && (receivedToday || partialToday)) ? ` · ${po.receivedBy}` : ''}
                 </div>
               </div>
-              <div onClick={e => e.stopPropagation()}>
-                <CancelBtn onClick={() => openCancel({ ...l,
-                  _desc: l.detail || 'รับสินค้า',
-                  _staff: l.staffName }, 'รับสินค้า', cancelAuditEntry)} />
-              </div>
-            </div>
-          ))
+            )
+          })
         }
-        {receiveLogs.filter(l => l.cancelled).map(l => (
-          <CancelledRow key={l.id} text={l.detail} reason={l.cancelReason} />
-        ))}
       </DataSection>
+
+      {/* PO Detail popup */}
+      {poDetail && (
+        <PODetailModal po={poDetail} items={items} catOrder={catOrder} onClose={() => setPoDetail(null)} />
+      )}
 
       {/* ═══ Group 5: 🚚 โอนสินค้า (เฉพาะวันที่เลือก) ═══ */}
       <DataSection icon="🚚" label="โอนสินค้า" count={transfers.filter(t => t.status !== 'cancelled').length}>
@@ -1109,7 +1341,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
                     </div>
                     {/* รายการสั้นๆ */}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                      {(rf.items || []).slice(0, 3).map((it, i) => (
+                      {sortByMaster(rf.items, { items, catOrder }).slice(0, 3).map((it, i) => (
                         <span key={i} style={{ fontSize: 10, background: '#F3F4F6',
                           borderRadius: 5, padding: '2px 6px', color: '#374151' }}>
                           {it.img} {it.itemName}{it.qty > 0 ? ` ×${it.qty}${it.unit ? ` ${it.unit}` : ''}` : ''}
@@ -1145,7 +1377,7 @@ function DailyTab({ cutLogs, fruitWaste, closingWaste, receiveLogs, transfers, a
         <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #F3F4F6', overflow: 'hidden' }}>
           {auditLogs.length === 0
             ? <EmptyState msg="ไม่มี log วันนี้" />
-            : auditLogs.map(l => <LogRow key={l.id} l={l} />)
+            : auditLogs.map(l => <LogRow key={l.id} l={l} warehouses={warehouses} />)
           }
         </div>
       </DataSection>
@@ -1279,7 +1511,7 @@ function dayAbbr(dateKey) {
 }
 
 /* ── AnalyzeTab (รวม Weekly + Analyze) ───────────────────────────────── */
-function AnalyzeTab() {
+function AnalyzeTab({ wh, warehouses }) {
   const [period, setPeriod] = useState('thisWeek')
   const [custom, setCustom] = useState({ start: '', end: '' })
   const [hoverIdx, setHoverIdx] = useState(null)
@@ -1287,12 +1519,7 @@ function AnalyzeTab() {
   const [cutLogs, setCutLogs] = useState([])
   const [wasteLogs, setWasteLogs] = useState([])
   const [incomeRecords, setIncomeRecords] = useState([])
-  const [analyzeItems, setAnalyzeItems] = useState([])  // master data → displayName lookup
-
-  useEffect(() => {
-    return onSnapshot(collection(db, COL.ITEMS),
-      snap => setAnalyzeItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
-  }, [])
+  const analyzeItems = useItems()  // master data → displayName lookup (shared singleton)
 
   const PILLS = [
     { id: 'thisWeek',  label: 'สัปดาห์นี้' },
@@ -1316,23 +1543,35 @@ function AnalyzeTab() {
   }, [start, end])
 
   useEffect(() => {
-    // Daily Income เก็บ doc id = YYYY-MM-DD, total = morning.total + afternoon.total
+    // Daily Income: format ใหม่ doc id = `YYYY-MM-DD_<branch_id>` (มี field branch_id) · format เก่า = `YYYY-MM-DD`
+    // ใช้ end + '' เพื่อให้ครอบ doc วันสุดท้ายที่มี suffix _branch ด้วย (ไม่งั้นตกหล่น)
     const q = query(collection(db, COL.INCOME_RECORDS),
-      where(documentId(), '>=', start), where(documentId(), '<=', end))
+      where(documentId(), '>=', start), where(documentId(), '<=', end + ''))
     return onSnapshot(q, snap => setIncomeRecords(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
   }, [start, end])
 
   // Helper: total ของวันนึง = morning.total + afternoon.total
   const recTotal = r => (r?.morning?.total || 0) + (r?.afternoon?.total || 0)
+  // วันที่ของ record (field date · fallback แยกจาก doc id format ใหม่ `date_branch`)
+  const recDate  = r => r?.date || (r?.id || '').split('_')[0]
+  // สาขาของ record — doc เก่า (ไม่มี branch_id) = ยุคสาขาเดียว → map เป็นสาขาเริ่มต้น (509)
+  const legacyBranch = defaultWarehouseId(warehouses)
+  const recBranch = r => r?.branch_id || legacyBranch
 
   const activeCut   = cutLogs.filter(l => !l.cancelled && !l.deletedAt)
   const activeWaste = wasteLogs.filter(l => !l.cancelled)
-  const totalCutCost   = activeCut.reduce((s,l) => s+(l.totalCost||0), 0)
-  const totalWasteCost = activeWaste.reduce((s,l) => s+(l.totalCost||0), 0)
-  const totalRevenue   = incomeRecords.reduce((s,r) => s+recTotal(r), 0)
+  // ── 🏪 กรองตามสาขาที่เลือก (client-side · '' หรือ 'all' = ทุกสาขา) ──
+  const whAll  = !wh || wh === 'all'
+  const fCut    = whAll ? activeCut    : activeCut.filter(l => l.warehouseId === wh)
+  const fWaste  = whAll ? activeWaste  : activeWaste.filter(l => l.warehouseId === wh)
+  const fIncome = whAll ? incomeRecords : incomeRecords.filter(r => recBranch(r) === wh)
+  const totalCutCost   = fCut.reduce((s,l) => s+(l.totalCost||0), 0)
+  const totalWasteCost = fWaste.reduce((s,l) => s+(l.totalCost||0), 0)
+  // รายได้ (Daily Income) แยกสาขาแล้ว → ใช้ fIncome ตามสาขาที่เลือก
+  const totalRevenue   = fIncome.reduce((s,r) => s+recTotal(r), 0)
   const grossProfit    = totalRevenue - totalCutCost
   const foodCostPct    = totalRevenue > 0 ? (totalCutCost / totalRevenue * 100) : 0
-  const cutCount       = activeCut.length
+  const cutCount       = fCut.length
   const costPerCut     = cutCount > 0 ? totalCutCost / cutCount : 0
   // Effective Use % = (cut − waste) / cut × 100
   const effectivePct   = totalCutCost > 0
@@ -1348,8 +1587,8 @@ function AnalyzeTab() {
   // Daily aggregation
   const dayCostMap = {}, dayRevMap = {}
   allDayKeys.forEach(k => { dayCostMap[k] = 0; dayRevMap[k] = 0 })
-  activeCut.forEach(l => { if (dayCostMap[l.date] != null) dayCostMap[l.date] += (l.totalCost||0) })
-  incomeRecords.forEach(r => { if (dayRevMap[r.id] != null) dayRevMap[r.id] += recTotal(r) })
+  fCut.forEach(l => { if (dayCostMap[l.date] != null) dayCostMap[l.date] += (l.totalCost||0) })
+  fIncome.forEach(r => { const dk = recDate(r); if (dayRevMap[dk] != null) dayRevMap[dk] += recTotal(r) })
 
   // Build bar buckets — รายวันหรือรายสัปดาห์
   function buildBuckets() {
@@ -1394,8 +1633,9 @@ function AnalyzeTab() {
   analyzeItems.forEach(i => { itemLookup[i.id] = i })
   const itemMap = {}
   const itemCostMap = {}
-  activeCut.forEach(l => {
+  fCut.forEach(l => {
     (l.items||[]).forEach(it => {
+      if (it.cancelled) return   // ข้าม item ที่ยกเลิกราย-line (กันนับ qty/cost เกิน)
       const master = itemLookup[it.itemId] || {}
       const displayName = master.displayName || it.itemName
       const key = it.itemId || it.itemName  // group by itemId เพื่อนับรวมต่อให้ชื่อต่าง
@@ -1493,7 +1733,7 @@ function AnalyzeTab() {
       {/* Mini KPI — ครั้งตัด, ของเสีย, Effective Use %, ต้นทุน/ครั้ง */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
         {[
-          { label: '✂️ ครั้งตัดสต็อก', value: activeCut.length, color: '#1C1C1E' },
+          { label: '✂️ ครั้งตัดสต็อก', value: fCut.length, color: '#1C1C1E' },
           { label: '🗑️ ของเสียรวม', value: thb(totalWasteCost), color: '#D97706' },
           { label: '✨ Effective Use %',
             value: `${effectivePct.toFixed(1)}%`,
@@ -1713,7 +1953,7 @@ function AnalyzeTab() {
 }
 
 /* ── WasteAnalysisTab ──────────────────────────────────────────────────── */
-function WasteAnalysisTab() {
+function WasteAnalysisTab({ wh, warehouses }) {
   const [period, setPeriod] = useState('7days')
   const [selectedDay, setSelectedDay] = useState(null)   // null = ทั้งช่วง · 'YYYY-MM-DD' = เจาะวันเดียว
   const [wasteLogs, setWasteLogs] = useState([])
@@ -1777,19 +2017,30 @@ function WasteAnalysisTab() {
   }, [start, end])
 
   useEffect(() => {
+    // Daily Income แยกสาขาแล้ว (doc id ใหม่ = `date_branch_id`) · end + '' ครอบ doc วันสุดท้ายที่มี suffix
     const q = query(collection(db, COL.INCOME_RECORDS),
-      where(documentId(), '>=', start), where(documentId(), '<=', end))
+      where(documentId(), '>=', start), where(documentId(), '<=', end + ''))
     return onSnapshot(q, snap => {
+      const whAll = !wh || wh === 'all'
+      const lb = defaultWarehouseId(warehouses)   // doc เก่าไม่มี branch_id → สาขาเริ่มต้น (509)
       const tot = snap.docs.reduce((s,d) => {
         const r = d.data() || {}
+        const br = r.branch_id || lb
+        if (!whAll && br !== wh) return s
         return s + (r.morning?.total || 0) + (r.afternoon?.total || 0)
       }, 0)
       setRevenue(tot)
     })
-  }, [start, end])
+  }, [start, end, wh, warehouses])
 
-  const active = wasteLogs.filter(l => !l.cancelled)
-  const activeCut = cutLogs.filter(l => !l.cancelled && !l.deletedAt)
+  // ── 🏪 กรองตามสาขาที่เลือก (client-side · '' หรือ 'all' = ทุกสาขา) ──
+  const whAll = !wh || wh === 'all'
+  const active = whAll
+    ? wasteLogs.filter(l => !l.cancelled)
+    : wasteLogs.filter(l => !l.cancelled && l.warehouseId === wh)
+  const activeCut = whAll
+    ? cutLogs.filter(l => !l.cancelled && !l.deletedAt)
+    : cutLogs.filter(l => !l.cancelled && !l.deletedAt && l.warehouseId === wh)
   const totalCutCost   = activeCut.reduce((s,l) => s+(l.totalCost||0), 0)
   const totalWasteCost = active.reduce((s,l) => s+(l.totalCost||0), 0)
   const wastePct = revenue > 0 ? (totalWasteCost / revenue * 100) : 0
@@ -2014,7 +2265,7 @@ function WasteAnalysisTab() {
 /* ══════════════════════════════════════════════════════════════════════
    Main Report component
    ══════════════════════════════════════════════════════════════════════ */
-export default function Report() {
+export default function Report({ wh, setWh, warehouses }) {
   const { isOwner } = useSession()
   const [subTab, setSubTab] = useState('daily')
   const [date, setDate] = useState(toDateKey())
@@ -2026,7 +2277,8 @@ export default function Report() {
   const [transfers,     setTransfers]     = useState([])
   const [refillReqs,    setRefillReqs]    = useState([])
   const [auditLogs,     setAuditLogs]     = useState([])
-  const [reportItems,   setReportItems]   = useState([])
+  const reportItems = useItems()   // shared singleton — ลด Inv_items reads
+  const [purchaseOrders, setPurchaseOrders] = useState([])
   const [catOrder,      setCatOrder]      = useState([])
   const [cmCosts,       setCmCosts]       = useState({})
   const [loadingDate,   setLoadingDate]   = useState(false)
@@ -2059,16 +2311,29 @@ export default function Report() {
   // Refill Requests — ดึงทุก status เพื่อแสดงใน daily log ตามวันที่แจ้ง
   useEffect(() => {
     const q = query(collection(db, COL.REFILL_REQUESTS),
-      where('status', 'in', ['pending', 'processing', 'done', 'cancelled']))
+      where('status', 'in', ['pending', 'processing', 'partial', 'done', 'cancelled']))
     return onSnapshot(q, snap => {
       setRefillReqs(snap.docs.map(d => ({ id: d.id, ...d.data() })))
     }, err => console.error('RF report:', err))
   }, [])
 
   useEffect(() => {
-    const q = query(collection(db, COL.AUDIT_LOGS), orderBy('timestamp', 'desc'))
-    return onSnapshot(q, snap => setAuditLogs(snap.docs.slice(0, 150).map(d => ({ id: d.id, ...d.data() }))))
+    // Log รายวัน — query เฉพาะวันที่เลือก (เดิม full scan แล้ว slice ฝั่ง client → เปลือง read)
+    // timestamp range = single-field → ไม่ต้องสร้าง composite index
+    const s = Timestamp.fromDate(new Date(date + 'T00:00:00'))
+    const e = Timestamp.fromDate(new Date(date + 'T23:59:59.999'))
+    const q = query(collection(db, COL.AUDIT_LOGS),
+      where('timestamp', '>=', s), where('timestamp', '<=', e),
+      orderBy('timestamp', 'desc'), limit(200))
+    return onSnapshot(q, snap => setAuditLogs(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
+  }, [date])
+
+  // 🛒 Purchase Orders — ทุกสถานะ (แสดงตามวันที่สั่ง/รับ)
+  useEffect(() => {
+    return onSnapshot(collection(db, COL.PURCHASE_ORDERS),
+      snap => setPurchaseOrders(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
   }, [])
+
 
   useEffect(() => {
     const unsubCat = onSnapshot(doc(db, COL.APP_SETTINGS, 'categories'), snap => {
@@ -2076,8 +2341,6 @@ export default function Report() {
         setCatOrder(snap.data().list.map(c => c.name))
       }
     })
-    const unsub = onSnapshot(collection(db, COL.ITEMS),
-      snap => setReportItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
     getDoc(doc(db, 'mixue_data', 'mixue-cost-manager')).then(snap => {
       if (!snap.exists()) return
       const lib = snap.data().library || []
@@ -2092,7 +2355,7 @@ export default function Report() {
       })
       setCmCosts(map)
     })
-    return () => { unsub(); unsubCat() }
+    return () => { unsubCat() }
   }, [])
 
   /* ── derived data ── */
@@ -2100,6 +2363,13 @@ export default function Report() {
   const closingWaste = wasteLogs.filter(l => l.type === 'closing')
   const receiveLogs  = auditLogs.filter(l =>
     l.action === 'receive' && tsToDateKey(l.timestamp) === date)
+  // 🛒 PO ที่มีกิจกรรมในวันที่เลือก (สั่ง / รับครบ / รับบางส่วน)
+  const dailyPOs = purchaseOrders.map(po => {
+    const orderedToday  = po.orderDate === date || (po.createdAt && tsToDateKey(po.createdAt) === date)
+    const receivedToday = po.receivedAt && tsToDateKey(po.receivedAt) === date
+    const partialToday  = po.partialAt && tsToDateKey(po.partialAt) === date
+    return { po, orderedToday, receivedToday, partialToday }
+  }).filter(x => x.orderedToday || x.receivedToday || x.partialToday)
   // TF ที่สร้างในวันที่เลือก (ใช้ createdAt)
   const dailyTransfers = transfers.filter(t => {
     if (!t.createdAt) return false
@@ -2115,6 +2385,23 @@ export default function Report() {
     if (!l.timestamp) return false
     return tsToDateKey(l.timestamp) === date
   })
+
+  // ── 🏪 กรองตามคลังที่เลือก ('' หรือ 'all' = ทุกคลัง) ──
+  const whAll = !wh || wh === 'all'
+  const isMainWh = (id) => { const w = warehouses.find(x => x.id === id); return !!(w?.type === 'main' || w?.isMain) }
+  const showMainData = whAll || isMainWh(wh)   // PO/รับเข้า = เข้าคลังกลางเสมอ
+  const fCutLogs   = whAll ? cutLogs        : cutLogs.filter(l => l.warehouseId === wh)
+  const fFruit     = whAll ? fruitWaste     : fruitWaste.filter(l => l.warehouseId === wh)
+  const fClosing   = whAll ? closingWaste   : closingWaste.filter(l => l.warehouseId === wh)
+  const fTransfers = whAll ? dailyTransfers : dailyTransfers.filter(t => t.fromWarehouseId === wh || t.toWarehouseId === wh)
+  const fRFs       = whAll ? dailyRFs       : dailyRFs.filter(r => r.branchId === wh)
+  const fPOs       = showMainData ? dailyPOs    : []
+  const fReceive   = showMainData ? receiveLogs : []
+  // Log (audit): กรองตามสาขาที่เลือก — เช็คทุก branch field (cut/adjust=warehouseId · โอน=from/toWarehouseId · RF=branchId)
+  // entry ที่ไม่มี field ตรงสาขา = ของสาขาอื่น/legacy → ซ่อน (กันข้อมูล 509 หลุดมาสาขาทดสอบ)
+  const auditMatchBranch = (l) =>
+    l.warehouseId === wh || l.fromWarehouseId === wh || l.toWarehouseId === wh || l.branchId === wh
+  const fAuditLogs = whAll ? dailyAuditLogs : dailyAuditLogs.filter(auditMatchBranch)
 
   /* ── cancel helpers ── */
   function openCancel(entry, label, handler) {
@@ -2138,8 +2425,10 @@ export default function Report() {
       cancelled: true, cancelReason: reason,
       cancelledBy: sName, cancelledAt: now,
     })
-    // 2. restore stock_balances + movement สำหรับทุก item ใน cut log
+    // 2. restore stock_balances + LOT + movement สำหรับทุก item ใน cut log
     const items = (log.items || []).filter(it => !it.cancelled)
+    // โหลด LOT ของคลังครั้งเดียว — ใช้คืน LOT ทุก item ใน batch เดียวกัน (working copy สะสม)
+    const workingLots = await fetchLotsForWarehouse(log.warehouseId)
     for (const it of items) {
       if (!it.itemId) continue       // ข้าม item ไม่มี id (compound เก่า)
       const balId = `${log.warehouseId}_${it.itemId}`
@@ -2156,6 +2445,11 @@ export default function Report() {
         lastUpdated: now,
         lastUpdatedBy: phone,
       }, { merge: true })
+      // คืน LOT ย้อน FIFO ให้ตรงกับ stock ที่คืน — ไม่งั้นยอด "ใช้แล้ว" ใน LOT จะค้างเกินจริง
+      restoreLotFifo(batch, workingLots, {
+        itemId: it.itemId, itemName: it.itemName, warehouseId: log.warehouseId,
+        qtyUse: restoreQty, source: `คืนจากยกเลิกตัดสต็อก (ใบ #${log.id?.slice(-6) || ''})`,
+      })
       const movRef = doc(collection(db, COL.STOCK_MOVEMENTS))
       batch.set(movRef, {
         type:         'cut_cancel',
@@ -2173,12 +2467,17 @@ export default function Report() {
         timestamp:    now,
       })
     }
-    // 3. audit
+    // 3. audit — ระบุเวลาตัดสต็อกจริง + รายชื่อของที่ยกเลิก (ไม่ใช่แค่จำนวน) เพื่อให้ตรวจย้อนหลังง่าย
+    const cutTimeStr = log.timestamp ? `${toThaiTime(log.timestamp)} น.` : ''
+    const itemNames = items.slice(0, 5)
+      .map(it => `${it.itemName} -${it.qtyUse ?? it.qty ?? 0} ${it.unitUse || it.unit || ''}`)
+      .join(', ')
+    const itemsSummary = itemNames + (items.length > 5 ? ` และอีก ${items.length - 5} รายการ` : '')
     const audRef = doc(collection(db, COL.AUDIT_LOGS))
     batch.set(audRef, {
       action: 'cancel_cut', staffPhone: phone, staffName: sName,
       warehouseId: log.warehouseId,
-      detail: `ยกเลิกตัดสต็อก (ใบ #${log.id?.slice(-6)}) — ${items.length} รายการ — เหตุผล: ${reason}`,
+      detail: `ยกเลิกตัดสต็อกทั้งใบ (ตัดเมื่อ ${cutTimeStr}${cutTimeStr ? ' · ' : ''}ใบ #${log.id?.slice(-6)}) — ${itemsSummary || `${items.length} รายการ`} — เหตุผล: ${reason}`,
       timestamp: now,
     })
     await batch.commit()
@@ -2206,6 +2505,12 @@ export default function Report() {
       lastUpdated: now,
       lastUpdatedBy: phone,
     }, { merge: true })
+    // คืน LOT ให้ตรงกับ stock ที่คืน
+    const restoreLots = await fetchLotsForWarehouse(log.warehouseId)
+    restoreLotFifo(batch, restoreLots, {
+      itemId: target.itemId, itemName: target.itemName, warehouseId: log.warehouseId,
+      qtyUse: restoreQty, source: `คืน stock manual (ใบ #${log.id?.slice(-6) || ''})`,
+    })
     const movRef = doc(collection(db, COL.STOCK_MOVEMENTS))
     batch.set(movRef, {
       type:         'cut_restore',
@@ -2231,7 +2536,7 @@ export default function Report() {
     batch.set(audRef, {
       action: 'restore_cut_item', staffPhone: phone, staffName: sName,
       warehouseId: log.warehouseId,
-      detail: `คืน stock manual: ${target.itemName} ${restoreQty} ${restoreUnit} (ใบ #${log.id?.slice(-6)})`,
+      detail: `คืน stock manual: ${target.itemName} +${restoreQty} ${restoreUnit} (ตัดเมื่อ ${log.timestamp ? toThaiTime(log.timestamp) + ' น.' : ''} · ใบ #${log.id?.slice(-6)})`,
       timestamp: now,
     })
     await batch.commit()
@@ -2278,6 +2583,12 @@ export default function Report() {
         lastUpdated: now,
         lastUpdatedBy: phone,
       }, { merge: true })
+      // คืน LOT ให้ตรงกับ stock ที่คืน
+      const restoreLots = await fetchLotsForWarehouse(log.warehouseId)
+      restoreLotFifo(batch, restoreLots, {
+        itemId: target.itemId, itemName: target.itemName, warehouseId: log.warehouseId,
+        qtyUse: restoreQty, source: `คืนจากยกเลิกรายการตัด (ใบ #${log.id?.slice(-6) || ''})`,
+      })
       const movRef = doc(collection(db, COL.STOCK_MOVEMENTS))
       batch.set(movRef, {
         type:         'cut_cancel_item',
@@ -2300,7 +2611,7 @@ export default function Report() {
     batch.set(audRef, {
       action: 'cancel_cut_item', staffPhone: phone, staffName: sName,
       warehouseId: log.warehouseId,
-      detail: `ยกเลิก ${target.itemName} ${target.qtyUse} ${target.unitUse} (ใบ #${log.id?.slice(-6)}) — เหตุผล: ${reason}`,
+      detail: `ยกเลิกรายการ: ${target.itemName} -${target.qtyUse} ${target.unitUse} (ตัดเมื่อ ${log.timestamp ? toThaiTime(log.timestamp) + ' น.' : ''} · ใบ #${log.id?.slice(-6)}) — เหตุผล: ${reason}`,
       timestamp: now,
     })
     await batch.commit()
@@ -2319,6 +2630,12 @@ export default function Report() {
           warehouseId: log.warehouseId, itemId: log.itemId,
           qty: increment(qtyUse), lastUpdated: serverTimestamp(),
         }, { merge: true })
+        // คืน LOT ให้ตรงกับ stock ที่คืน (ตอนบันทึกของเสียหัก LOT แบบ FIFO ไว้)
+        const restoreLots = await fetchLotsForWarehouse(log.warehouseId)
+        restoreLotFifo(batch, restoreLots, {
+          itemId: log.itemId, itemName: log.itemName, warehouseId: log.warehouseId,
+          qtyUse, source: `คืนจากยกเลิกของเสีย (#${log.id?.slice(-6) || ''})`,
+        })
         // movement = reverse
         batch.set(doc(collection(db, COL.STOCK_MOVEMENTS)), {
           type: 'waste_reverse',
@@ -2376,10 +2693,7 @@ export default function Report() {
       const shortages = []
       for (const it of (tf.items || [])) {
         const itemMeta = reportItems.find(i => i.id === it.itemId)
-        const factor   = parseConvFactor(itemMeta?.unitConversion) || 1
-        const qtyIn    = parseFloat(it.qty) || 0
-        const needQtyUse = (it.unit && itemMeta?.unitBase && it.unit === itemMeta.unitBase)
-          ? qtyIn * factor : qtyIn
+        const needQtyUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, itemMeta)
         const toRef = doc(db, COL.STOCK_BALANCES, balanceId(tf.toWarehouseId, it.itemId))
         const toSnap = await getDoc(toRef)
         const curQty = Number(toSnap.exists() ? toSnap.data().qty : 0) || 0
@@ -2398,21 +2712,27 @@ export default function Report() {
     if (tf.status === 'received') {
       for (const it of (tf.items || [])) {
         const itemMeta = reportItems.find(i => i.id === it.itemId)
-        const factor   = parseConvFactor(itemMeta?.unitConversion) || 1
-        const qtyIn    = parseFloat(it.qty) || 0
-        const addQtyUse = (it.unit && itemMeta?.unitBase && it.unit === itemMeta.unitBase)
-          ? qtyIn * factor : qtyIn
+        const addQtyUse = qtyToUse(parseFloat(it.qty) || 0, it.unit, itemMeta)
         // คืนต้นทาง (+) ลดปลายทาง (-)
         const fromRef = doc(db, COL.STOCK_BALANCES, balanceId(tf.fromWarehouseId, it.itemId))
         const toRef   = doc(db, COL.STOCK_BALANCES, balanceId(tf.toWarehouseId, it.itemId))
         batch.set(fromRef, { qty: increment(addQtyUse),  lastUpdated: serverTimestamp() }, { merge: true })
         batch.set(toRef,   { qty: increment(-addQtyUse), lastUpdated: serverTimestamp() }, { merge: true })
-        // movement = reverse
+        // movement = reverse (ต้นทาง: คืน +)
         batch.set(doc(collection(db, COL.STOCK_MOVEMENTS)), {
           type: 'transfer_reverse', itemId: it.itemId, itemName: it.itemName,
           warehouseId: tf.fromWarehouseId, qty: addQtyUse, qtyUse: addQtyUse,
           unit: itemMeta?.unitUse || '', unitUse: itemMeta?.unitUse || '',
           adjustReason: 'ยกเลิกใบโอน (คืน stock)',
+          note: `TF ${tf.tfRef || tf.id} · ${reason}`,
+          staffPhone: phone, staffName, timestamp: serverTimestamp(),
+        })
+        // movement = reverse (ปลายทาง: หักคืน -)
+        batch.set(doc(collection(db, COL.STOCK_MOVEMENTS)), {
+          type: 'transfer_reverse', itemId: it.itemId, itemName: it.itemName,
+          warehouseId: tf.toWarehouseId, qty: -addQtyUse, qtyUse: -addQtyUse,
+          unit: itemMeta?.unitUse || '', unitUse: itemMeta?.unitUse || '',
+          adjustReason: 'ยกเลิกใบโอน (หักคืนต้นทาง)',
           note: `TF ${tf.tfRef || tf.id} · ${reason}`,
           staffPhone: phone, staffName, timestamp: serverTimestamp(),
         })
@@ -2424,11 +2744,18 @@ export default function Report() {
       for (const lotDoc of lotsSnap.docs) {
         const childLot = { id: lotDoc.id, ...lotDoc.data() }
         const take = Number(childLot.inWarehouse) || 0
-        // คืนเข้า src parent
+        // คืนเข้า src parent — sync ทั้ง 2 schema (inWarehouse + locationQty ถ้า parent มี map)
         if (childLot.parentLotId && take > 0) {
-          batch.update(doc(db, COL.LOT_TRACKING, childLot.parentLotId), {
-            inWarehouse: increment(take), lastUpdated: serverTimestamp(),
-          })
+          const parentSnap = await getDoc(doc(db, COL.LOT_TRACKING, childLot.parentLotId))
+          const upd = { inWarehouse: increment(take), lastUpdated: serverTimestamp() }
+          if (parentSnap.exists()) {
+            const pd = parentSnap.data()
+            if (pd.locationQty && typeof pd.locationQty === 'object') {
+              upd[`locationQty.${tf.fromWarehouseId}`] = (Number(pd.locationQty[tf.fromWarehouseId]) || 0) + take
+            }
+            // totalQty ของ dest เคยถูกบวกตอนโอน → qty/totalQty parent ไม่แตะ (เป็นยอดรับสะสมของ parent เอง)
+          }
+          batch.update(doc(db, COL.LOT_TRACKING, childLot.parentLotId), upd)
         }
         // ลบ child LOT
         batch.delete(doc(db, COL.LOT_TRACKING, childLot.id))
@@ -2448,6 +2775,7 @@ export default function Report() {
     }
     batch.set(doc(collection(db, COL.AUDIT_LOGS)), {
       action: 'cancel_transfer', staffPhone: phone, staffName,
+      fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
       detail: `ยกเลิกใบโอน ${tf.tfRef || tf.id} (${tf.status === 'received' ? 'คืน stock + LOT แล้ว' : 'ยังไม่ได้รับ'}) — ${reason}`,
       timestamp: serverTimestamp(),
     })
@@ -2459,6 +2787,8 @@ export default function Report() {
       body: `${tf.fromWarehouseName || ''} → ${tf.toWarehouseName || ''} · ${staffName} · ${reason}`,
       tfRef: tf.tfRef || tf.id, wasReceived: tf.status === 'received',
       cancelReason: reason,
+      fromWarehouseId: tf.fromWarehouseId || '', toWarehouseId: tf.toWarehouseId || '',
+      notifyAppEditors: !!tf.toWarehouseId,   // editor สาขาปลายทางรู้ว่าใบโอนถูกยกเลิก · ไม่มีปลายทาง = owner/admin (กัน branch หลุด)
       createdAt: serverTimestamp(),
       read: false, read_by: [],
     })
@@ -2466,31 +2796,50 @@ export default function Report() {
     sendHubPush(notifRef.id)
   }
 
+  // ── Export ตัดสต็อกของวันที่เลือก → CSV (saveOrShareFile รองรับ iOS PWA) ──
+  function handleExportDaily() {
+    const active = fCutLogs.filter(l => !l.cancelled && !l.deletedAt)   // ตามคลังที่เลือก
+    if (!active.length) return  // ไม่มี log → ไม่ทำอะไร
+    const esc = v => {
+      const s = v == null ? '' : String(v)
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"` : s
+    }
+    const rows = [['เวลา', 'คนตัด', 'รายการ', 'จำนวน', 'หน่วย', 'ต้นทุน(฿)']]
+    active.forEach(log => {
+      const time = log.timestamp ? toThaiTime(log.timestamp) : ''
+      ;(log.items || []).forEach(it => {
+        if (it.cancelled) return
+        const qty  = it.qtyUse  ?? it.qty  ?? 0
+        const unit = it.unitUse ?? it.unit ?? ''
+        const cost = it.costTotal > 0 ? it.costTotal : calcItemCost(it, reportItems, cmCosts)
+        rows.push([time, log.staffName || '', it.itemName || '', qty, unit, cost > 0 ? cost.toFixed(2) : '0'])
+      })
+    })
+    const csv = rows.map(r => r.map(esc).join(',')).join('\n')
+    const whTag = whAll ? '' : `_${(warehouses.find(w => w.id === wh)?.name || wh).replace(/\s+/g, '')}`
+    return saveOrShareFile(`cutlog_${date}${whTag}.csv`, '﻿' + csv, 'text/csv;charset=utf-8;')
+  }
+
   return (
     <div className="page-pad">
 
-      {/* ── Topbar ── */}
-      <div className="page-subbar" style={{ flexDirection: 'column', alignItems: 'stretch',
-        height: 'auto', paddingBottom: 10, gap: 8 }}>
-        <span className="subbar-title">รายงาน</span>
-
-        {/* Sub-tab pills */}
-        <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 2,
-          scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch' }}>
-          {SUB_TABS.filter(t => t.id !== 'analyze' || isOwner()).map(t => {
-            const active = subTab === t.id
-            return (
-              <button key={t.id} onClick={() => setSubTab(t.id)}
-                style={{ flexShrink: 0, border: 'none', borderRadius: 20,
-                  padding: '6px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-                  transition: 'all .15s', whiteSpace: 'nowrap',
-                  background: active ? 'var(--red)' : '#F2F2F7',
-                  color: active ? '#fff' : 'var(--txt3)' }}>
-                {t.icon} {t.label}
-              </button>
-            )
-          })}
-        </div>
+      {/* ── Sub-tab pills (ยุบหัว "รายงาน" · แท็บมาอยู่บนสุด) ── */}
+      <div style={{ display: 'flex', gap: 6, padding: '4px 1rem 0', overflowX: 'auto',
+        scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch' }}>
+        {SUB_TABS.filter(t => t.id !== 'analyze' || isOwner()).map(t => {
+          const active = subTab === t.id
+          return (
+            <button key={t.id} onClick={() => setSubTab(t.id)}
+              style={{ flexShrink: 0, border: 'none', borderRadius: 20,
+                padding: '7px 16px', fontSize: 12.5, fontWeight: 700, cursor: 'pointer',
+                transition: 'all .15s', whiteSpace: 'nowrap',
+                background: active ? 'var(--red)' : '#F2F2F7',
+                color: active ? '#fff' : 'var(--txt3)' }}>
+              {t.icon} {t.label}
+            </button>
+          )
+        })}
       </div>
 
       {/* ── Date + Export bar (รายวัน only) ── */}
@@ -2498,15 +2847,22 @@ export default function Report() {
         <div style={{ padding: '4px 1rem 8px' }}>
           <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #E5E5EA',
             padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <input ref={dateInputRef} type="date"
-              style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 0, height: 0 }}
-              value={date} onChange={e => setDate(e.target.value)} />
-            <button onClick={() => dateInputRef.current?.showPicker?.() || dateInputRef.current?.click()}
-              style={{ border: 'none', background: '#F2F2F7', borderRadius: 8, width: 32, height: 32,
-                fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center',
-                justifyContent: 'center', flexShrink: 0 }}>
-              📅
-            </button>
+            {/* 🍎 iOS-safe: input ตัวจริงโปร่งใสทับปุ่ม 📅 → นิ้วแตะโดน input ตรง ๆ iOS เปิด picker เอง
+                (เดิมใช้ showPicker()/.click() ไปยัง input ที่ซ่อน → iOS Safari บล็อก กดไม่ได้) */}
+            <div style={{ position: 'relative', width: 32, height: 32, flexShrink: 0 }}>
+              <div aria-hidden="true"
+                style={{ background: '#F2F2F7', borderRadius: 8, width: 32, height: 32,
+                  fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  pointerEvents: 'none' }}>
+                📅
+              </div>
+              <input ref={dateInputRef} type="date" aria-label="เลือกวันที่"
+                value={date} onChange={e => setDate(e.target.value)}
+                onClick={e => { try { e.currentTarget.showPicker?.() } catch {} }}
+                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
+                  opacity: 0, border: 'none', padding: 0, margin: 0, cursor: 'pointer',
+                  WebkitAppearance: 'none', appearance: 'none' }} />
+            </div>
             <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 14, flex: 1 }}>
               {toThaiDate(date)}
             </span>
@@ -2516,7 +2872,8 @@ export default function Report() {
                 whiteSpace: 'nowrap' }}>
               วันนี้
             </button>
-            <button style={{ border: 'none', background: 'var(--red)', color: '#fff',
+            <button onClick={handleExportDaily}
+              style={{ border: 'none', background: 'var(--red)', color: '#fff',
               borderRadius: 8, padding: '5px 12px', fontSize: 12, fontWeight: 700,
               cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}>
               📤 Export
@@ -2557,12 +2914,14 @@ export default function Report() {
 
         {subTab === 'daily' && (
           <DailyTab
-            cutLogs={cutLogs}
-            fruitWaste={fruitWaste}
-            closingWaste={closingWaste}
-            receiveLogs={receiveLogs}
-            transfers={dailyTransfers}
-            auditLogs={dailyAuditLogs}
+            canEditOld={isOwner()}
+            cutLogs={fCutLogs}
+            fruitWaste={fFruit}
+            closingWaste={fClosing}
+            receiveLogs={fReceive}
+            dailyPOs={fPOs}
+            transfers={[...fTransfers].sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))}
+            auditLogs={fAuditLogs}
             items={reportItems}
             catOrder={catOrder}
             cmCosts={cmCosts}
@@ -2573,11 +2932,12 @@ export default function Report() {
             cancelWasteLog={cancelWasteLog}
             cancelAuditEntry={cancelAuditEntry}
             cancelTransfer={cancelTransfer}
-            dailyRFs={dailyRFs}
+            dailyRFs={[...fRFs].sort((a, b) => (b.requestedAt?.seconds || 0) - (a.requestedAt?.seconds || 0))}
+            warehouses={warehouses}
           />
         )}
-        {subTab === 'waste'   && <WasteAnalysisTab />}
-        {subTab === 'analyze' && <AnalyzeTab />}
+        {subTab === 'waste'   && <WasteAnalysisTab wh={wh} warehouses={warehouses} />}
+        {subTab === 'analyze' && <AnalyzeTab wh={wh} warehouses={warehouses} />}
       </div>
 
       {/* ── Cancel Sheet ── */}

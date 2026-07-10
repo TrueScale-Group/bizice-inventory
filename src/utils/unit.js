@@ -22,6 +22,51 @@ export function convertToBase(qtyUse, conversion) {
   return qtyUse / parseConvFactor(conversion)
 }
 
+/**
+ * แปลง qty ของ "หน่วยใดก็ได้" → unitUse (รองรับหน่วยหลายชั้น เช่น ลัง→มัด→ใบ)
+ *   ใช้ item.unitLevels [{name, factorToUse}] เป็นหลัก (1 หน่วยนั้น = factorToUse unitUse)
+ *   fallback: legacy 2-ชั้น (unitBase ×parseConvFactor, อื่น ๆ = unitUse)
+ * @returns {number} qty ในหน่วย unitUse
+ */
+export function qtyToUse(qty, unitName, item) {
+  const q = Number(qty) || 0
+  const levels = item?.unitLevels
+  if (Array.isArray(levels) && levels.length) {
+    const lv = levels.find(l => l.name === unitName)
+    if (lv) return q * (Number(lv.factorToUse) || 1)
+    // หน่วยไม่อยู่ใน levels — ถ้าตรง unitUse ก็คือ 1:1
+    if (unitName && unitName === item.unitUse) return q
+  }
+  // legacy fallback
+  const factor = parseConvFactor(item?.unitConversion) || 1
+  if (unitName && item?.unitBase && unitName === item.unitBase) return q * factor
+  return q   // ถือว่าเป็น unitUse
+}
+
+/** แปลง qtyUse → จำนวนในหน่วย unitName (ผกผันของ qtyToUse) เช่น 200 ใบ → 8 มัด */
+export function useToQty(qtyUse, unitName, item) {
+  const q = Number(qtyUse) || 0
+  const levels = item?.unitLevels
+  if (Array.isArray(levels) && levels.length) {
+    const lv = levels.find(l => l.name === unitName)
+    if (lv) return q / (Number(lv.factorToUse) || 1)
+    if (unitName && unitName === item.unitUse) return q
+  }
+  const factor = parseConvFactor(item?.unitConversion) || 1
+  if (unitName && item?.unitBase && unitName === item.unitBase) return q / factor
+  return q
+}
+
+/** มีหน่วยอะไรให้เลือกบ้าง (รองรับหลายชั้น) — คืน array ชื่อหน่วย เรียงจากใหญ่→เล็ก */
+export function unitOptionsOf(item) {
+  if (Array.isArray(item?.unitLevels) && item.unitLevels.length) {
+    return item.unitLevels.map(l => l.name).filter(Boolean)
+  }
+  const out = []
+  ;[item?.unitBuy || item?.unitBase, item?.unitUse, item?.unitSub].forEach(u => { if (u && !out.includes(u)) out.push(u) })
+  return out
+}
+
 /** qty (unitBase) → qty (unitUse). 1 (ลัง) → 20 (กระป๋อง) */
 export function convertToUse(qtyBase, conversion) {
   return qtyBase * parseConvFactor(conversion)

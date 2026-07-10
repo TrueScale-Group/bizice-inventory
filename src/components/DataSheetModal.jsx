@@ -6,6 +6,7 @@ import { Modal } from './Modal'
 import { COL } from '../constants/collections'
 import { parseConvFactor, balanceId } from '../utils/unit'
 import { beepSuccess } from '../utils/audio'
+import { saveOrShareFile } from '../utils/download'
 
 /**
  * DataSheetModal — Owner only · "Master + Stock ทุก warehouse" 1 ไฟล์
@@ -160,7 +161,9 @@ function buildStyledWorkbook(header, rows, warehouses) {
 }
 
 function downloadXLSX(filename, wb) {
-  XLSX.writeFile(wb, filename, { bookType: 'xlsx', cellStyles: true })
+  // XLSX.writeFile() ใช้ <a download> ภายใน → iOS standalone ล้มเหลว → เขียนเป็น array buffer แล้วแชร์/ดาวน์โหลดเอง
+  const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' })
+  return saveOrShareFile(filename, buf, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 }
 
 /**
@@ -179,10 +182,10 @@ function sumQty(qB, qU, qS, factor, convSub) {
 
 const CAT_EMOJI = {
   'แยม': '🍓', 'ผลไม้': '🍑', 'ไซรัป': '🍯',
-  'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
+  'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'ขนม': '🍪', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
 }
 
-const CAT_ORDER = ['แยม','ผลไม้','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','บรรจุภัณฑ์','อื่นๆ']
+const CAT_ORDER = ['แยม','ผลไม้','ไซรัป','ท็อปปิ้ง','วัตถุดิบ','ขนม','บรรจุภัณฑ์','อื่นๆ']
 
 function sortItemsByCategory(items) {
   return [...items].sort((a, b) => {

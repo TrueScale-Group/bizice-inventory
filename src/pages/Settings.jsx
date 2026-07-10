@@ -5,18 +5,21 @@ import { collection, onSnapshot, doc, getDoc, setDoc, addDoc, updateDoc,
 import { ConnectionStatus } from '../components/ConnectionStatus'
 import { Modal } from '../components/Modal'
 import { useSession } from '../hooks/useSession'
+import { useItems } from '../hooks/useItems'
+import { useStockBalanceMap } from '../hooks/useStock'
 import { Toast } from '../components/Toast'
 import IntegrationModal from '../components/IntegrationModal'
 import QuickTemplateModal from '../components/QuickTemplateModal'
 import SeedStockModal from '../components/SeedStockModal'
 import DataSheetModal from '../components/DataSheetModal'
+import ReconcileLotsModal from '../components/ReconcileLotsModal'
 import { COL } from '../constants/collections'
 import { beepAdd, beepRemove } from '../utils/audio'
 import { saveOrShareFile } from '../utils/download'
 
 const CAT_EMOJI = {
   'แยม': '🍓', 'ผลไม้': '🍑', 'ไซรัป': '🍯',
-  'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
+  'ท็อปปิ้ง': '🍫', 'วัตถุดิบ': '🥛', 'ขนม': '🍪', 'บรรจุภัณฑ์': '📦', 'อื่นๆ': '🔖'
 }
 
 // ── เลือก level ที่ user ใน CM เลือกเป็น "หน่วยใช้" ──
@@ -1201,6 +1204,7 @@ const DEFAULT_CATS = [
   { id:'c3', name:'ไซรัป',     emoji:'🍯' },
   { id:'c4', name:'ท็อปปิ้ง',  emoji:'💎' },
   { id:'c5', name:'วัตถุดิบ',  emoji:'🥛' },
+  { id:'c9', name:'ขนม',       emoji:'🍪' },
   { id:'c6', name:'บรรจุภัณฑ์',emoji:'📦' },
   { id:'c7', name:'อื่นๆ',     emoji:'🔖' },
   { id:'c8', name:'สูตรผสม',   emoji:'🧪' },
@@ -1492,15 +1496,15 @@ function CategoryModal({ open, onClose, cats, setCats, items, cmCompounds = [] }
   )
 }
 
-export default function Settings() {
-  const { name, phone, isOwner } = useSession()
+export default function Settings({ warehouses = [] }) {
+  const { name, phone, isOwner, isEditor } = useSession()
   const [loading, setLoading] = useState(true)
   const [lastSync, setLastSync] = useState('')
   const [settings, setSettings] = useState({})
   // โปรไฟล์ย้ายไปจัดการที่ BizICE Hub แล้ว — ไม่ subscribe staff/{phone} ในแอพนี้
-  const [warehouses, setWarehouses] = useState([])
-  const [items, setItems] = useState([])
-  const [balanceMap, setBalanceMap] = useState({})  // { `${wh}_${item}`: balance doc }
+  // warehouses มาจาก prop (App) — ตัด listener ซ้ำ (เดิม subscribe เอง)
+  const items = useItems()                 // shared singleton — ลด Inv_items reads
+  const balanceMap = useStockBalanceMap('all')  // { `${wh}_${item}`: balance } — shared singleton 'all'
   const [templates, setTemplates] = useState([])
   const [toast, setToast] = useState('')
 
@@ -1518,6 +1522,7 @@ export default function Settings() {
   const [exportOpen, setExportOpen] = useState(false)
   const [seedOpen, setSeedOpen] = useState(false)
   const [dataSheetOpen, setDataSheetOpen] = useState(false)
+  const [reconOpen, setReconOpen] = useState(false)   // 🧩 ปรับ LOT ให้ตรงสต็อก
   const [pinModal, setPinModal] = useState(false)
   const [editItem, setEditItem] = useState(null)
   const [editWH, setEditWH] = useState(null)
@@ -1537,6 +1542,7 @@ export default function Settings() {
     wasteLevel: 'sub', // 'buy' | 'use' | 'sub' — ใช้คำนวณของเสีย (default = หน่วยที่ 3)
     stockLimits: {}, // { [warehouseId]: { minQty, minUnit, maxQty, maxUnit } }
     alertEnabled: true,   // false = ปิดแจ้งเตือนของหมด/ใกล้หมด + lock Min/Max
+    lotEnabled: true,     // false = ปิดระบบ LOT/EXP รายการนี้ (ของไม่มีวันหมดอายุ เช่น หมวก/ของแบรนด์)
     wasteMode: false, wasteUnit: 'use',
     showSubInInventory: false,
     visibleIn: {}, // { [warehouseId]: false } = ซ่อนเฉพาะคลังนั้น; ค่าเริ่มต้น = แสดงทุกที่
@@ -1573,17 +1579,7 @@ export default function Settings() {
   const [compoundWasteDraft, setCompoundWasteDraft] = useState({}) // local edits before save
 
   useEffect(() => {
-    const u1 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
-      setWarehouses(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    })
-    const u2 = onSnapshot(collection(db, COL.ITEMS), snap => {
-      setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    })
-    const u2b = onSnapshot(collection(db, COL.STOCK_BALANCES), snap => {
-      const map = {}
-      snap.docs.forEach(d => { map[d.id] = d.data() })
-      setBalanceMap(map)
-    })
+    // balanceMap ย้ายไป useStockBalanceMap('all') แล้ว (ดูบรรทัดประกาศด้านบน)
     const u3 = onSnapshot(collection(db, COL.QUICK_TEMPLATES), snap => {
       setTemplates(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0)))
     })
@@ -1617,7 +1613,7 @@ export default function Settings() {
     getDoc(doc(db, COL.APP_SETTINGS, 'exp_thresholds')).then(snap => {
       if (snap.exists()) setExpThresholds(snap.data())
     })
-    return () => { u1(); u2(); u2b(); u3(); u4() }
+    return () => { u3(); u4() }
   }, [])
 
   // จัดการสาขา/คลัง ย้ายไป Hub ทั้งหมดแล้ว — modal นี้เหลือ read-only
@@ -1783,6 +1779,7 @@ export default function Settings() {
       cutLevel: 'use', wasteLevel: 'sub',
       stockLimits: {},
       alertEnabled: true,
+      lotEnabled: true,
       wasteMode: false, wasteUnit: 'use',
       showSubInInventory: false,
       visibleIn: {},
@@ -1876,23 +1873,15 @@ export default function Settings() {
         </div>
       )}
 
-      {/* Sub-header */}
-      <div className="page-subbar" style={{ flexDirection: 'column', alignItems: 'stretch', height: 'auto', paddingBottom: 6 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span className="subbar-title">ตั้งค่า</span>
-        </div>
-        {lastSync && (
-          <div style={{ fontSize: 11, color: 'var(--txt3)', marginTop: 2 }}>อัปเดตล่าสุด {lastSync} น.</div>
-        )}
-      </div>
-
+      {/* (ยุบหัว "ตั้งค่า" + อัปเดตล่าสุด ออกเพื่อความกระชับบนมือถือ) */}
       {/* (การ์ดโปรไฟล์ถูกย้ายไปจัดการที่ BizICE Hub แล้ว) */}
 
       {/* ══ กลุ่ม 1 — คลัง + วัตถุดิบ (Editor + Owner) ══ */}
       <div>
         <div className="section-label">คลัง + วัตถุดิบ</div>
         <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
-          <SettingRow icon="🏪" title="จัดการคลังสินค้า" onClick={() => setWhModal(true)} />
+          {/* ลบออก: จัดการคลังสินค้า — ดูอย่างเดียว ซ้ำกับ Hub (จัดการสาขาที่ Hub แล้ว)
+          <SettingRow icon="🏪" title="จัดการคลังสินค้า" onClick={() => setWhModal(true)} /> */}
           <SettingRow icon="🚚" title="แหล่งที่มาสินค้า" desc="แก้ไขรายการแหล่งที่มา" onClick={() => setSrcModal(true)} />
           <SettingRow icon="🏷️" title="หมวดหมู่วัตถุดิบ" desc={`${cats.length} หมวด`} onClick={() => setCatModal(true)} />
           <SettingRow icon="📦" title="วัตถุดิบ (Master Data)" onClick={() => setItemModal(true)} />
@@ -1908,6 +1897,22 @@ export default function Settings() {
           }} />
         </div>
       </div>
+
+      {/* ══ กลุ่ม — เครื่องมือข้อมูล (Owner / Admin / Editor) ══ */}
+      {isEditor() && (
+        <div>
+          <div className="section-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            เครื่องมือข้อมูล
+            <span style={{ fontSize: 10, background: '#FEF3C7', color: '#B45309',
+              borderRadius: 20, padding: '1px 8px', fontWeight: 700 }}>👑 Owner / Admin</span>
+          </div>
+          <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
+            <SettingRow icon="🧩" title="ปรับ LOT ให้ตรงสต็อก"
+              desc="ตรวจ/ซ่อม LOT ที่ไม่ตรงยอดคงเหลือจริง (ทุกคลัง)"
+              onClick={() => setReconOpen(true)} />
+          </div>
+        </div>
+      )}
 
       {/* ══ ส่วนที่เหลือ: Owner เท่านั้น ══ */}
       {isOwner() && (<>
@@ -1974,7 +1979,8 @@ export default function Settings() {
           </div>
         </div>
 
-        {/* กลุ่ม 3 — เครื่องมือ Owner */}
+        {/* ลบออกทั้งกลุ่ม: เครื่องมือ Owner (Quick Template / เชื่อมต่อระบบ / Export / Seed Stock / Data Sheet)
+            — แทบไม่ได้ใช้ / one-time · เก็บโค้ด+modal ไว้เผื่อกลับมาเปิดใหม่
         <div>
           <div className="section-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             เครื่องมือ
@@ -1997,14 +2003,16 @@ export default function Settings() {
               onClick={() => setDataSheetOpen(true)} />
           </div>
         </div>
+        */}
 
         {/* Danger Zone */}
         <div>
           <div className="section-label" style={{ color: '#DC2626' }}>Danger Zone</div>
           <div className="card" style={{ margin: '0 1rem', overflow: 'visible' }}>
+            {/* ลบออก: ซ่อมข้อมูล Stock ย้อนหลัง — migration one-time รันไปแล้ว
             <SettingRow icon="🔧" title="ซ่อมข้อมูล Stock ย้อนหลัง"
               desc="ลด stock_balances ตาม cut_stock_logs ที่มีอยู่ (ใช้ครั้งเดียว)"
-              onClick={retroFixStock} />
+              onClick={retroFixStock} /> */}
             <SettingRow icon="🗑️" title="Clear All Data"
               desc="ลบ stock + log + lot + transfer ทั้งหมด (ใส่ PIN ยืนยัน)"
               danger onClick={() => setClearDataOpen(true)} />
@@ -2029,7 +2037,7 @@ export default function Settings() {
             background: 'var(--bg)', border: '1px solid var(--border2)',
             borderRadius: 20, padding: '1px 8px', fontWeight: 700, fontSize: 10.5,
             color: 'var(--txt2)'
-          }}>v{__APP_VERSION__}</span>
+          }}>{(() => { const [ma,mi,pa] = __APP_VERSION__.split('.'); return `v${ma}.${mi}.${pa.padStart(2,'0')}` })()}</span>
           <span>·</span>
           <span>อัพเดท {__BUILD_DATE__}</span>
         </div>
@@ -2331,6 +2339,7 @@ export default function Settings() {
                               wasteLevel: i.wasteLevel || ((i.unitSubRaw || i.unitSub) ? 'sub' : 'use'),
                               stockLimits: mergedLimits,
                               alertEnabled: i.alertEnabled !== false,   // default true
+                              lotEnabled: i.lotEnabled !== false,       // default true
                               wasteMode: i.wasteMode || false,
                               wasteUnit: i.wasteUnit || 'use',
                               showSubInInventory: i.showSubInInventory || false,
@@ -2961,6 +2970,27 @@ export default function Settings() {
                   </div>
                 </div>
 
+                {/* 📦 LOT toggle — ปิดได้กรณีของไม่มีวันหมดอายุ (หมวก/ของแบรนด์/อุปกรณ์) */}
+                <div style={{
+                  background: itemForm.lotEnabled !== false ? '#EFF6FF' : '#F3F4F6',
+                  border: `1.5px solid ${itemForm.lotEnabled !== false ? '#93C5FD' : '#D1D5DB'}`,
+                  borderRadius: 12, padding: '12px 14px',
+                  display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <button className={`toggle${itemForm.lotEnabled !== false ? ' on' : ''}`}
+                    onClick={() => setItemForm(f => ({ ...f, lotEnabled: f.lotEnabled === false }))} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700,
+                      color: itemForm.lotEnabled !== false ? '#1D4ED8' : '#6B7280' }}>
+                      📦 ติดตาม LOT / วันหมดอายุ
+                    </div>
+                    <div style={{ fontSize: 11, color: itemForm.lotEnabled !== false ? '#1D4ED8' : '#9CA3AF', marginTop: 2 }}>
+                      {itemForm.lotEnabled !== false
+                        ? 'เปิดอยู่ — รับเข้า/โอน/ตัด จะบันทึก LOT + เตือน EXP'
+                        : '🔕 ปิดอยู่ — ไม่สร้าง LOT ไม่ถามวันหมดอายุ (เช่น หมวก/ของแบรนด์)'}
+                    </div>
+                  </div>
+                </div>
+
                 {/* Min / Max Stock — Tab Sheet per warehouse */}
                 {(() => {
                   const activeWhs = warehouses.filter(wh => wh.active !== false)
@@ -3582,6 +3612,16 @@ export default function Settings() {
           staffPhone={phone}
           staffName={name}
           onSuccess={msg => setToast(msg)}
+        />
+      )}
+
+      {/* ── 🧩 ปรับ LOT ให้ตรงสต็อก (Owner / Admin / Editor) ── */}
+      {isEditor() && (
+        <ReconcileLotsModal
+          open={reconOpen}
+          onClose={() => setReconOpen(false)}
+          items={items}
+          warehouses={warehouses}
         />
       )}
     </div>

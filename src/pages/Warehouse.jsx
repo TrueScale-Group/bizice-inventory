@@ -10,7 +10,10 @@ import AdjustStockModal from '../components/AdjustStockModal'
 import { sortLotsFIFO, getExpStatus, formatDateDDMMYY } from '../utils/fifo'
 import { COL } from '../constants/collections'
 import { useSession } from '../hooks/useSession'
-import { formatStockQty, getStockStatus, balanceId } from '../utils/unit'
+import { useItems, useItemsLoaded } from '../hooks/useItems'
+import { useStockBalances } from '../hooks/useStock'
+import { formatStockQty, getStockStatus, balanceId, qtyToUse, parseConvFactor } from '../utils/unit'
+import { CAT_ORDER } from '../utils/sortItems'
 
 const CATS = [
   { id: 'all',        name: 'ทั้งหมด',    emoji: '🔍' },
@@ -19,6 +22,7 @@ const CATS = [
   { id: 'ไซรัป',     name: 'ไซรัป',      emoji: '🍯' },
   { id: 'ท็อปปิ้ง',  name: 'ท็อปปิ้ง',   emoji: '💎' },
   { id: 'วัตถุดิบ',  name: 'วัตถุดิบ',   emoji: '🥛' },
+  { id: 'ขนม',       name: 'ขนม',        emoji: '🍪' },
   { id: 'บรรจุภัณฑ์', name: 'บรรจุ',     emoji: '🥤' },
   { id: 'อื่นๆ',     name: 'อื่นๆ',      emoji: '🔖' },
 ]
@@ -27,14 +31,39 @@ const CATS = [
 const WH_COLORS = ['#34C759', '#FF9500', '#007AFF', '#AF52DE', '#FF2D55']
 const WH_BG     = ['#DCFCE7', '#FEF3C7', '#DBEAFE', '#F3E8FF', '#FFE4E6']
 
-export default function Warehouse() {
+/* ── LOT helpers (shared: card badges + LOT popup) — รองรับ 2 schema (locationQty map / legacy inWarehouse+inShop) ── */
+function getLotQtyTotal(lot) {
+  // totalQty = ยอดรับสะสมที่ถูกต้องเสมอ (qty เคยเพี้ยนจาก bug โอนซ้ำเข้า lot เดิม — เชื่อ totalQty ก่อน)
+  if (lot.totalQty != null) return Number(lot.totalQty) || 0
+  if (lot.qty != null) return lot.qty
+  if (lot.locationQty) return Object.values(lot.locationQty).reduce((s, v) => s + v, 0)
+  return (lot.inWarehouse || 0) + (lot.inShop || 0) + (lot.used || 0)
+}
+function getLotLocationBreakdown(lot) {
+  if (lot.locationQty && Object.keys(lot.locationQty).length > 0) return lot.locationQty
+  const bd = {}
+  const whId = lot.warehouseId || '__main__'
+  if ((lot.inWarehouse || 0) > 0) bd[whId] = lot.inWarehouse
+  if ((lot.inShop || 0) > 0) bd['__shop__'] = lot.inShop
+  if (Object.keys(bd).length === 0 && (lot.qty || 0) > 0 && whId) bd[whId] = lot.qty
+  return bd
+}
+/** ใช้หมดแล้ว = ไม่เหลือ stock ที่คลัง/ร้านไหนเลย — ใช้ซ่อน LOT ออกจากลิสต์ที่แสดงผล */
+function isLotDepleted(lot) {
+  const total = getLotQtyTotal(lot)
+  if (total <= 0) return false
+  const active = Object.values(getLotLocationBreakdown(lot)).reduce((s, v) => s + v, 0)
+  return active <= 0.0001
+}
+
+export default function Warehouse({ wh: scope, setWh: setScope, warehouses }) {
   const [loading, setLoading]     = useState(true)
-  const [scope, setScope]         = useState('')
   const [cat, setCat]             = useState('all')
   const [search, setSearch]       = useState('')
-  const [warehouses, setWarehouses] = useState([])
-  const [items, setItems]         = useState([])
-  const [balances, setBalances]   = useState([])
+  const items = useItems()                 // shared singleton — ลด Inv_items reads
+  const itemsLoaded = useItemsLoaded()
+  // balances — shared singleton: owner เลือก 'all' = ทุกคลัง · staff = สาขาเดียว (scope)
+  const balances = useStockBalances(scope || 'all')
   const [lots, setLots]           = useState([])
   const [lotItem, setLotItem]     = useState(null)
   const [historyItem, setHistoryItem] = useState(null)   // 👓 history popup
@@ -53,35 +82,13 @@ export default function Warehouse() {
     return () => unsub()
   }, [])
 
-  useEffect(() => {
-    const u1 = onSnapshot(collection(db, COL.WAREHOUSES), snap => {
-      const wList = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(w => w.active !== false)
-      setWarehouses(wList)
-      if (wList.length > 0) {
-        // Default: สาขา (type==='shop' หรือ isShop===true) → fallback อันที่ 2 → อันแรก
-        const shop = wList.find(w => w.type === 'shop' || w.isShop === true)
-          || wList.find((_, i) => i > 0)
-          || wList[0]
-        setScope(prev => prev || shop.id)
-      }
-    })
-    const u2 = onSnapshot(collection(db, COL.ITEMS), snap => {
-      setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-      setLoading(false)
-    })
-    return () => { u1(); u2() }
-  }, [])
+  // items มาจาก useItems() (shared) — เคลียร์ loading เมื่อโหลดเสร็จ
+  useEffect(() => { if (itemsLoaded) setLoading(false) }, [itemsLoaded])
 
-  useEffect(() => {
-    const q = !scope
-      ? query(collection(db, COL.STOCK_BALANCES))
-      : query(collection(db, COL.STOCK_BALANCES), where('warehouseId', '==', scope))
-    const unsub = onSnapshot(q, snap => {
-      setBalances(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    })
-    return () => unsub()
-  }, [scope])
+  // balances ย้ายไป useStockBalances(scope || 'all') แล้ว (ดูบรรทัดประกาศด้านบน)
 
+  // โหลด LOT ทุกคลังเสมอ — popup ต้องเห็นทั้งครอบครัว (แม่คลังกลาง + ลูกสาขา) เพื่อตามของจนใช้หมด
+  // (Dashboard subscribe ทั้ง collection อยู่แล้ว — ไม่ได้เพิ่ม read จริง)
   useEffect(() => {
     const unsub = onSnapshot(collection(db, COL.LOT_TRACKING), snap => {
       setLots(snap.docs.map(d => ({ id: d.id, ...d.data() })))
@@ -108,9 +115,9 @@ export default function Warehouse() {
     return Math.min(100, Math.round((qty / ref) * 100))
   }
 
-  // กรอง LOT ที่ถูก split ออกแล้ว (แสดงแค่ sub-lots ที่ active)
+  // กรอง LOT ที่ถูก split ออกแล้ว (แสดงแค่ sub-lots ที่ active) + LOT ที่ใช้หมดแล้ว (ไม่ต้องโชว์ค้าง)
   function getItemLots(itemId) {
-    return sortLotsFIFO(lots.filter(l => l.itemId === itemId && l.status !== 'split'))
+    return sortLotsFIFO(lots.filter(l => l.itemId === itemId && l.status !== 'split' && !isLotDepleted(l)))
   }
 
   const EXP_ORDER = { expired: 0, danger: 1, warning: 2, ok: 3 }
@@ -129,7 +136,11 @@ export default function Warehouse() {
     .filter(i => cat === 'all' || i.category === cat)
     .filter(i => !search || (i.displayName || i.name).toLowerCase().includes(search.toLowerCase()) || i.name.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => {
-      // เรียงตาม sortOrder ที่ตั้งใน Settings → "ลากเพื่อเรียงลำดับ"
+      // เรียงตาม Master Data: ตำแหน่งหมวด (CAT_ORDER) → sortOrder → name
+      // โชว์ cat==='all' ปนทุกหมวด จึงต้องใช้ตำแหน่งหมวดเป็น key หลัก
+      const cia = CAT_ORDER.indexOf(a.category); const ca = cia < 0 ? 999 : cia
+      const cib = CAT_ORDER.indexOf(b.category); const cb = cib < 0 ? 999 : cib
+      if (ca !== cb) return ca - cb
       const oa = a.sortOrder ?? 999
       const ob = b.sortOrder ?? 999
       if (oa !== ob) return oa - ob
@@ -138,20 +149,23 @@ export default function Warehouse() {
     .map(item => {
       const bal = balances.filter(b => b.itemId === item.id)
       const qty = bal.reduce((s, b) => s + (b.qty || 0), 0)
-      const itemLots = getItemLots(item.id)
+      // item ปิดระบบ LOT (lotEnabled=false) → ไม่โชว์ badge/popup LOT เลย (ของไม่มีวันหมดอายุ)
+      const familyLots = item.lotEnabled === false ? [] : getItemLots(item.id)   // ทั้งครอบครัว ทุกคลัง — ส่งให้ popup
+      // badge บนการ์ด (📦 N · EXP) ยังนับเฉพาะคลังที่กำลังดู — ยอดหน้ารายการเป็นราย-คลัง
+      const itemLots = scope ? familyLots.filter(l => (l.warehouseId || '') === scope) : familyLots
       const warnLots = itemLots.filter(l => getExpStatus(l.expDate || '', expThresholds).status !== 'ok')
-      // หา worst EXP status ในทุก lot ของ item นี้
+      // หา worst EXP status ในทุก lot ของ item นี้ (เฉพาะคลังที่ดู)
       let worstExp = null
       for (const lot of itemLots) {
         const exp = getExpStatus(lot.expDate || '', expThresholds)
         if (!worstExp || EXP_ORDER[exp.status] < EXP_ORDER[worstExp.status]) worstExp = exp
       }
-      return { item, qty, itemLots, warnLots, worstExp, status: getStatus(qty, item.id), pct: getPct(qty, item) }
+      return { item, qty, itemLots, familyLots, warnLots, worstExp, status: getStatus(qty, item.id), pct: getPct(qty, item) }
     })
 
-  function openLotPopup(item, itemLots, warnLots, qty) {
-    setLotItem({ item, itemLots, warnLots, qty, expThresholds, warehouses, session,
-      currentScope: scope })   // lock warehouse กับ scope ที่กำลังเปิดอยู่
+  function openLotPopup(item, familyLots, warnLots, qty) {
+    setLotItem({ item, itemLots: familyLots, warnLots, qty, expThresholds, warehouses, session,
+      currentScope: scope })   // scope ใช้เป็น default คลังตอนเพิ่ม LOT + ป้าย "Stock คงเหลือ"
   }
 
   return (
@@ -164,28 +178,6 @@ export default function Warehouse() {
         </div>
       )}
 
-      {/* Sub-header */}
-      <div className="page-subbar">
-        <span className="subbar-title">คลังสินค้า</span>
-      </div>
-
-      {/* Scope selector — สาขา ก่อน, คลังกลางทีหลัง */}
-      <div style={{ padding: '0 1rem' }}>
-        <div className="segment">
-          {[...warehouses]
-            .sort((a, b) => {
-              const ra = (a.type === 'main' || a.isMain) ? 1 : 0
-              const rb = (b.type === 'main' || b.isMain) ? 1 : 0
-              return ra - rb
-            })
-            .map(w => (
-              <button key={w.id} className={`seg-btn${scope === w.id ? ' active' : ''}`} onClick={() => setScope(w.id)}>
-                {w.name}
-              </button>
-            ))}
-        </div>
-      </div>
-
       {/* Search */}
       <div style={{ padding: '0 1rem', display: 'flex', alignItems: 'center', gap: 10 }}>
         <div className="search-wrap" style={{ margin: 0, flex: 1 }}>
@@ -193,7 +185,7 @@ export default function Warehouse() {
           <input className="search-input" placeholder="ค้นหาวัตถุดิบ..." value={search}
             onChange={e => setSearch(e.target.value)} />
           {search && (
-            <button className="search-clear" onClick={() => setSearch('')} title="ล้าง">✕</button>
+            <button className="search-clear" onClick={() => setSearch('')} title="ล้าง">×</button>
           )}
         </div>
         <span style={{ fontSize: 12, color: 'var(--txt3)', whiteSpace: 'nowrap', fontWeight: 600 }}>
@@ -233,7 +225,7 @@ export default function Warehouse() {
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--txt3)' }}>ไม่มีข้อมูล</div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 8, padding: 8 }}>
-              {rows.map(({ item, qty, itemLots, warnLots, worstExp, status, pct }) => (
+              {rows.map(({ item, qty, itemLots, familyLots, warnLots, worstExp, status, pct }) => (
                 <div key={item.id} className="stock-card" onClick={() => setHoverItem(hoverItem === item.id ? null : item.id)}
                   style={{ cursor: 'pointer', position: 'relative', minWidth: 0, overflow: 'hidden',
                     background: hoverItem === item.id ? '#FFF1F5' : undefined,
@@ -248,7 +240,7 @@ export default function Warehouse() {
                     color: hoverItem === item.id ? '#fff' : '#C2185B',
                     fontWeight: 700, transition: 'all .15s', flexShrink: 0,
                     lineHeight: 1 }}>
-                    {hoverItem === item.id ? '✕' : '⟳'}
+                    {hoverItem === item.id ? '×' : '⟳'}
                   </div>
                   {hoverItem !== item.id && (<>
                   <div className="stock-emoji">{item.img || '📦'}</div>
@@ -291,7 +283,7 @@ export default function Warehouse() {
                       const expText = noExp ? 'ไม่ระบุ EXP' : worstExp.label
                       return (
                         <button
-                          onClick={e => { e.stopPropagation(); openLotPopup(item, itemLots, warnLots, qty) }}
+                          onClick={e => { e.stopPropagation(); openLotPopup(item, familyLots, warnLots, qty) }}
                           style={{
                             border: `1.5px solid ${pillStyle.border}`,
                             background: pillStyle.bg,
@@ -385,12 +377,14 @@ export default function Warehouse() {
                             ⚖️ ปรับยอด
                           </button>
                         )}
-                        <button onClick={e => { e.stopPropagation(); openLotPopup(item, itemLots, warnLots, qty) }}
-                          style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: '1px solid #FFD4E0',
-                            background: '#fff', color: '#C2185B', fontSize: 11.5, fontWeight: 700,
-                            cursor: 'pointer', whiteSpace: 'nowrap' }}>
-                          📦 LOT ({itemLots.length})
-                        </button>
+                        {item.lotEnabled !== false && (
+                          <button onClick={e => { e.stopPropagation(); openLotPopup(item, familyLots, warnLots, qty) }}
+                            style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: '1px solid #FFD4E0',
+                              background: '#fff', color: '#C2185B', fontSize: 11.5, fontWeight: 700,
+                              cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                            📦 LOT ({itemLots.length})
+                          </button>
+                        )}
                         <button onClick={e => { e.stopPropagation(); setHistoryItem(item) }}
                           style={{ flex: 1, padding: '9px 6px', borderRadius: 9, border: '1px solid #DBEAFE',
                             background: '#fff', color: '#1D4ED8', fontSize: 11.5, fontWeight: 700,
@@ -448,7 +442,8 @@ function LotPopup({ data, onClose }) {
   const lockedWh = currentScope && warehouses.find(w => w.id === currentScope) ? currentScope : ''
   const thr = expThresholds || { yellow: 30, red: 7 }
   const role    = session.role || 'viewer'
-  const canEdit = role === 'editor' || role === 'owner'
+  const canEdit = ['editor', 'staff', 'owner', 'admin'].includes(role)
+  const canManage = role === 'owner' || role === 'admin'   // ลบ LOT — Owner + Admin
 
   // Local lots state — อัปเดต optimistic หลังแก้ไข / split
   const [lots, setLots]       = useState(() => initLots)
@@ -462,6 +457,9 @@ function LotPopup({ data, onClose }) {
   const [closeConfirm, setCloseConfirm] = useState(false) // X กด 2 ครั้งเมื่อมีข้อมูลค้าง
   const [addOpen, setAddOpen] = useState(false)           // เพิ่ม LOT
   const [addDraft, setAddDraft] = useState({})
+  const [mergeMode, setMergeMode] = useState(false)       // 🔀 โหมดรวม LOT
+  const [mergeSel, setMergeSel]   = useState([])          // lot ids ที่เลือก (เฉพาะ LOT แม่ คลังเดียวกัน)
+  const [mergePrimary, setMergePrimary] = useState('')    // LOT ที่เก็บข้อมูล (Lot No./วันที่/EXP) ไว้
 
   // Sync เมื่อ parent snapshot เปลี่ยน
   useEffect(() => { setLots(initLots) }, [initLots])
@@ -488,11 +486,9 @@ function LotPopup({ data, onClose }) {
     return lot.lotNo || formatDateDDMMYY(lot.receiveDate) || 'Start'
   }
 
-  /** qty รวมของ lot นี้ (รับมาทั้งหมด) */
+  /** qty รวมของ lot นี้ (รับมาทั้งหมด) — เชื่อ totalQty ก่อน (qty เคยเพี้ยนจาก bug โอนซ้ำ) */
   function getLotQty(lot) {
-    if (lot.qty != null) return lot.qty
-    if (lot.locationQty) return Object.values(lot.locationQty).reduce((s, v) => s + v, 0)
-    return (lot.inWarehouse || 0) + (lot.inShop || 0) + (lot.used || 0)
+    return getLotQtyTotal(lot)
   }
 
   /**
@@ -512,13 +508,6 @@ function LotPopup({ data, onClose }) {
       bd[whId] = lot.qty
     }
     return bd
-  }
-
-  /** qty ที่ใช้ไปแล้ว = รับมา - ยังคงเหลืออยู่ทุกคลัง */
-  function getUsed(lot) {
-    const total  = getLotQty(lot)
-    const active = Object.values(getLocationBreakdown(lot)).reduce((s, v) => s + v, 0)
-    return Math.max(0, total - active)
   }
 
   // ── Edit handlers ─────────────────────────────────────────
@@ -589,6 +578,11 @@ function LotPopup({ data, onClose }) {
         expDate:      addDraft.expDate || '',
         qty,
         locationQty:  { [addDraft.warehouseId]: qty },
+        // dual-schema: ให้ FIFO/EXP (ที่อ่าน inWarehouse) มองเห็นล็อต manual ด้วย
+        totalQty:     qty,
+        inWarehouse:  qty,
+        inShop:       0,
+        used:         0,
         source:       'Backfill (manual)',
         status:       'active',
         createdAt:    now,
@@ -639,6 +633,88 @@ function LotPopup({ data, onClose }) {
     } finally {
       setSaving(false)
     }
+  }
+
+  // ── รวม LOT (merge) ────────────────────────────
+  // use case: ของล็อตเดียวกันแต่กลายเป็นหลาย doc (รับเพิ่ม/กดซ่อม Reconcile) → ยุบรวมเป็นใบเดียว
+  function toggleMergeMode() {
+    setMergeMode(m => !m)
+    setMergeSel([]); setMergePrimary('')
+    setEditingId(null); setAddOpen(false); setSplitOpen(false); setError('')
+  }
+
+  function toggleMergeSelect(lot) {
+    if (lot.parentLotId) return   // รวมได้เฉพาะ LOT แม่ (ลูกจากการโอนจะถูกย้ายตามแม่หลักอัตโนมัติ)
+    setMergeSel(prev => {
+      const next = prev.includes(lot.id) ? prev.filter(id => id !== lot.id) : [...prev, lot.id]
+      setMergePrimary(p => next.includes(p) ? p : (next[0] || ''))
+      return next
+    })
+  }
+
+  async function confirmMerge() {
+    setError('')
+    const members = mergeSel.map(id => lots.find(l => l.id === id)).filter(Boolean)
+    if (members.length < 2) { setError('เลือกอย่างน้อย 2 LOT'); return }
+    const primary = members.find(l => l.id === mergePrimary) || members[0]
+    const whId = primary.warehouseId || ''
+    if (members.some(l => (l.warehouseId || '') !== whId)) { setError('รวมได้เฉพาะ LOT ที่อยู่คลังเดียวกัน'); return }
+    const others = members.filter(l => l.id !== primary.id)
+    setSaving(true)
+    try {
+      const now   = serverTimestamp()
+      const batch = writeBatch(db)
+      // รวมยอด: totalQty/used = ผลบวก · locationQty = รวมคงเหลือรายคลัง (invariant total = คงเหลือ+used+โอนออก คงเดิม)
+      let totalQty = 0, used = 0
+      const bd = {}
+      members.forEach(m => {
+        totalQty += getLotQty(m)
+        used     += Number(m.used) || 0
+        Object.entries(getLocationBreakdown(m)).forEach(([wh, q]) => {
+          if (q > 0) bd[wh] = (bd[wh] || 0) + q
+        })
+      })
+      batch.update(doc(db, COL.LOT_TRACKING, primary.id), {
+        totalQty, qty: totalQty, used,
+        locationQty: bd,
+        inWarehouse: bd[whId] || 0,
+        inShop:      bd['__shop__'] || 0,
+        mergedFrom:  others.map(o => o.id),
+        updatedAt:   now,
+        updatedBy:   session.name || 'unknown',
+      })
+      // LOT ลูก (โอนไปสาขา) ของใบที่ถูกยุบ → ย้าย parent มาที่ใบหลัก ให้ family view ตามต่อได้
+      const orphans = lots.filter(l => l.parentLotId && others.some(o => o.id === l.parentLotId))
+      orphans.forEach(c => batch.update(doc(db, COL.LOT_TRACKING, c.id), { parentLotId: primary.id, updatedAt: now }))
+      others.forEach(o => batch.delete(doc(db, COL.LOT_TRACKING, o.id)))
+      const audRef = doc(collection(db, COL.AUDIT_LOGS))
+      batch.set(audRef, {
+        action:      'lot_merge',
+        itemId:      item.id,
+        itemName:    item.name,
+        lotId:       primary.id,
+        warehouseId: whId,
+        merged: others.map(o => ({
+          id: o.id, lotNo: o.lotNo || '', receiveDate: o.receiveDate || '',
+          expDate: o.expDate || '', qty: getLotQty(o), used: Number(o.used) || 0,
+        })),
+        totalQty,
+        detail: `รวม ${members.length} LOT → LOT ${getLotDisplay(primary)} (${item.name} รวม ${totalQty} ${item.unitUse})`,
+        by: session.name || 'unknown',
+        at: now,
+      })
+      await batch.commit()
+      // Optimistic update — ลบใบที่ถูกยุบ อัปเดตใบหลัก ย้าย parent ของลูก
+      setLots(prev => prev
+        .filter(l => !others.some(o => o.id === l.id))
+        .map(l => l.id === primary.id
+          ? { ...l, totalQty, qty: totalQty, used, locationQty: bd, inWarehouse: bd[whId] || 0, inShop: bd['__shop__'] || 0 }
+          : orphans.some(c => c.id === l.id) ? { ...l, parentLotId: primary.id } : l))
+      setMergeMode(false); setMergeSel([]); setMergePrimary('')
+    } catch (e) {
+      setError('รวม LOT ไม่สำเร็จ: ' + e.message)
+    }
+    setSaving(false)
   }
 
   async function saveEdit(lot) {
@@ -716,6 +792,7 @@ function LotPopup({ data, onClose }) {
         lotNo:        splitDraft.lotNoA || lot.lotNo + '-A',
         qty:          qtyA,
         locationQty:  { [firstWh]: qtyA },
+        totalQty:     qtyA, inWarehouse: qtyA, inShop: 0, used: 0,
         mfgDate:      splitDraft.mfgA || '',
         expDate:      splitDraft.expA || '',
         receiveDate:  lot.receiveDate || '',
@@ -738,6 +815,7 @@ function LotPopup({ data, onClose }) {
         lotNo:        splitDraft.lotNoB || lot.lotNo + '-B',
         qty:          qtyB,
         locationQty:  { [firstWh]: qtyB },
+        totalQty:     qtyB, inWarehouse: qtyB, inShop: 0, used: 0,
         mfgDate:      splitDraft.mfgB || '',
         expDate:      splitDraft.expB || '',
         receiveDate:  lot.receiveDate || '',
@@ -834,7 +912,42 @@ function LotPopup({ data, onClose }) {
     { color: '#FF3B30', bg: '#FEE2E2', label: `≤ ${thr.red} วัน / หมด` },
   ]
 
+  // LOT popup = มุมมอง "ทั้งครอบครัว ทุกคลัง" เสมอ (แทนกฎ §9.2/9.3 เดิมที่แยกคลัง — เจ้าของสั่ง 6 ก.ค. 2569)
+  // เหตุผล: LOT คือของล็อตเดียวกัน ต้องตามได้ตั้งแต่รับเข้าคลังกลาง → โอนสาขา → จนใช้หมด
   const sortedLots = sortLotsFIFO(lots)
+  // ใช้หมดแล้ว (ไม่เหลือ stock ที่คลังไหนเลย) → ซ่อนออกจากลิสต์ ไม่ต้องโชว์ค้างให้รก
+  const visibleLots = sortedLots.filter(lot => !isLotDepleted(lot))
+
+  // รวม LOT ครอบครัวเดียว (แม่+ลูกทุกสาขา) เป็นการ์ดเดียว
+  // แสดงคงเหลือจริงรายคลัง + ใช้แล้วรวม (เช่น รับ 80: คลังกลาง 40 / สาขา 25 / ใช้แล้ว 15)
+  const displayLots = (() => {
+    const groups = new Map()
+    for (const l of visibleLots) {
+      const rootId = l.parentLotId || l.id
+      if (!groups.has(rootId)) groups.set(rootId, [])
+      groups.get(rootId).push(l)
+    }
+    const units = []
+    for (const [rootId, members] of groups) {
+      const root = members.find(l => l.id === rootId) || members[0]
+      const bd = {}
+      members.forEach(m => {
+        Object.entries(getLocationBreakdown(m)).forEach(([whId, q]) => {
+          if (q > 0) bd[whId] = (bd[whId] || 0) + q
+        })
+      })
+      // ยอดรับของครอบครัว = totalQty ของแม่ · ถ้าแม่หมด/ถูกซ่อนไปแล้ว fallback รวมจากลูกที่เหลือ
+      const total = members.some(l => l.id === rootId)
+        ? getLotQty(root)
+        : members.reduce((s, m) => s + getLotQty(m), 0)
+      units.push({ ...root, _familyBd: bd, _familyTotal: total, _familyCount: members.length })
+    }
+    return sortLotsFIFO(units)
+  })()
+
+  // นับ LOT ใกล้หมดอายุจาก "การ์ดที่แสดงจริง" (ครอบครัวรวมทุกคลัง) — ให้ตรงกับ "จำนวน Lot" เสมอ
+  // เดิมใช้ warnLots ที่หน้ารายการนับเฉพาะคลังที่ดู → เปิดจากสาขานับได้ 1 แต่การ์ดโชว์ 2 (เลขขัดกัน)
+  const warnCount = displayLots.filter(l => getExpStatus(l.expDate || '', thr).status !== 'ok').length
 
   return (
     <div className="modal-backdrop"
@@ -867,7 +980,7 @@ function LotPopup({ data, onClose }) {
                 style={{ width: 36, height: 36, borderRadius: '50%', border: '2px solid #DC2626',
                   background: '#FEE2E2', color: '#DC2626', fontSize: 15, fontWeight: 800,
                   cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                ✕
+                ×
               </button>
               <span style={{ fontSize: 9, color: '#DC2626', fontWeight: 700, whiteSpace: 'nowrap' }}>
                 กดอีกครั้ง
@@ -886,7 +999,7 @@ function LotPopup({ data, onClose }) {
                   onClose()
                 }
               }}>
-              ✕
+              ×
             </button>
           )}
         </div>
@@ -895,19 +1008,35 @@ function LotPopup({ data, onClose }) {
           {/* ── Info box ─────────────────────────────────── */}
           <div style={{ background: '#EFF6FF', borderRadius: 10, padding: 12, marginBottom: 14 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}>
-              <span style={{ color: 'var(--txt2)' }}>Stock คงเหลือ</span>
+              <span style={{ color: 'var(--txt2)' }}>Stock คงเหลือ{lockedWh ? ` · ${whName(lockedWh)}` : ''}</span>
               <span style={{ fontWeight: 700, fontFamily: 'Prompt' }}>{qty} {item.unitUse}</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}>
               <span style={{ color: 'var(--txt2)' }}>จำนวน Lot</span>
-              <span style={{ fontWeight: 700 }}>{sortedLots.length} Lot</span>
+              <span style={{ fontWeight: 700 }}>{displayLots.length} Lot</span>
             </div>
-            {warnLots.length > 0 && (
+            {warnCount > 0 && (
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
-                <span style={{ color: '#D97706' }}>Lot ใกล้หมดอายุ</span>
-                <span style={{ fontWeight: 700, color: '#D97706' }}>{warnLots.length} Lot ⚠️</span>
+                <span style={{ fontWeight: 700, color: '#EA580C' }}>Lot ใกล้หมดอายุ</span>
+                <span style={{ fontWeight: 700, color: '#EA580C' }}>{warnCount} Lot ⚠️</span>
               </div>
             )}
+            {/* ⚠️ LOT drift — ยอด LOT ที่คลังนี้ไม่ตรงยอดจริง → ชี้ให้ Owner ไปกดซ่อมใน ตั้งค่า */}
+            {lockedWh && (() => {
+              const lotHere = lots.reduce((s, l) => {
+                if (l.locationQty && typeof l.locationQty === 'object') return s + (Number(l.locationQty[lockedWh]) || 0)
+                if (l.warehouseId === lockedWh) return s + (Number(l.inWarehouse) || 0)
+                return s
+              }, 0)
+              if (Math.abs(lotHere - qty) < 0.001) return null
+              return (
+                <div style={{ marginTop: 6, padding: '6px 10px', background: '#FEF3C7',
+                  border: '1px solid #FDE68A', borderRadius: 8, fontSize: 11, color: '#92400E', lineHeight: 1.5 }}>
+                  ⚠️ ยอด LOT ที่{whName(lockedWh)} ({lotHere}) ไม่ตรงยอดจริง ({qty} {item.unitUse})
+                  — ซ่อมได้ที่ ตั้งค่า → 🧩 ปรับ LOT ให้ตรงสต็อก
+                </div>
+              )
+            })()}
             {/* EXP Legend */}
             <div style={{ marginTop: 10, paddingTop: 8, borderTop: '1px solid #DBEAFE',
               display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -939,15 +1068,81 @@ function LotPopup({ data, onClose }) {
             )}
           </div>
 
-          {/* ── เพิ่ม LOT (Owner/Editor) ─────────── */}
+          {/* ── เพิ่ม LOT + รวม LOT (Owner/Editor) ─────────── */}
           {canEdit && !addOpen && (
-            <button onClick={startAddLot}
-              style={{ width: '100%', padding: '10px 14px', border: '2px dashed var(--red)',
-                borderRadius: 12, background: 'var(--red-p)', color: 'var(--red)',
-                fontSize: 13, fontWeight: 700, cursor: 'pointer', marginBottom: 12 }}>
-              ➕ เพิ่ม LOT
-            </button>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              {!mergeMode && (
+                <button onClick={startAddLot}
+                  style={{ flex: 1, padding: '10px 14px', border: '2px dashed var(--red)',
+                    borderRadius: 12, background: 'var(--red-p)', color: 'var(--red)',
+                    fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
+                  ➕ เพิ่ม LOT
+                </button>
+              )}
+              {displayLots.length >= 2 && (
+                <button onClick={toggleMergeMode}
+                  style={{ flex: 1, padding: '10px 14px',
+                    border: mergeMode ? '2px solid #0284C7' : '2px dashed #0284C7',
+                    borderRadius: 12, background: mergeMode ? '#E0F2FE' : '#F0F9FF',
+                    color: '#0284C7', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
+                  {mergeMode ? '✕ ยกเลิกโหมดรวม' : '🔀 รวม LOT'}
+                </button>
+              )}
+            </div>
           )}
+
+          {/* ── แผงรวม LOT ─────────────────────── */}
+          {mergeMode && (() => {
+            const selLots = mergeSel.map(id => lots.find(l => l.id === id)).filter(Boolean)
+            const sumQty  = selLots.reduce((s, l) => s + getLotQty(l), 0)
+            return (
+              <div style={{ background: '#F0F9FF', border: '2px solid #7DD3FC',
+                borderRadius: 12, padding: 14, marginBottom: 14 }}>
+                <div style={{ fontWeight: 700, color: '#0369A1', fontSize: 13, marginBottom: 4 }}>
+                  🔀 รวม LOT เป็นใบเดียว
+                </div>
+                <div style={{ fontSize: 11, color: '#0C4A6E', lineHeight: 1.5 }}>
+                  แตะการ์ด LOT ด้านล่างเพื่อเลือก (อย่างน้อย 2 LOT · ต้องอยู่คลังเดียวกัน · เฉพาะ LOT แม่)
+                  — ยอดจะถูกบวกรวม แล้ว LOT ที่เหลือถูกยุบทิ้ง
+                </div>
+                {selLots.length > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: '#0369A1' }}>
+                    เลือกแล้ว {selLots.length} LOT · รวม {sumQty} {item.unitUse}
+                  </div>
+                )}
+                {selLots.length >= 2 && (
+                  <>
+                    <div style={{ marginTop: 10, fontSize: 11, fontWeight: 700, color: '#0C4A6E' }}>
+                      ใช้ข้อมูล (Lot No. / วันที่รับ / EXP) ของ:
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
+                      {selLots.map(l => (
+                        <label key={l.id} style={{ display: 'flex', alignItems: 'center', gap: 8,
+                          padding: '8px 10px',
+                          background: mergePrimary === l.id ? '#E0F2FE' : 'var(--bg)',
+                          border: `1.5px solid ${mergePrimary === l.id ? '#38BDF8' : 'var(--border)'}`,
+                          borderRadius: 8, cursor: 'pointer', fontSize: 12 }}>
+                          <input type="radio" checked={mergePrimary === l.id}
+                            onChange={() => setMergePrimary(l.id)} />
+                          <span style={{ fontWeight: 700 }}>LOT {getLotDisplay(l)}</span>
+                          <span style={{ color: 'var(--txt3)', fontSize: 11 }}>
+                            {getLotQty(l)} {item.unitUse} · EXP {formatDateDDMMYY(l.expDate) || '-'}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <button onClick={confirmMerge} disabled={saving}
+                      style={{ width: '100%', marginTop: 10, padding: '10px 16px', border: 'none',
+                        borderRadius: 10, background: saving ? 'var(--border2)' : '#0284C7',
+                        color: '#fff', fontSize: 13, fontWeight: 700,
+                        cursor: saving ? 'wait' : 'pointer' }}>
+                      {saving ? '⏳ กำลังรวม...' : `✅ รวม ${selLots.length} LOT (${sumQty} ${item.unitUse})`}
+                    </button>
+                  </>
+                )}
+              </div>
+            )
+          })()}
           {addOpen && (
             <div style={{ background: '#F0FDF4', border: '2px solid #86EFAC',
               borderRadius: 12, padding: 14, marginBottom: 14,
@@ -956,7 +1151,7 @@ function LotPopup({ data, onClose }) {
                 <span style={{ fontWeight: 700, color: '#15803D' }}>📦 เพิ่ม LOT ใหม่</span>
                 <button onClick={() => { setAddOpen(false); setError('') }}
                   style={{ border: 'none', background: 'transparent', cursor: 'pointer',
-                    fontSize: 18, color: '#6B7280' }}>✕</button>
+                    fontSize: 18, color: '#6B7280' }}>×</button>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <div>
@@ -996,7 +1191,7 @@ function LotPopup({ data, onClose }) {
                 </div>
                 <div>
                   <label style={{ fontSize: 10, color: 'var(--txt3)', fontWeight: 600 }}>จำนวน ({item.unitUse}) *</label>
-                  <input type="number" value={addDraft.qty}
+                  <input type="number" inputMode="decimal" value={addDraft.qty}
                     onChange={e => setAddDraft(d => ({ ...d, qty: e.target.value }))}
                     placeholder="0"
                     style={{ width: '100%', padding: '6px 10px', borderRadius: 8,
@@ -1050,7 +1245,7 @@ function LotPopup({ data, onClose }) {
             </div>
           )}
 
-          {sortedLots.length === 0 && !addOpen && (
+          {displayLots.length === 0 && !addOpen && (
             <div style={{ background: '#FFF7ED', border: '1px solid #FDE68A', borderRadius: 12,
               padding: '16px 14px', textAlign: 'center', color: '#92400E', fontSize: 13 }}>
               ยังไม่มี LOT สำหรับรายการนี้
@@ -1060,13 +1255,21 @@ function LotPopup({ data, onClose }) {
             </div>
           )}
 
-          {sortedLots.map((lot, idx) => {
+          {displayLots.map((lot, idx) => {
             const isEditing = editingId === lot.id
             const exp       = getExpStatus(lot.expDate || '', thr)
-            const bd        = getLocationBreakdown(lot)
-            const usedQty   = getUsed(lot)
-            const totalQty  = getLotQty(lot)
+            const isFamily  = !!lot._familyBd
+            const bd        = isFamily ? lot._familyBd : getLocationBreakdown(lot)
+            const docQty    = getLotQty(lot)              // ยอดของ doc นี้เอง — ใช้กับ แก้ไข/แบ่ง/ลบ
+            const totalQty  = isFamily ? lot._familyTotal : docQty
             const lotDisplay = getLotDisplay(lot)
+            const activeQty = Object.values(bd).reduce((s, v) => s + v, 0)
+            // การ์ดรวมครอบครัว: เห็นคงเหลือครบทุกคลัง → ที่หาย = ใช้จริง (ไม่มีก้อน "โอนออก" เพราะโอนคือย้ายภายในครอบครัว)
+            // การ์ดคลังเดียว: สมการ totalQty = คงเหลือ + used (field จริงจาก FIFO consume) + โอนออกไปคลังอื่น
+            const usedQty = isFamily
+              ? Math.max(0, totalQty - activeQty)
+              : Math.min(Number(lot.used) || 0, Math.max(0, totalQty - activeQty))
+            const transferredQty = isFamily ? 0 : Math.max(0, totalQty - activeQty - usedQty)
 
             const cardBg = exp.status === 'expired' || exp.status === 'danger' ? '#FFF5F5'
                          : exp.status === 'warning' ? '#FFFBEB'
@@ -1077,13 +1280,30 @@ function LotPopup({ data, onClose }) {
                              : isEditing ? '1px solid #86EFAC'
                              : '1px solid var(--border)'
 
+            // 🔀 โหมดรวม LOT — เลือกได้เฉพาะ LOT แม่ที่คลังเดียวกับใบแรกที่เลือก
+            const isMergeSel = mergeSel.includes(lot.id)
+            const mergeWhLock = mergeSel.length > 0
+              ? (lots.find(l => l.id === mergeSel[0])?.warehouseId || '') : null
+            const isMergeable = mergeMode && !lot.parentLotId &&
+              (mergeWhLock === null || isMergeSel || mergeWhLock === (lot.warehouseId || ''))
+
             return (
-              <div key={lot.id} style={{ marginBottom: 14, background: cardBg,
-                borderRadius: 12, padding: 12, border: cardBorder, transition: 'all .2s' }}>
+              <div key={lot.id}
+                onClick={mergeMode && isMergeable ? () => toggleMergeSelect(lot) : undefined}
+                style={{ marginBottom: 14,
+                  background: isMergeSel ? '#F0F9FF' : cardBg,
+                  borderRadius: 12, padding: 12,
+                  border: isMergeSel ? '2px solid #38BDF8' : cardBorder,
+                  opacity: mergeMode && !isMergeable ? 0.4 : 1,
+                  cursor: mergeMode && isMergeable ? 'pointer' : 'default',
+                  transition: 'all .2s' }}>
 
                 {/* ── Card Header ─────────────────────── */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    {mergeMode && isMergeable && (
+                      <span style={{ fontSize: 16, lineHeight: 1 }}>{isMergeSel ? '☑️' : '⬜'}</span>
+                    )}
                     <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 14 }}>
                       LOT {lotDisplay}
                     </span>
@@ -1092,17 +1312,32 @@ function LotPopup({ data, onClose }) {
                       <span style={{ background: '#DCFCE7', color: '#166534', fontSize: 9, fontWeight: 700,
                         padding: '2px 6px', borderRadius: 6 }}>FIFO ออกก่อน</span>
                     )}
-                    {/* Sub-lot badge */}
-                    {lot.parentLotId && (
+                    {/* Sub-lot badge (เฉพาะการ์ดคลังเดียว — การ์ดรวมครอบครัวไม่ใช่ sub-lot) */}
+                    {!isFamily && lot.parentLotId && (
                       <span style={{ background: '#EDE9FE', color: '#7C3AED', fontSize: 9, fontWeight: 700,
                         padding: '2px 6px', borderRadius: 6 }}>✂️ Sub-lot {lot.subLotSuffix || ''}</span>
+                    )}
+                    {/* Family badge — การ์ดนี้รวม LOT แม่+ลูกหลายคลัง */}
+                    {isFamily && lot._familyCount > 1 && (
+                      <span style={{ background: '#E0F2FE', color: '#0369A1', fontSize: 9, fontWeight: 700,
+                        padding: '2px 6px', borderRadius: 6 }}>🔗 รวม {lot._familyCount} คลัง</span>
                     )}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <span style={{ fontFamily: 'Prompt', fontWeight: 700, fontSize: 14 }}>
                       {totalQty} {item.unitUse}
+                      {(() => {
+                        // วงเล็บหน่วยใหญ่ (สีเทา) — เช่น "64 ถุง (4 ลัง)" · โชว์เมื่อถึงอย่างน้อย 1 หน่วยใหญ่
+                        const f = parseConvFactor(item.unitConversion)
+                        if (!(f > 1) || !item.unitBase || item.unitBase === item.unitUse || totalQty < f) return null
+                        return (
+                          <span style={{ fontWeight: 500, fontSize: 11, color: 'var(--txt3)', marginLeft: 4 }}>
+                            ({formatStockQty(totalQty, item)})
+                          </span>
+                        )
+                      })()}
                     </span>
-                    {canEdit && !isEditing && (
+                    {canEdit && !isEditing && !mergeMode && (
                       <button onClick={() => startEdit(lot)}
                         style={{ border: 'none', background: '#EFF6FF', borderRadius: 8,
                           padding: '4px 10px', fontSize: 12, color: '#2563EB',
@@ -1132,17 +1367,17 @@ function LotPopup({ data, onClose }) {
                 {/* ── Location breakdown chips ────────── */}
                 {!isEditing && (
                   <LocationChips
-                    bd={bd} usedQty={usedQty} totalQty={totalQty}
+                    bd={bd} usedQty={usedQty} transferredQty={transferredQty} totalQty={totalQty}
                     unitUse={item.unitUse}
                     whName={whName} whColor={whColor} whBg={whBg}
                   />
                 )}
 
-                {/* ── 🔗 LOT Family (Smart Link) ────────── */}
-                {!isEditing && (() => {
-                  // หา family: LOT แม่ + ลูกทั้งหมด
+                {/* ── 🔗 LOT Family (Smart Link) — เฉพาะการ์ดคลังเดียว (การ์ดรวมมีข้อมูลครบแล้ว) ── */}
+                {!isEditing && !isFamily && (() => {
+                  // หา family: LOT แม่ + ลูกทั้งหมด (ใช้ lots ทั้งหมด ไม่ใช่ scoped — เพื่อเห็นว่าโอนไปคลังอื่นเท่าไร)
                   const rootId = lot.parentLotId || lot.id
-                  const family = sortedLots.filter(l =>
+                  const family = lots.filter(l =>
                     l.id === rootId || l.parentLotId === rootId
                   )
                   if (family.length <= 1) return null   // ไม่มี LOT ลูก/ไม่ใช่ลูก → ข้าม
@@ -1205,9 +1440,9 @@ function LotPopup({ data, onClose }) {
                     draft={editDraft}
                     setDraft={setEditDraft}
                     lot={lot}
-                    totalQty={totalQty}
+                    totalQty={docQty}
                     saving={saving}
-                    isOwner={role === 'owner'}
+                    isOwner={canManage}
                     onCancel={cancelEdit}
                     onSave={() => saveEdit(lot)}
                     onSplit={() => openSplit(lot)}
@@ -1223,7 +1458,7 @@ function LotPopup({ data, onClose }) {
                         🗑️ ยืนยันลบ LOT นี้?
                       </div>
                       <div style={{ fontSize: 12, color: '#7F1D1D' }}>
-                        <strong>LOT {getLotDisplay(lot)}</strong> · {totalQty} {item.unitUse}
+                        <strong>LOT {getLotDisplay(lot)}</strong> · {docQty} {item.unitUse}
                       </div>
                       <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 4 }}>
                         การลบจะบันทึกใน Audit Log และไม่สามารถกู้คืนได้
@@ -1252,7 +1487,7 @@ function LotPopup({ data, onClose }) {
                   <SplitForm
                     draft={splitDraft}
                     setDraft={setSplitDraft}
-                    totalQty={totalQty}
+                    totalQty={docQty}
                     unitUse={item.unitUse}
                     saving={saving}
                     onCancel={() => setSplitOpen(false)}
@@ -1269,9 +1504,9 @@ function LotPopup({ data, onClose }) {
 }
 
 /* ── Location Chips Component ────────────────────────────────── */
-function LocationChips({ bd, usedQty, totalQty, unitUse, whName, whColor, whBg }) {
+function LocationChips({ bd, usedQty, transferredQty = 0, totalQty, unitUse, whName, whColor, whBg }) {
   const locations = Object.entries(bd).filter(([, q]) => q > 0)
-  if (locations.length === 0 && usedQty === 0) return null
+  if (locations.length === 0 && usedQty === 0 && transferredQty === 0) return null
 
   // scale dots: max 24 total
   const maxDots = 24
@@ -1296,6 +1531,12 @@ function LocationChips({ bd, usedQty, totalQty, unitUse, whName, whColor, whBg }
                 boxShadow: `0 0 0 1.5px ${color}33` }} />
           ))
         })}
+        {transferredQty > 0 && Array.from({ length: Math.max(1, Math.round(transferredQty * scale)) }).map((_, i) => (
+          <div key={`xfer-${i}`}
+            style={{ width: 10, height: 10, borderRadius: '50%',
+              background: '#DBEAFE', flexShrink: 0,
+              border: '1.5px solid #93C5FD' }} />
+        ))}
         {usedQty > 0 && Array.from({ length: Math.max(1, Math.round(usedQty * scale)) }).map((_, i) => (
           <div key={`used-${i}`}
             style={{ width: 10, height: 10, borderRadius: '50%',
@@ -1314,6 +1555,12 @@ function LocationChips({ bd, usedQty, totalQty, unitUse, whName, whColor, whBg }
             </span>
           </div>
         ))}
+        {transferredQty > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3B82F6' }} />
+            <span style={{ fontSize: 10, color: '#2563EB', fontWeight: 600 }}>โอนออกแล้ว ({transferredQty})</span>
+          </div>
+        )}
         {usedQty > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
             <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#9CA3AF' }} />
@@ -1566,11 +1813,7 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
     const m = conv.match(/=\s*([\d.]+)/)
     return m ? Number(m[1]) || 1 : (Number(item?.convBuyToUse) || 1)
   })()
-  const toQtyUse = (q, unit) => {
-    const n = Math.abs(Number(q) || 0)
-    if (unit && item?.unitBase && unit === item.unitBase) return n * factor
-    return n  // already unitUse
-  }
+  const toQtyUse = (q, unit) => qtyToUse(Math.abs(Number(q) || 0), unit, item)  // รองรับหน่วยหลายชั้น
 
   // ─── รวมเหตุการณ์ทั้งหมด ───
   // กฎ dedupe: stock_movements ที่ type=cut/waste จะถูก SKIP เพราะ cut_logs/waste_logs มีข้อมูลละเอียดกว่า
@@ -1587,6 +1830,9 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
     const ts = w.timestamp?.seconds || 0
     if (ts) dedupKeySet.add(`waste|${ts}|${w.warehouseId || ''}`)
   })
+
+  // lookup ใบโอน (Inv_transfers) ตาม tf.id — ใช้ createdBy/receivedBy ของจริงมาโชว์คู่กับ movement log เก่าที่ไม่มี field นี้
+  const tfById = new Map(transfers.map(({ tf }) => [tf.id, tf]))
 
   // 1. stock_movements (รับ, โอน, ปรับยอด, สร้าง LOT)
   movements.forEach(m => {
@@ -1628,6 +1874,18 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
     }
     // qUse สำหรับ math running balance — ใช้ qtyUse เสมอ
     const qUse = hasUse ? absQtyUse : toQtyUse(m.qty || 0, m.unit)
+    // ใบโอน — โชว์ทั้งผู้สร้างใบโอน (นำส่ง) และผู้กดรับ เพื่อรู้ว่าใครโอนใครรับ
+    // ดึงจาก field ใหม่บน movement ก่อน · ถ้าไม่มี (log เก่า) → lookup จากใบโอนจริงใน Inv_transfers
+    const isTransferMv = m.type === 'transfer_send' || m.type === 'transfer_recv'
+    const relatedTf = isTransferMv && m.transferTfId ? tfById.get(m.transferTfId) : null
+    const creatorNm  = m.createdByName  || relatedTf?.createdBy  || ''
+    const receiverNm = m.receivedByName || relatedTf?.receivedBy || m.staffName || ''
+    const staffName = (isTransferMv && creatorNm && receiverNm && creatorNm !== receiverNm)
+      ? `${creatorNm} → ${receiverNm}`
+      : (receiverNm || m.staffName || m.adjustBy || '-')
+    // เวลานำส่ง (สร้างใบโอน) vs เวลารับ — movement.timestamp คือเวลากดรับจริงเสมอ
+    const createdTs  = isTransferMv ? (relatedTf?.createdAt?.seconds || 0) : 0
+    const receivedTs = isTransferMv ? (relatedTf?.receivedAt?.seconds || ts) : 0
     events.push({
       id: 'mv_' + m.id, ts, type: m.type, meta,
       qty: displayQ,
@@ -1636,7 +1894,8 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
       delta: meta.delta * qUse,
       unit: displayU,
       whId: m.warehouseId || '',
-      whName, staffName: m.staffName || m.adjustBy || '-',
+      whName, staffName,
+      createdTs, receivedTs,
       note: m.note || m.adjustReason || '',
     })
   })
@@ -1678,11 +1937,21 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
       const m = conv.match(/=\s*([\d.]+)/)
       return m ? Number(m[1]) || 1 : 1
     })()
-    const qtyIn = parseFloat(it.qty) || 0
-    const qUse = (it.unit && itemMeta?.unitBase && it.unit === itemMeta.unitBase)
-      ? qtyIn * factor : qtyIn
+    // ยอดที่ขยับจริง — ใบที่รับแล้วใช้ receivedQty (รับไม่ครบ/0) · ใบเก่า/ยังไม่รับ → it.qty
+    const movedRaw = (tf.status === 'received' && it.receivedQty != null)
+      ? (parseFloat(it.receivedQty) || 0)
+      : (parseFloat(it.qty) || 0)
+    if (movedRaw <= 0) return   // รับ 0 / ไม่ได้โอนมา → ไม่ขึ้นในประวัติ
+    const qtyIn = movedRaw
+    const qUse = qtyToUse(qtyIn, it.unit, itemMeta)
     const fromMeta = { icon: '🚚', label: 'นำส่งโอน', color: '#0369A1', bg: '#E0F2FE', delta: -1 }
     const toMeta   = { icon: '📦', label: 'รับโอน',  color: '#16A34A', bg: '#DCFCE7', delta: +1 }
+    // ใบโอน — โชว์ทั้งผู้สร้างใบโอน (นำส่ง) และผู้กดรับ เพื่อรู้ว่าใครโอนใครรับ
+    const tfStaffName = (tf.receivedBy && tf.createdBy && tf.receivedBy !== tf.createdBy)
+      ? `${tf.createdBy} → ${tf.receivedBy}`
+      : (tf.receivedBy || tf.createdBy || '-')
+    const createdTs  = tf.createdAt?.seconds || 0
+    const receivedTs = tf.receivedAt?.seconds || 0
     // ฝั่งต้นทาง — ลด
     events.push({
       id: `tf_s_${tf.id}`, ts, type: 'transfer_send', meta: fromMeta,
@@ -1691,7 +1960,8 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
       unit: it.unit || '',
       whId: tf.fromWarehouseId || '',
       whName: tf.fromWarehouseName || warehouses.find(w => w.id === tf.fromWarehouseId)?.name || '',
-      staffName: tf.createdBy || '-',
+      staffName: tfStaffName,
+      createdTs, receivedTs,
       note: `ใบโอน ${tf.tfRef || tf.id} → ${tf.toWarehouseName || ''}`,
     })
     // ฝั่งปลายทาง — เพิ่ม
@@ -1702,7 +1972,8 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
       unit: it.unit || '',
       whId: tf.toWarehouseId || '',
       whName: tf.toWarehouseName || warehouses.find(w => w.id === tf.toWarehouseId)?.name || '',
-      staffName: tf.receivedBy || tf.createdBy || '-',
+      staffName: tfStaffName,
+      createdTs, receivedTs,
       note: `ใบโอน ${tf.tfRef || tf.id} ← ${tf.fromWarehouseName || ''}`,
     })
   })
@@ -1803,6 +2074,29 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
     const mn = String(d.getMinutes()).padStart(2,'0')
     return `${dd}/${mm}/${yy} ${hh}:${mn}`
   }
+  function fmtDateOnly(ts) {
+    if (!ts) return '-'
+    const d = new Date(ts * 1000)
+    const dd = String(d.getDate()).padStart(2,'0')
+    const mm = String(d.getMonth()+1).padStart(2,'0')
+    const yy = (d.getFullYear() + 543).toString().slice(-2)
+    return `${dd}/${mm}/${yy}`
+  }
+  function fmtTimeOnly(ts) {
+    if (!ts) return null
+    const d = new Date(ts * 1000)
+    const hh = String(d.getHours()).padStart(2,'0')
+    const mn = String(d.getMinutes()).padStart(2,'0')
+    return `${hh}:${mn}`
+  }
+  // ใบโอน — โชว์เวลาส่ง/เวลารับคู่กัน เช่น "12:57 / 14:51 (ที่รับ)"
+  function fmtTransferTime(e) {
+    const isTf = e.type === 'transfer_send' || e.type === 'transfer_recv'
+    const t1 = isTf ? fmtTimeOnly(e.createdTs) : null
+    const t2 = isTf ? fmtTimeOnly(e.receivedTs) : null
+    if (t1 && t2 && t1 !== t2) return `${fmtDateOnly(e.ts)} ${t1} / ${t2} (ที่รับ)`
+    return fmtTime(e.ts)
+  }
 
   return (
     <div onClick={bounceX} onTouchStart={bounceX} onPointerDown={bounceX}
@@ -1836,7 +2130,7 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
           </div>
           <button onClick={onClose} aria-label="ปิด" className="popup-x-btn"
             onAnimationEnd={() => setXBounce(false)}
-            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>✕</button>
+            style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}>×</button>
         </div>
 
         {/* Filter pills — 3 col × 2 row grid (สวย เท่ากันหมด) */}
@@ -1895,7 +2189,7 @@ function ItemHistoryPopup({ item, warehouses = [], currentScope = '', onClose })
                 </div>
                 <div style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>
                   👤 <b style={{ color: '#374151' }}>{e.staffName}</b>
-                  <span style={{ marginLeft: 8 }}>🕐 {fmtTime(e.ts)}</span>
+                  <span style={{ marginLeft: 8 }}>🕐 {fmtTransferTime(e)}</span>
                 </div>
                 {e.note && (
                   <div style={{ fontSize: 10, color: '#9CA3AF', marginTop: 2,

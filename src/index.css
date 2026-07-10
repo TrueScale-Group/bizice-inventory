@@ -62,9 +62,8 @@ html, body, #root {
 
 /* ── App TopBar (shared, Daily Income style) ── */
 .app-topbar {
-  background: rgba(255,255,255,0.97);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
+  background: #fff;   /* ทึบ — เลิกใช้ backdrop-filter: iOS WebKit วาด layer backdrop-filter ทับ popup
+                         (fixed z-index สูงกว่าก็ยังโดน) → เนื้อหา popup ทะลุขึ้นใต้แถบหัว */
   border-bottom: 1px solid var(--border);
   box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.05);
   padding: env(safe-area-inset-top) .85rem 0;
@@ -150,6 +149,41 @@ html, body, #root {
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* ── Branch strip — mobile only, sticky ใต้ AppTopBar ── */
+.branch-strip {
+  display: flex;
+  align-items: center;
+  padding: 6px 14px;
+  background: var(--surf);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+@media (min-width: 900px) {
+  .branch-strip { display: none; }
+}
+
+/* ── Branch switch overlay — แบบ Maintenance: เบลอเฉพาะพื้นที่ content + ไอคอน refresh หมุน ── */
+.branch-switch-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  background: rgba(255,255,255,0.72);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: bsoFade .14s ease;
+}
+.branch-switch-spinner {
+  width: 28px;
+  height: 28px;
+  color: var(--red);
+  animation: branchSpin .8s linear infinite;
+}
+@keyframes branchSpin { to { transform: rotate(360deg); } }
+@keyframes bsoFade { from { opacity: 0; } to { opacity: 1; } }
 
 /* ── Page sub-header (sticky, below app topbar) ── */
 .page-subbar {
@@ -329,16 +363,17 @@ html, body, #root {
   margin: 0 1rem;
   display: flex;
   align-items: center;
-  background: #F2F2F7;
-  border: 1px solid transparent;
+  /* พื้นขาว + ขอบแดง + เงา ค้างไว้ตลอด (เหมือนตอนกำลังจะกรอก) */
+  background: #fff;
+  border: 1px solid rgba(227,30,36,.4);
   border-radius: 12px;
   padding: 0 8px 0 36px;
+  box-shadow: 0 0 0 4px rgba(227,30,36,.08);
   transition: all .15s;
 }
 .search-wrap:focus-within {
-  background: #fff;
-  border-color: rgba(227,30,36,.4);
-  box-shadow: 0 0 0 4px rgba(227,30,36,.08);
+  border-color: rgba(227,30,36,.6);
+  box-shadow: 0 0 0 4px rgba(227,30,36,.14);
 }
 .search-input {
   flex: 1;
@@ -442,11 +477,14 @@ html, body, #root {
   position: fixed;
   inset: 0;
   background: rgba(0,0,0,0.45);
-  z-index: 50;
+  z-index: 100;   /* เหนือ .app-topbar (50) แต่ต่ำกว่า popup ที่เด้งเหนือ Modal (transfer/receive confirm 300–400) */
   display: flex;
   align-items: center;      /* กึ่งกลางแนวตั้ง */
   justify-content: center;  /* กึ่งกลางแนวนอน */
-  padding: 16px 12px calc(58px + env(safe-area-inset-bottom));
+  padding: calc(16px + env(safe-area-inset-top))
+           calc(12px + env(safe-area-inset-right))
+           calc(58px + env(safe-area-inset-bottom))
+           calc(12px + env(safe-area-inset-left));   /* iOS: กัน notch บังตอนแนวนอน */
 }
 .modal-backdrop input,
 .modal-backdrop textarea,
@@ -486,7 +524,7 @@ html, body, #root {
   font-size: 16px;
   font-weight: 700;
 }
-/* ── Unified popup close (✕) — สีแดงทุกที่ ── */
+/* ── Unified popup close (×) — สีแดงทุกที่ ── */
 .sheet-close,
 .popup-x-btn {
   width: 32px; height: 32px;
@@ -494,12 +532,18 @@ html, body, #root {
   background: #FEE2E2;
   border: 1px solid rgba(220,38,38,.22);
   cursor: pointer;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 700;
+  line-height: 1;                 /* iOS: กัน glyph เลื่อน/ถูก clip */
+  /* iOS Safari PWA: บังคับฟอนต์ระบบที่มี glyph × แน่ ๆ (Sarabun/Prompt ไม่มี dingbat) */
+  font-family: -apple-system, system-ui, 'Segoe UI Symbol', sans-serif;
+  -webkit-appearance: none;       /* iOS: ปิด native button styling ที่บัง content */
+  appearance: none;
   display: flex;
   align-items: center;
   justify-content: center;
   color: #DC2626;
+  -webkit-text-fill-color: #DC2626;  /* iOS: บางเคสต้องบังคับสีตัวอักษรซ้ำ */
   flex-shrink: 0;
   transition: transform .12s, background .15s;
 }
@@ -743,7 +787,7 @@ html, body, #root {
 /* ── Toast ── */
 .toast {
   position: fixed;
-  top: 64px;
+  top: calc(64px + env(safe-area-inset-top));   /* iOS: กัน notch บัง */
   left: 50%;
   transform: translateX(-50%);
   background: #1A1A1A;
@@ -764,13 +808,16 @@ html, body, #root {
   border: 1.5px solid var(--border2);
   border-radius: 10px;
   padding: 10px 12px;
-  font-size: 14px;
+  font-size: 16px;          /* iOS: ต้อง ≥16px ไม่งั้น Safari auto-zoom ตอนโฟกัส */
   font-family: 'Sarabun', sans-serif;
   background: var(--surf);
   outline: none;
   color: var(--txt);
   transition: border-color 0.15s;
 }
+/* iOS: บังคับทุก input/select/textarea = 16px กันหน้าจอซูมตอนแตะ
+   ใช้ !important เพราะ inline style (date/number บางตัวตั้ง 12–14px) จะ override CSS ปกติ */
+input, select, textarea { font-size: 16px !important; }
 .fi:focus { border-color: var(--red); box-shadow: 0 0 0 3px rgba(227,30,36,0.1); }
 .fi-label { font-size: 12px; font-weight: 700; color: var(--txt2); margin-bottom: 5px; display: block; }
 
@@ -847,7 +894,8 @@ html, body, #root {
   border: 5px solid transparent; border-bottom-color: #1F2937;
 }
 .setting-info:hover .setting-tip,
-.setting-info:focus .setting-tip { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
+.setting-info:focus .setting-tip,
+.setting-info.tip-open .setting-tip { opacity: 1; visibility: visible; transform: translate(-50%, 0); }  /* tip-open = แตะ ⓘ บน iOS (ไม่มี hover) */
 .setting-arrow { color: var(--txt3); font-size: 14px; }
 
 /* Flip card (Warehouse detail) */
@@ -938,6 +986,7 @@ html, body, #root {
 }
 @media (min-width: 900px) {
   .desk-content-bar { display: flex !important; }
+  .desk-hide { display: none !important; }
 }
 
 /* ═══════════════════════════════════════════════
@@ -1066,9 +1115,17 @@ html, body, #root {
   color: #fff;
   flex-shrink: 0;
 }
-.dsb-user-name { font-size: 12.5px; font-weight: 700; color: var(--txt); }
-.dsb-user-role { font-size: 10px; color: var(--txt3); }
-.dsb-date { margin-left: auto; font-size: 10.5px; color: var(--txt3); font-weight: 500; }
+.dsb-user-name { font-size: 12.5px; font-weight: 700; color: var(--txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsb-user-role { font-size: 10px; color: var(--txt3); margin-top: 1px; }
+/* ปุ่ม refresh ใน footer — สไตล์เดียวกับ Cost Manager (sb-refresh-btn) */
+.dsb-refresh-btn {
+  flex-shrink: 0; width: 32px; height: 32px; border-radius: 50%;
+  background: var(--bg); border: 1px solid var(--border); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 15px;
+  transition: background .15s, transform .3s;
+}
+.dsb-refresh-btn:hover  { background: var(--surf); }
+.dsb-refresh-btn:active { transform: rotate(180deg); }
 
 /* ═══════════════════════════════════════════════
    RESPONSIVE — DESKTOP (≥900px)
@@ -1204,7 +1261,7 @@ html, body, #root {
 .notif-bell-wrap { position: relative; flex-shrink: 0; }
 .notif-bell-btn { width: 36px; height: 36px; border-radius: 10px; position: relative; display: flex; align-items: center; justify-content: center; background: var(--bg); border: 1px solid var(--border); font-size: 18px; cursor: pointer; }
 .notif-bell-badge { position: absolute; top: -5px; right: -5px; min-width: 17px; height: 17px; background: var(--red); color: #fff; font-size: 10px; font-weight: 800; border-radius: 9px; border: 2px solid #fff; padding: 0 3px; display: flex; align-items: center; justify-content: center; line-height: 1; }
-.notif-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 200; width: 320px; max-width: calc(100vw - 24px); background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.18); overflow: hidden; }
+.notif-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 200; width: 320px; max-width: calc(100vw - 24px - env(safe-area-inset-right)); background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.18); overflow: hidden; }
 .notif-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 14px; }
 .notif-readall { background: none; border: none; color: var(--red); font-weight: 600; font-size: 12px; cursor: pointer; }
 .notif-panel-list { max-height: 360px; overflow-y: auto; }
@@ -1217,3 +1274,20 @@ html, body, #root {
 .notif-item-text { font-size: 12.5px; color: #444; margin-top: 1px; line-height: 1.4; }
 .notif-item-time { font-size: 11px; color: #999; margin-top: 3px; }
 .notif-item-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; margin-top: 5px; }
+
+/* ── BizICE Splash / loading (มาตรฐานกลาง Hub) ── */
+#splash{position:fixed;inset:0;background:var(--red);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;transition:opacity .5s ease}
+#splash.hide{opacity:0;pointer-events:none}
+#splash.hide{animation:spGone 0s .5s forwards}
+@keyframes spGone{to{display:none;visibility:hidden}}
+.sp-ice{animation:icePop .6s cubic-bezier(.175,.885,.32,1.275) forwards;opacity:0;margin-bottom:12px}
+@keyframes icePop{0%{transform:rotate(-20deg) scale(.3);opacity:0}60%{transform:rotate(10deg) scale(1.12);opacity:1}80%{transform:rotate(-5deg) scale(.97)}100%{transform:rotate(0) scale(1);opacity:1}}
+.sp-name{font-family:'Prompt',sans-serif;font-size:32px;font-weight:600;color:#fff;letter-spacing:1px;animation:spFade .4s .55s ease both;opacity:0}
+.sp-sub{font-size:11px;color:rgba(255,255,255,.6);letter-spacing:.18em;text-transform:uppercase;margin-top:5px;animation:spFade .4s .7s ease both;opacity:0}
+@keyframes spFade{0%{transform:translateY(10px);opacity:0}100%{transform:translateY(0);opacity:1}}
+.sp-dots{display:flex;gap:8px;margin-top:28px;animation:spFade .3s .85s ease both;opacity:0}
+.sp-dot{width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.35)}
+.sp-dot:nth-child(1){animation:dotB .7s .85s ease-in-out infinite}
+.sp-dot:nth-child(2){animation:dotB .7s 1.0s ease-in-out infinite}
+.sp-dot:nth-child(3){animation:dotB .7s 1.15s ease-in-out infinite}
+@keyframes dotB{0%,100%{transform:translateY(0);opacity:.35}45%{transform:translateY(-10px);background:#fff;opacity:1}}

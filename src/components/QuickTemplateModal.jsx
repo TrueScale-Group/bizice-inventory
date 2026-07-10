@@ -6,6 +6,7 @@ import {
 import { Modal } from './Modal'
 import { COL } from '../constants/collections'
 import { beepSuccess } from '../utils/audio'
+import { sortByMaster } from '../utils/sortItems'
 
 /**
  * QuickTemplateModal — Owner only. List + Create/Edit/Delete
@@ -153,7 +154,7 @@ export default function QuickTemplateModal({
                         style={{ flex: 1, padding: '6px 8px', borderRadius: 8,
                           border: '1.5px solid var(--border2)', fontSize: 12 }}>
                         <option value="">-- เลือก --</option>
-                        {items.map(it => <option key={it.id} value={it.id}>{it.img} {it.name}</option>)}
+                        {sortByMaster(items).map(it => <option key={it.id} value={it.id}>{it.img} {it.name}</option>)}
                       </select>
                       <input type="number" value={row.qty}
                         onChange={e => updateItemRow(i, { qty: e.target.value })}

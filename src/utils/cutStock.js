@@ -14,6 +14,7 @@ import {
 import { COL } from '../constants/collections'
 import { convertToBase, balanceId } from './unit'
 import { toDateKey } from './formatDate'
+import { fetchLotsForWarehouse, planFifoConsume, applyFifoConsume, writeLotShortage } from './lotFifo'
 
 /**
  * @param {Object} params
@@ -36,6 +37,8 @@ export async function cutStock({
   const now   = serverTimestamp()
 
   const logItemsFinal = []
+  // โหลด LOT ของคลังครั้งเดียว → หัก FIFO ในคลังเดียว (working copy ลด _avail สะสมข้ามรายการ)
+  const workingLots = await fetchLotsForWarehouse(warehouseId)
 
   for (const cut of cuts) {
     const { itemId, itemName, img, qtyUse, item, costPerUnit = 0 } = cut
@@ -56,6 +59,14 @@ export async function cutStock({
       lastUpdated:   now,
       lastUpdatedBy: staffPhone,
     }, { merge: true })
+
+    // 1b. หัก LOT แบบ FIFO (รับก่อนใช้ก่อน) — atomic ใน batch เดียวกับ balance
+    //     ข้ามถ้า item ปิดระบบ LOT (lotEnabled=false ใน Master Data)
+    if (item.lotEnabled !== false) {
+      const { allocations, shortage } = planFifoConsume(workingLots, { itemId, warehouseId, qtyUse })
+      applyFifoConsume(batch, allocations, warehouseId)
+      if (shortage > 0) writeLotShortage(batch, { itemId, itemName, warehouseId, shortage, unitUse, reasonType: 'ตัดสต็อก', note: shopName || '' })
+    }
 
     // 2. add stock_movements
     const movRef = doc(collection(db, COL.STOCK_MOVEMENTS))
@@ -126,6 +137,9 @@ async function checkLowStockAfterCut(cuts, warehouseId) {
     const balRef = doc(db, COL.STOCK_BALANCES, balanceId(warehouseId, cut.itemId))
     const snap   = await getDoc(balRef)
     if (!snap.exists()) continue
+    // 🔕 ปิดแจ้งเตือนใน Master Data (alertEnabled=false) → ไม่นับ/ไม่บันทึก alert/ไม่ push
+    const itemSnap = await getDoc(doc(db, COL.ITEMS, cut.itemId))
+    if (itemSnap.exists() && itemSnap.data().alertEnabled === false) continue
     const { qty, minQty } = snap.data()
     if (qty <= (minQty || 0)) {
       const status = qty <= 0 ? 'out' : 'low'

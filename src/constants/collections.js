@@ -23,6 +23,7 @@ export const COL = {
   APP_SETTINGS:     'Inv_settings',
   PUSH_QUEUE:       'Inv_push_queue',
   REFILL_REQUESTS:  'Inv_refill_requests',
+  PURCHASE_ORDERS:  'Inv_purchase_orders',   // สั่งซื้อจาก supplier → คลังกลาง (2-step)
 
   // ─── Cross-app (read-only, ไม่เปลี่ยน prefix) ──────────────────────────────
   MIXUE_DATA:       'mixue_data',       // Cost Manager owns this

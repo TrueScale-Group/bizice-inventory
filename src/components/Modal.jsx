@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from 'react'
  */
 export function Modal({ open, onClose, title, children, footer, lockClose = false }) {
   const [xBounce, setXBounce] = useState(false)
+  const closeRef = useRef(onClose); closeRef.current = onClose
 
   useEffect(() => {
     if (open) document.body.style.overflow = 'hidden'
@@ -22,10 +23,19 @@ export function Modal({ open, onClose, title, children, footer, lockClose = fals
     return () => { document.body.style.overflow = '' }
   }, [open])
 
+  // 🔙 ลงทะเบียนให้ปุ่ม back มือถือ "ปิด popup นี้ก่อน" (กันหลุดออกแอป/หน้าขาว)
+  useEffect(() => {
+    if (!open) return
+    const closer = () => { try { closeRef.current?.() } catch {} }
+    const stack = (window.__invBackStack = window.__invBackStack || [])
+    stack.push(closer)
+    return () => { const i = stack.indexOf(closer); if (i >= 0) stack.splice(i, 1) }
+  }, [open])
+
   if (!open) return null
 
   function blockEvent(e) {
-    // ป้องกัน backdrop ปิด modal + bounce ✕ เรียกความสนใจ
+    // ป้องกัน backdrop ปิด modal + bounce × เรียกความสนใจ
     e.stopPropagation()
     e.preventDefault()
     setXBounce(false)
@@ -55,7 +65,7 @@ export function Modal({ open, onClose, title, children, footer, lockClose = fals
             onAnimationEnd={() => setXBounce(false)}
             style={{ animation: xBounce ? 'xBounce 0.45s ease' : 'none' }}
           >
-            ✕
+            ×
           </button>
         </div>
 

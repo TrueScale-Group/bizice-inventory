@@ -194,7 +194,7 @@ export default function AdjustStockModal({
                 setQtyInput(String(v))
               }} style={{ width: 48, border: 'none', background: '#FEF2F2', color: '#DC2626',
                 fontSize: 22, fontWeight: 700, cursor: 'pointer' }}>−</button>
-              <input type="number" value={qtyInput} onChange={e => setQtyInput(e.target.value)}
+              <input type="number" inputMode="decimal" value={qtyInput} onChange={e => setQtyInput(e.target.value)}
                 min="0" step="any" placeholder="0"
                 style={{ flex: 1, width: '50%', padding: '10px 8px', border: 'none', outline: 'none',
                   fontSize: 18, fontWeight: 700, textAlign: 'center',

@@ -34,7 +34,7 @@ const TAB_LABEL = {
   settings:  'ตั้งค่า',
 }
 
-export default function AppTopBar({ tab }) {
+export default function AppTopBar({ tab, warehouses = [] }) {
   return (
     <div className="app-topbar">
       {/* ปุ่ม Home */}
@@ -53,7 +53,7 @@ export default function AppTopBar({ tab }) {
       {/* Right — Online → Bell → Refresh (เหมือน Cost Manager) */}
       <div className="app-topbar-right">
         <ConnectionStatus />
-        <NotifBell />
+        <NotifBell warehouses={warehouses} />
         <button className="topbar-refresh-btn" onClick={hardRefresh} title="รีเฟรช (ล้าง cache + โหลดใหม่)">
           🔄
         </button>

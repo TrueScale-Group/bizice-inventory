@@ -1,26 +1,23 @@
 // NotifBell — กระดิ่งแจ้งเตือน Stock (Live) — Inventory
 // อ่านจาก stock_balances + items + warehouses → คำนวณ low/out สด
 import { useState, useEffect, useRef } from 'react'
-import { collection, onSnapshot } from 'firebase/firestore'
-import { db } from '../firebase'
-import { COL } from '../constants/collections'
+import { useItems } from '../hooks/useItems'
+import { useStockBalances, useStockBalancesPassive } from '../hooks/useStock'
+import { useSession } from '../hooks/useSession'
 
-export default function NotifBell() {
-  const [balances, setBalances]     = useState([])
-  const [items, setItems]           = useState([])
-  const [warehouses, setWarehouses] = useState([])
+export default function NotifBell({ warehouses = [] }) {
+  // scope ตาม role: staff เห็นแค่สาขาตัวเอง (App กรอง warehouses เหลือสาขาเดียวอยู่แล้ว) → ดึงสาขาเดียวพอ
+  //   owner/admin → 'all' (เห็นทุกสาขา)
+  const { isStaff, branch_id } = useSession()
+  const balScope = (isStaff() && branch_id) ? branch_id : 'all'
   const [open, setOpen] = useState(false)
+  // 🪶 LAZY: เปิด live listener เฉพาะตอนกดดูกระดิ่ง · ปิดแล้วปล่อย (ไม่ถือ listener ค้างทุกหน้า)
+  useStockBalances(open ? balScope : null)
+  // badge/รายการ: อ่านจาก cache + เกาะ listener หน้าอื่น (เช่นแดชบอร์ด) ฟรี — ไม่บังคับเปิด listener เอง
+  const balances = useStockBalancesPassive(balScope)
+  const items = useItems()                 // shared singleton — ลด Inv_items reads
+  // warehouses มาจาก prop (App) — ตัด listener ซ้ำ
   const ref = useRef(null)
-
-  useEffect(() => {
-    const u1 = onSnapshot(collection(db, COL.STOCK_BALANCES),
-      s => setBalances(s.docs.map(d => ({ id: d.id, ...d.data() }))))
-    const u2 = onSnapshot(collection(db, COL.ITEMS),
-      s => setItems(s.docs.map(d => ({ id: d.id, ...d.data() }))))
-    const u3 = onSnapshot(collection(db, COL.WAREHOUSES),
-      s => setWarehouses(s.docs.map(d => ({ id: d.id, ...d.data() }))))
-    return () => { u1(); u2(); u3() }
-  }, [])
 
   useEffect(() => {
     if (!open) return
