@@ -28,7 +28,7 @@ function injectSwVersion(version) {
 
 export default defineConfig({
   plugins: [react(), injectSwVersion(pkg.version)],
-  base: '/',   // .web.app deploy = root · (github.io เดิม '/bizice-inventory/' อยู่ branch main)
+  base: '/inventory/',   // single-origin: bizice.web.app/inventory/ (แก้ PWA หลุด standalone)
   build: { outDir: 'dist' },
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),

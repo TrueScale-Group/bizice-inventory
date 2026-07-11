@@ -5,7 +5,7 @@
 import { signInWithCustomToken, onAuthStateChanged } from 'firebase/auth'
 import { auth } from './firebase'
 
-const HUB_URL = 'https://bizice.web.app'
+const HUB_URL = '/'   // origin-relative: Hub = root ของ origin เดียวกัน (single-origin)
 
 /**
  * เรียก "ก่อน" render แอพหลัก (ใน main.jsx)

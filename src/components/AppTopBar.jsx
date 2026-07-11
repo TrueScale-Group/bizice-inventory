@@ -2,7 +2,7 @@ import { ConnectionStatus } from './ConnectionStatus'
 import NotifBell from './NotifBell'
 
 function goHome() {
-  window.top.location.href = 'https://bizice.web.app'
+  window.top.location.href = '/'
 }
 
 // Hard refresh — ล้าง Service Worker cache + unregister SW แล้ว reload (โหลดเวอร์ชันใหม่ล่าสุด)

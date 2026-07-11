@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Inventory" />
   <meta name="theme-color" id="meta-theme-color" content="#E31E24" />
-  <link rel="manifest" href="/manifest.json" />
+  <link rel="manifest" href="/inventory/manifest.json" />
   <link rel="icon" type="image/png" href="./icon-inventory.png" />
   <!-- apple-touch-icon: iOS อยากได้ขนาดเฉพาะ (180 iPhone · 167 iPad Pro · 152 iPad) จะคมกว่า/โหลดเบากว่าไฟล์ 2048px -->
   <link rel="apple-touch-icon" sizes="180x180" href="./icon-inventory-180.png" />
@@ -72,7 +72,7 @@
   </script>
   <script>
     (function () {
-      const HUB = 'https://bizice.web.app';
+      const HUB = '/';   // origin-relative (single-origin)
       const TTL = 30 * 86400000;   // 30 วัน — กัน iOS ITP ลบ storage / หมดอายุเร็วจนหลุดบ่อย
       try {
         const params = new URLSearchParams(location.search);

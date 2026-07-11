@@ -1,5 +1,5 @@
 function goHome() {
-  window.top.location.href = 'https://bizice.web.app'
+  window.top.location.href = '/'
 }
 
 // Hard refresh — ล้าง cache + unregister SW แล้วโหลดใหม่ (เหมือน Cost Manager)
