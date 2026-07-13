@@ -1,7 +1,7 @@
 {
   "name": "bizice-inventory",
   "private": true,
-  "version": "5.10.1",
+  "version": "5.10.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
